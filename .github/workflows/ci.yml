@@ -1,0 +1,112 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Check and test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: authme_test
+          POSTGRES_USER: authme
+          POSTGRES_PASSWORD: authme-ci-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U authme -d authme_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      NODE_ENV: test
+      AUTHME_PUBLIC_URL: https://authme.test
+      AUTHME_PORT: "3000"
+      AUTHME_REALMS: master
+      DATABASE_URL: postgresql://authme:authme-ci-only@127.0.0.1:5432/authme_test
+      REDIS_URL: redis://127.0.0.1:6379/0
+      AUTHME_JWKS_DIR: ${{ runner.temp }}/authme-jwks
+      AUTHME_DEV_MODE: "false"
+      AUTHME_TRUST_PROXY: "false"
+      AUTHME_LOG_LEVEL: error
+    steps:
+      - name: Check out source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Generate ephemeral test secrets
+        shell: bash
+        run: |
+          mkdir -p "$AUTHME_JWKS_DIR"
+          {
+            echo "AUTHME_COOKIE_KEYS=$(openssl rand -hex 32),$(openssl rand -hex 32)"
+            echo "AUTHME_CSRF_SECRET=$(openssl rand -hex 32)"
+            echo "AUTHME_PASSWORD_PEPPER=$(openssl rand -hex 32)"
+            echo "AUTHME_SUBJECT_SALT=$(openssl rand -hex 32)"
+            echo "AUTHME_FIELD_ENCRYPTION_KEY=$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n')"
+            echo "AUTHME_ADMIN_TOKEN=$(openssl rand -hex 32)"
+          } >> "$GITHUB_ENV"
+
+      - name: Generate signing keys
+        run: npm run keys:generate
+
+      - name: Apply database migrations
+        run: npm run db:migrate
+
+      - name: Check
+        run: npm run check
+
+      - name: Test
+        run: npm test
+
+      - name: PostgreSQL protocol smoke test
+        env:
+          AUTHME_SMOKE_DATABASE_URL: ${{ env.DATABASE_URL }}
+        run: npm run smoke
+
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high
+
+  container:
+    name: Build production container
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      - name: Build runtime image
+        run: docker build --pull --target runtime --tag authme:ci .
