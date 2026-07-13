@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
 
 import { MemoryIdentityStore, publicUser } from '../src/repositories/identity-store.js';
@@ -114,6 +115,34 @@ test('create, read, list, and update operations return defensive copies', async 
   assert.deepEqual((await store.findUserById('master', created.id)).groups, ['/engineering']);
 });
 
+test('password rehash is a compare-and-set that cannot overwrite a reset', async () => {
+  const store = new MemoryIdentityStore();
+  const user = await store.createUser(userInput({ passwordHash: 'hash-before-login' }));
+
+  assert.equal(
+    await store.rehashPasswordIfCurrent('master', user.id, 'wrong-expected-hash', 'unwanted-hash'),
+    false,
+  );
+  assert.equal((await store.findUserById('master', user.id)).passwordHash, 'hash-before-login');
+
+  await store.updateUser('master', user.id, { passwordHash: 'hash-from-admin-reset' });
+  assert.equal(
+    await store.rehashPasswordIfCurrent('master', user.id, 'hash-before-login', 'rehash-of-old-password'),
+    false,
+  );
+  assert.equal((await store.findUserById('master', user.id)).passwordHash, 'hash-from-admin-reset');
+
+  assert.equal(
+    await store.rehashPasswordIfCurrent('master', user.id, 'hash-from-admin-reset', 'current-rehash'),
+    true,
+  );
+  assert.equal((await store.findUserById('master', user.id)).passwordHash, 'current-rehash');
+  assert.equal(
+    await store.rehashPasswordIfCurrent('other', user.id, 'current-rehash', 'cross-realm'),
+    false,
+  );
+});
+
 test('public user views remove authentication secrets and expose MFA counts', async () => {
   const store = new MemoryIdentityStore();
   const created = await store.createUser(userInput({
@@ -203,4 +232,89 @@ test('audit records are newest-first, realm-scoped, paginated, and defensively c
   assert.notEqual(forged.createdAt, '1970-01-01T00:00:00.000Z');
   assert.equal((await store.writeAudit({ realm: 'master', type: 'ip.valid', ip: '203.0.113.8' })).ip, '203.0.113.8');
   assert.equal((await store.writeAudit({ realm: 'master', type: 'ip.invalid', ip: 'spoofed, 127.0.0.1' })).ip, null);
+});
+
+test('WebAuthn challenges are expiring, context-bound, and consumed exactly once', async () => {
+  const store = new MemoryIdentityStore();
+  const user = await store.createUser(userInput());
+  const challenge = await store.createWebAuthnChallenge({
+    realm: 'master',
+    purpose: 'registration',
+    userId: user.id,
+    userHandle: 'opaque-user-handle',
+    challenge: 'challenge-value-that-is-long-enough-for-webauthn',
+    expiresAt: new Date(Date.now() + 60_000),
+  });
+
+  assert.equal(await store.consumeWebAuthnChallenge({
+    realm: 'staff', id: challenge.id, purpose: 'registration', userId: user.id,
+  }), null);
+  assert.equal(await store.consumeWebAuthnChallenge({
+    realm: 'master', id: challenge.id, purpose: 'authentication', userId: user.id,
+  }), null);
+  assert.equal((await store.consumeWebAuthnChallenge({
+    realm: 'master', id: challenge.id, purpose: 'registration', userId: user.id,
+  })).challenge, challenge.challenge);
+  assert.equal(await store.consumeWebAuthnChallenge({
+    realm: 'master', id: challenge.id, purpose: 'registration', userId: user.id,
+  }), null);
+
+  const expired = await store.createWebAuthnChallenge({
+    realm: 'master',
+    purpose: 'authentication',
+    interactionUid: 'interaction-one',
+    challenge: 'expired-challenge-value-that-is-long-enough',
+    expiresAt: new Date(Date.now() - 1),
+  });
+  assert.equal(await store.consumeWebAuthnChallenge({
+    realm: 'master', id: expired.id, purpose: 'authentication', interactionUid: 'interaction-one',
+  }), null);
+  assert.equal(await store.cleanupExpiredWebAuthnChallenges(), 1);
+});
+
+test('WebAuthn credentials are realm/user scoped and counters update with compare-and-set semantics', async () => {
+  const store = new MemoryIdentityStore();
+  const id = 'eeb54dc9-0700-4e56-a9ce-a4edcbd24a72';
+  await store.createUser(userInput({ id }));
+  await store.createUser(userInput({ id, realm: 'staff' }));
+  const input = {
+    realm: 'master',
+    userId: id,
+    id: 'credential_id-1',
+    userHandle: 'opaque-user-handle',
+    publicKey: Uint8Array.from([1, 2, 3]),
+    counter: 4,
+    transports: ['internal', 'hybrid'],
+    deviceType: 'multiDevice',
+    backedUp: false,
+    aaguid: '00000000-0000-0000-0000-000000000000',
+    name: 'Phone passkey',
+  };
+  await store.createWebAuthnCredential(input);
+  await store.createWebAuthnCredential({ ...input, realm: 'staff' });
+
+  await assert.rejects(
+    store.createWebAuthnCredential(input),
+    (error) => error.code === 'WEBAUTHN_CREDENTIAL_EXISTS',
+  );
+  assert.equal((await store.findWebAuthnCredential('master', input.id)).name, 'Phone passkey');
+  assert.equal((await store.findWebAuthnCredential('other', input.id)), null);
+  assert.equal((await store.listWebAuthnCredentials('master', id)).length, 1);
+  assert.equal(await store.updateWebAuthnCredentialCounter('master', input.id, {
+    expectedCounter: 3, newCounter: 5, deviceType: 'multiDevice', backedUp: true,
+  }), false);
+  assert.equal(await store.updateWebAuthnCredentialCounter('master', input.id, {
+    expectedCounter: 4, newCounter: 5, deviceType: 'multiDevice', backedUp: true,
+  }), true);
+  const updated = await store.findWebAuthnCredential('master', input.id);
+  assert.equal(updated.counter, 5);
+  assert.equal(updated.backedUp, true);
+  assert.ok(updated.lastUsedAt);
+
+  assert.equal(await store.deleteWebAuthnCredential('master', randomUUID(), input.id), null);
+  assert.equal((await store.deleteWebAuthnCredential('master', id, input.id)).id, input.id);
+  assert.equal(await store.findWebAuthnCredential('master', input.id), null);
+  assert.notEqual(await store.findWebAuthnCredential('staff', input.id), null);
+  await store.deleteUser('staff', id);
+  assert.equal(await store.findWebAuthnCredential('staff', input.id), null);
 });

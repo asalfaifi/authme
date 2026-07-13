@@ -1,0 +1,26 @@
+AuthMe has been rendered for namespace {{ .Release.Namespace }}.
+
+Issuer origin: {{ .Values.config.publicUrl }}
+Service: {{ include "authme.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.port }}
+
+IMPORTANT:
+  * The external Secret {{ .Values.runtimeSecret.existingSecret | quote }} and JWKS Secret
+    {{ .Values.jwks.existingSecret | quote }} must exist before installation.
+  * PostgreSQL and optional Redis are external. This chart does not install them.
+{{- if .Values.migration.enabled }}
+  * The {{ .Values.migration.hook }} migration Job blocks rollout on migration failure.
+    A Helm rollback does not roll back a database schema. Back up PostgreSQL and
+    verify forward compatibility before every upgrade.
+{{- end }}
+  * Replace the example config.publicUrl before exposing this release.
+  * For external Secret/ConfigMap changes, bump the corresponding checksum value.
+
+Check rollout:
+  kubectl -n {{ .Release.Namespace }} rollout status deployment/{{ include "authme.fullname" . }}
+  kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/instance={{ .Release.Name }}
+
+Run the release test after the Deployment is ready:
+  helm test {{ .Release.Name }} -n {{ .Release.Namespace }}
+
+See charts/authme/README.md for secret keys, migration semantics, OpenShift,
+network policy, monitoring, and upgrade guidance.

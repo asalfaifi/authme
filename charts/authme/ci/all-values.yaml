@@ -1,0 +1,41 @@
+image:
+  digest: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+
+config:
+  publicUrl: https://login.example.test
+  realms:
+    - master
+    - staff
+  extraData:
+    AUTHME_EXAMPLE_NON_SECRET: enabled
+
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+  hosts:
+    - host: login.example.test
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: login-example-test-tls
+      hosts:
+        - login.example.test
+
+route:
+  enabled: true
+  host: login.apps.example.test
+
+autoscaling:
+  enabled: true
+
+podDisruptionBudget:
+  minAvailable: null
+  maxUnavailable: 1
+
+serviceMonitor:
+  enabled: true
+  labels:
+    release: monitoring

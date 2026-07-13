@@ -23,16 +23,17 @@ Until tagged releases are published, only the latest commit on `main` receives s
 
 ## Security boundary
 
-AuthMe v0.1 is a production-oriented OIDC foundation, not a complete Keycloak replacement and not an independently OpenID-certified distribution. The upstream protocol engine's certification does not automatically certify AuthMe or an operator's deployment.
+AuthMe v0.2 is a production-oriented identity foundation with OAuth/OIDC, upstream OIDC/SAML federation, LDAP/AD authentication, SCIM provisioning, and strong credentials. It is not a complete Keycloak replacement and not an independently OpenID-certified distribution. The upstream protocol engine's certification does not automatically certify AuthMe or an operator's deployment.
 
 The implemented and staged boundaries are documented in:
 
 - [Threat model](docs/threat-model.md)
 - [Production runbook](docs/production.md)
 - [Keycloak compatibility](docs/keycloak-compatibility.md)
+- [Federation and provisioning](docs/federation-and-provisioning.md)
 - [Roadmap and release gates](docs/roadmap.md)
 
-Do not use v0.1 as a replacement where SAML, LDAP/AD, Kerberos, SCIM, identity brokering, passkeys/WebAuthn, UMA, configurable authentication flows, Keycloak Admin REST compatibility, or multi-site active/active operation is required.
+Do not use v0.2 as a replacement where Kerberos/SPNEGO, RADIUS, X.509 login, SAML IdP operation, encrypted/IdP-initiated SAML, LDAP synchronization, advanced SCIM/Bulk, imported WebAuthn credentials, UMA, configurable authentication flows, Keycloak Admin REST compatibility, or multi-site active/active operation is required. Treat the exact baseline documented for each implemented mechanism as the supported boundary.
 
 ## Operator responsibilities
 
@@ -40,6 +41,7 @@ A secure production deployment requires operators to:
 
 - terminate modern TLS at a trusted ingress and set the exact immutable external issuer URL;
 - keep PostgreSQL, Redis, administration endpoints, metrics, and private keys off untrusted networks;
+- restrict AuthMe egress to reviewed IdP/directory endpoints and protect LDAP bind, OIDC client, SAML key/certificate, and SCIM token material;
 - generate independent high-entropy values for every documented secret and rotate them deliberately;
 - keep at least two cookie signing keys during rotation and retain verification keys while issued tokens may still be valid;
 - use exact registered redirect/logout URIs and confidential-client authentication where appropriate;
@@ -51,7 +53,7 @@ A secure production deployment requires operators to:
 - run unit, smoke, migration, container, dependency-audit, and protocol-conformance gates on the exact release artifact;
 - review log and proxy configuration so authorization headers, cookies, codes, tokens, passwords, MFA material, and client secrets are never recorded.
 
-`AUTHME_ADMIN_TOKEN` is a bootstrap-grade global administration credential in v0.1. Store it in a secret manager, restrict access to the administration routes at the network layer, rotate it on suspected exposure, and do not treat it as delegated RBAC.
+`AUTHME_ADMIN_TOKEN` is a bootstrap-grade global administration credential in v0.2. Store it in a secret manager, restrict access to the administration routes at the network layer, rotate it on suspected exposure, and do not treat it as delegated RBAC.
 
 ## Development and dependency policy
 

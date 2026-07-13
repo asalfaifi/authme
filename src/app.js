@@ -4,6 +4,8 @@ import express from 'express';
 import helmet from 'helmet';
 import pinoHttp from 'pino-http';
 import { createDataLayer } from './db.js';
+import { resolveFederatedLogin } from './authentication/federated-login.js';
+import { createIdentityRuntime } from './authentication/runtime.js';
 import { loadRealmJwks } from './crypto/jwks.js';
 import { hashPassword } from './crypto/password.js';
 import { randomToken } from './crypto/secrets.js';
@@ -12,11 +14,15 @@ import { createMetrics } from './observability/metrics.js';
 import { createAuditWriter } from './observability/audit-writer.js';
 import { createRealmProvider } from './provider.js';
 import { createAdminRouter } from './routes/admin.js';
+import { createFederationRouter } from './routes/federation.js';
 import { createInteractionRouter } from './routes/interactions.js';
 import { createRateLimits } from './security/rate-limit.js';
+import { createWebAuthn } from './security/webauthn.js';
 import { renderError } from './ui/render.js';
 
 const cssPath = fileURLToPath(new URL('./ui/authme.css', import.meta.url));
+const passkeyCssPath = fileURLToPath(new URL('./ui/authme-passkeys.css', import.meta.url));
+const passkeyScriptPath = fileURLToPath(new URL('./ui/authme-passkeys.js', import.meta.url));
 
 function securityHeaders(req, res, next) {
   const authUi = req.path.startsWith('/realms/')
@@ -25,7 +31,7 @@ function securityHeaders(req, res, next) {
     // oidc-provider appends an exact SHA-256 source when its device-code
     // verification_uri_complete page needs an auto-submitting inline script.
     res.set('Content-Security-Policy', "default-src 'none'; script-src 'self'; style-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'");
-    res.set('Permissions-Policy', 'camera=(), geolocation=(), microphone=(), payment=(), usb=()');
+    res.set('Permissions-Policy', 'camera=(), geolocation=(), microphone=(), payment=(), usb=(), publickey-credentials-create=(self), publickey-credentials-get=(self)');
   }
   next();
 }
@@ -73,6 +79,7 @@ export async function createAuthMeApp(config, overrides = {}) {
   const store = overrides.store ?? data.store;
   const rateLimits = overrides.rateLimits ?? createRateLimits(config, logger);
   const metrics = overrides.metrics ?? createMetrics();
+  const webauthn = overrides.webauthn ?? createWebAuthn(config);
   const auditWriter = overrides.auditWriter ?? createAuditWriter({
     write: (event) => store.writeAudit(event),
     maxQueue: 1_024,
@@ -102,6 +109,14 @@ export async function createAuthMeApp(config, overrides = {}) {
     await rateLimits.ready();
     await bootstrapDevelopmentUsers(config, store, logger);
     const dummyPasswordHash = await hashPassword(randomToken(32), config.passwordPepper);
+    const identityRuntime = overrides.identityRuntime ?? createIdentityRuntime({
+      config,
+      data,
+      store,
+      disabledPasswordHash: dummyPasswordHash,
+      logger,
+      fetch: overrides.fetch,
+    });
     const providers = new Map();
     for (const realm of config.realms) {
       const provider = await createRealmProvider({
@@ -134,7 +149,7 @@ export async function createAuthMeApp(config, overrides = {}) {
       return next();
     });
     app.use((req, res, next) => {
-      if (!config.devMode && (req.path.startsWith('/realms/') || req.path.startsWith('/.well-known/'))) {
+      if (!config.devMode && (req.path.startsWith('/realms/') || req.path.startsWith('/.well-known/') || req.path.startsWith('/scim/'))) {
         let requestOrigin;
         try { requestOrigin = new URL(`${req.protocol}://${req.host}`).origin; } catch { return res.status(400).end(); }
         if (requestOrigin !== config.publicUrl) {
@@ -172,8 +187,12 @@ export async function createAuthMeApp(config, overrides = {}) {
     app.get('/', (_req, res) => {
       res.set('Cache-Control', 'no-store').json({
         name: 'AuthMe',
-        version: '0.1.0',
+        version: '0.2.0',
         issuers: config.realms.map((realm) => `${config.publicUrl}/realms/${realm}`),
+        capabilities: Object.fromEntries(config.realms.map((realm) => [
+          realm,
+          identityRuntime.registry.describe(realm).map(({ id, kind, capabilities }) => ({ id, kind, capabilities })),
+        ])),
         documentation: 'https://github.com/asalfaifi/authme',
       });
     });
@@ -192,10 +211,84 @@ export async function createAuthMeApp(config, overrides = {}) {
         res.set('Cache-Control', 'public, max-age=3600').type('text/css').send(await readFile(cssPath, 'utf8'));
       } catch (error) { next(error); }
     });
-    app.use('/admin', createAdminRouter({ config, store, rateLimits, metrics, providers, data }));
+    app.get('/assets/authme-passkeys.css', async (_req, res, next) => {
+      try {
+        res.set('Cache-Control', 'public, max-age=3600').type('text/css').send(await readFile(passkeyCssPath, 'utf8'));
+      } catch (error) { next(error); }
+    });
+    app.get('/assets/authme-passkeys.js', async (_req, res, next) => {
+      try {
+        res.set('Cache-Control', 'public, max-age=3600').type('text/javascript').send(await readFile(passkeyScriptPath, 'utf8'));
+      } catch (error) { next(error); }
+    });
+    if (identityRuntime.scimRepository) {
+      app.use('/scim/v2/realms', identityRuntime.scim.implementation.createRouter({
+        repository: identityRuntime.scimRepository,
+        authenticate: identityRuntime.scimAuthenticate,
+        realmExists: async (realm) => config.realms.includes(realm),
+        baseUrl: `${config.publicUrl}/scim/v2/realms`,
+        audit: async ({ realm, actor, type, resourceType, resourceId, changes, request }) => store.writeAudit({
+          realm,
+          type,
+          subjectId: resourceId,
+          ip: request.ip,
+          userAgent: request.userAgent,
+          metadata: { actor, resourceType, changes },
+        }),
+      }));
+    }
+    app.use('/admin', createAdminRouter({
+      config, store, rateLimits, metrics, providers, data, webauthn,
+      federatedIdentities: identityRuntime.federatedIdentities,
+    }));
 
     for (const [realm, provider] of providers) {
-      app.use(createInteractionRouter({ realm, provider, store, config, rateLimits, dummyPasswordHash, logger }));
+      app.use(createFederationRouter({
+        realm,
+        provider,
+        registry: identityRuntime.registry,
+        stateStore: identityRuntime.stateStore,
+        publicUrl: config.publicUrl,
+        csrfSecret: config.csrfSecret,
+        audit: (event) => store.writeAudit(event),
+        accountResolver: async ({ extensionId, providerId, profile, identity }) => {
+          const configured = extensionId === 'builtin.saml-federation'
+            ? config.samlProvidersByRealm[realm]?.find((candidate) => candidate.id === providerId)
+            : config.oidcProvidersByRealm[realm]?.find((candidate) => candidate.id === providerId);
+          if (!configured) {
+            throw Object.assign(new Error('Federation provider is not configured'), {
+              code: 'AUTHME_FEDERATION_PROVIDER_NOT_FOUND', status: 404, safe: true,
+            });
+          }
+          const issuer = extensionId === 'builtin.saml-federation'
+            ? configured.idp.entityId
+            : configured.issuer;
+          const resolution = await resolveFederatedLogin({
+            realm,
+            repository: identityRuntime.federatedIdentities,
+            result: {
+              providerId,
+              issuer,
+              profile,
+              identity,
+              allowCreate: configured.jitProvisioning,
+            },
+          });
+          const locked = resolution.user.lockedUntil
+            && new Date(resolution.user.lockedUntil).getTime() > Date.now();
+          if (locked) {
+            throw Object.assign(new Error('This account is temporarily locked.'), {
+              code: 'AUTHME_FEDERATED_LOGIN_DENIED', status: 403, safe: true,
+            });
+          }
+          await store.recordLoginSuccess(realm, resolution.user.id);
+          return { accountId: resolution.user.id, created: resolution.status === 'created' };
+        },
+      }));
+      app.use(createInteractionRouter({
+        realm, provider, store, config, rateLimits, dummyPasswordHash, logger, webauthn,
+        identityRuntime,
+      }));
       const callback = provider.callback();
       app.use(`/realms/${realm}/device`, async (req, res, next) => {
         if (req.method !== 'POST' || req.path !== '/') return next();
@@ -227,6 +320,10 @@ export async function createAuthMeApp(config, overrides = {}) {
       app.use(`/realms/${realm}`, callback);
       app.use(`/.well-known/oauth-authorization-server/realms/${realm}`, (req, res) => {
         req.url = '/.well-known/oauth-authorization-server';
+        // oidc-provider derives advertised endpoint mount paths from originalUrl.
+        // Present the equivalent issuer-mounted metadata request so RFC 8414
+        // metadata advertises /realms/{realm}/protocol/... endpoints.
+        req.originalUrl = `/realms/${realm}${req.url}`;
         callback(req, res);
       });
     }
@@ -263,8 +360,9 @@ export async function createAuthMeApp(config, overrides = {}) {
       data,
       logger,
       metrics,
-        providers,
-        auditWriter,
+      providers,
+      auditWriter,
+      identityRuntime,
       rateLimits,
       store,
       async close() {

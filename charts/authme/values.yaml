@@ -1,0 +1,246 @@
+# Production deployments should pin an immutable image digest.
+image:
+  repository: ghcr.io/asalfaifi/authme
+  tag: ""
+  digest: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# Helm detects OpenShift when installing against a live cluster. Set this to
+# true for offline rendering so fixed Kubernetes UIDs/GIDs are omitted.
+openshift:
+  enabled: false
+
+replicaCount: 2
+
+config:
+  # This value becomes the immutable issuer origin. Replace it before install.
+  publicUrl: https://auth.example.com
+  realms:
+    - master
+  trustProxy: true
+  logLevel: info
+  auditRetentionDays: 90
+  enableDynamicRegistration: false
+  accessTokenTtlSeconds: 300
+  authorizationCodeTtlSeconds: 60
+  sessionTtlSeconds: 28800
+  webauthnChallengeTtlSeconds: 300
+  # Additional non-secret environment variables added to the ConfigMap.
+  extraData: {}
+  # Use a pre-created ConfigMap instead of the chart-managed ConfigMap.
+  existingConfigMap: ""
+  # Bump after changing an external ConfigMap to force a rollout.
+  checksum: ""
+
+# This Secret must be created before Helm runs because the migration hook uses
+# it before ordinary release resources are installed. It is mounted with
+# envFrom, so use the exact AUTHME_* and DATABASE_URL key names documented in
+# this chart's README.
+runtimeSecret:
+  existingSecret: authme-runtime
+  databaseUrlKey: DATABASE_URL
+  # Bump after rotating the external Secret to force a rollout.
+  checksum: ""
+
+# One key per realm, for example master.json. The Secret is mounted as files.
+jwks:
+  existingSecret: authme-jwks
+  mountPath: /run/secrets/authme-jwks
+  defaultMode: 0444
+  # Bump after rotating the external Secret to force a rollout.
+  checksum: ""
+
+serviceAccount:
+  create: true
+  automountServiceAccountToken: false
+  annotations: {}
+  name: ""
+
+service:
+  type: ClusterIP
+  port: 80
+  annotations: {}
+  clusterIP: ""
+  externalTrafficPolicy: ""
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: auth.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+  # - secretName: auth-example-com-tls
+  #   hosts:
+  #     - auth.example.com
+
+# Optional native OpenShift Route. Do not enable it together with Ingress for
+# the same hostname unless that is intentional.
+route:
+  enabled: false
+  annotations: {}
+  host: ""
+  path: ""
+  wildcardPolicy: None
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+
+deployment:
+  annotations: {}
+  podAnnotations: {}
+  podLabels: {}
+  revisionHistoryLimit: 5
+  progressDeadlineSeconds: 600
+  terminationGracePeriodSeconds: 30
+  minReadySeconds: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  extraEnv: []
+  extraEnvFrom: []
+  extraVolumes: []
+  extraVolumeMounts: []
+
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+# Applied only on ordinary Kubernetes. OpenShift restricted SCCs assign an
+# arbitrary UID/GID, so the chart omits all three values there.
+kubernetesIdentity:
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  fsGroupChangePolicy: OnRootMismatch
+
+containerSecurityContext:
+  privileged: false
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+tmpVolume:
+  emptyDir:
+    medium: Memory
+    sizeLimit: 128Mi
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: "1"
+    memory: 1Gi
+
+probes:
+  startup:
+    enabled: true
+    path: /health/ready
+    failureThreshold: 30
+    periodSeconds: 2
+    timeoutSeconds: 2
+  readiness:
+    enabled: true
+    path: /health/ready
+    failureThreshold: 3
+    periodSeconds: 5
+    timeoutSeconds: 2
+  liveness:
+    enabled: true
+    path: /health/live
+    failureThreshold: 3
+    periodSeconds: 10
+    timeoutSeconds: 2
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+  maxUnavailable: null
+
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 6
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+  behavior: {}
+
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: ScheduleAnyway
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+priorityClassName: ""
+runtimeClassName: ""
+
+# The default policy permits ingress only to the AuthMe HTTP port and leaves
+# egress open for DNS plus operator-selected external PostgreSQL/Redis hosts.
+# Replace egress with cluster-specific CIDR/namespace rules where possible.
+networkPolicy:
+  enabled: true
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - ports:
+        - port: http
+          protocol: TCP
+  egress:
+    - {}
+
+migration:
+  enabled: true
+  annotations: {}
+  hook: pre-install,pre-upgrade
+  hookWeight: "-5"
+  hookDeletePolicy: before-hook-creation,hook-succeeded
+  backoffLimit: 1
+  activeDeadlineSeconds: 600
+  ttlSecondsAfterFinished: null
+  serviceAccountName: ""
+  podAnnotations: {}
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+serviceMonitor:
+  enabled: false
+  namespace: ""
+  labels: {}
+  annotations: {}
+  interval: 30s
+  scrapeTimeout: 10s
+  path: /admin/metrics
+  # AuthMe currently protects metrics with its administration bearer token.
+  authorization:
+    enabled: true
+    # Defaults to runtimeSecret.existingSecret when empty.
+    secretName: ""
+    secretKey: AUTHME_ADMIN_TOKEN
+
+test:
+  enabled: true
+  annotations: {}

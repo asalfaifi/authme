@@ -7,7 +7,7 @@ function escapeHtml(value) {
     .replaceAll("'", '&#39;');
 }
 
-function shell({ title, realm, body }) {
+function shell({ title, realm, body, scripts = '' }) {
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -17,6 +17,7 @@ function shell({ title, realm, body }) {
   <meta name="referrer" content="no-referrer">
   <title>${escapeHtml(title)} · AuthMe</title>
   <link rel="stylesheet" href="/assets/authme.css">
+  <link rel="stylesheet" href="/assets/authme-passkeys.css">
 </head>
 <body>
   <main class="auth-shell">
@@ -25,6 +26,7 @@ function shell({ title, realm, body }) {
       ${body}
     </section>
   </main>
+  ${scripts}
 </body>
 </html>`;
 }
@@ -33,20 +35,40 @@ function errorBanner(message) {
   return message ? `<div class="alert" role="alert">${escapeHtml(message)}</div>` : '';
 }
 
-export function renderLogin({ realm, uid, csrfToken, clientName, login = '', error = '' }) {
+export function renderLogin({
+  realm,
+  uid,
+  csrfToken,
+  clientName,
+  login = '',
+  error = '',
+  federationProviders = [],
+}) {
+  const federation = federationProviders.map((provider) => `
+        <form method="post" action="/realms/${encodeURIComponent(realm)}/interaction/${encodeURIComponent(uid)}/federation/${encodeURIComponent(provider.extensionId)}/${encodeURIComponent(provider.providerId)}">
+          <input type="hidden" name="csrf" value="${escapeHtml(provider.csrfToken)}">
+          <button class="secondary" type="submit">Continue with ${escapeHtml(provider.displayName)}</button>
+        </form>`).join('');
   return shell({
     title: 'Sign in',
     realm,
     body: `<div class="heading"><p class="eyebrow">Secure sign-in</p><h1 id="page-title">Welcome back</h1><p>Continue to <strong>${escapeHtml(clientName)}</strong>.</p></div>
       ${errorBanner(error)}
-      <form method="post" action="/realms/${encodeURIComponent(realm)}/interaction/${encodeURIComponent(uid)}/login" autocomplete="on">
+      <form method="post" action="/realms/${encodeURIComponent(realm)}/interaction/${encodeURIComponent(uid)}/login" autocomplete="on" data-password-login>
         <input type="hidden" name="csrf" value="${escapeHtml(csrfToken)}">
         <label>Email or username<input name="login" value="${escapeHtml(login)}" autocomplete="username" maxlength="254" required autofocus></label>
         <label>Password<input name="password" type="password" autocomplete="current-password" maxlength="1024" required></label>
         <label>Authenticator or recovery code <span class="optional">if enabled</span><input name="otp" inputmode="numeric" autocomplete="one-time-code" maxlength="32"></label>
         <button class="primary" type="submit">Sign in securely</button>
       </form>
+      <div class="auth-divider" aria-hidden="true"><span>or</span></div>
+      <button class="secondary passkey-button" type="button" hidden
+        data-passkey-options="/realms/${encodeURIComponent(realm)}/interaction/${encodeURIComponent(uid)}/passkey/options"
+        data-passkey-verify="/realms/${encodeURIComponent(realm)}/interaction/${encodeURIComponent(uid)}/passkey">Sign in with a passkey</button>
+      <p class="passkey-status" data-passkey-status aria-live="polite"></p>
+      ${federation ? `<div class="federation-options" aria-label="Federated sign-in options">${federation}</div>` : ''}
       <p class="fine-print">Protected by PKCE, short-lived sessions, brute-force controls, and auditable access.</p>`,
+    scripts: '<script type="module" src="/assets/authme-passkeys.js"></script>',
   });
 }
 

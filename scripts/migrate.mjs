@@ -1,13 +1,9 @@
-import { createHash } from 'node:crypto';
-import { readFile, readdir } from 'node:fs/promises';
-import { fileURLToPath } from 'node:url';
-import { join } from 'node:path';
 import pg from 'pg';
+import { loadMigrationManifest, verifyMigrationHistory, verifyMigrationState } from '../src/migrations.js';
 
 const databaseUrl = process.env.DATABASE_URL;
 if (!databaseUrl) throw new Error('DATABASE_URL is required');
-const migrationsDirectory = fileURLToPath(new URL('../migrations', import.meta.url));
-const names = (await readdir(migrationsDirectory)).filter((name) => /^\d+_.+\.sql$/.test(name)).sort();
+const manifest = await loadMigrationManifest();
 const pool = new pg.Pool({ connectionString: databaseUrl, max: 1, application_name: 'authme-migrate' });
 const client = await pool.connect();
 
@@ -18,9 +14,8 @@ try {
     checksum TEXT NOT NULL,
     applied_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
   )`);
-  for (const name of names) {
-    const sql = await readFile(join(migrationsDirectory, name), 'utf8');
-    const checksum = createHash('sha256').update(sql).digest('hex');
+  await verifyMigrationHistory(client, manifest);
+  for (const { name, sql, checksum } of manifest) {
     const existing = await client.query('SELECT checksum FROM schema_migrations WHERE name=$1', [name]);
     if (existing.rows[0]) {
       if (existing.rows[0].checksum !== checksum) throw new Error(`Applied migration ${name} has been modified`);
@@ -38,6 +33,7 @@ try {
     }
     console.log(`apply ${name}`);
   }
+  await verifyMigrationState(client, manifest);
 } finally {
   await client.query("SELECT pg_advisory_unlock(hashtext('authme-schema-migrations'))").catch(() => {});
   client.release();

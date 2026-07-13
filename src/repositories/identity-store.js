@@ -35,6 +35,64 @@ function normalizeUser(input) {
   };
 }
 
+function normalizeWebAuthnCredential(input) {
+  const counter = Number(input.counter ?? 0);
+  if (!Number.isSafeInteger(counter) || counter < 0 || counter > 0xffff_ffff) {
+    throw new TypeError('WebAuthn credential counter is invalid');
+  }
+  return {
+    realm: input.realm,
+    userId: input.userId,
+    id: input.id,
+    userHandle: input.userHandle,
+    publicKey: new Uint8Array(input.publicKey),
+    counter,
+    transports: [...new Set(input.transports ?? [])],
+    deviceType: input.deviceType,
+    backedUp: Boolean(input.backedUp),
+    aaguid: input.aaguid,
+    name: String(input.name ?? 'Passkey').trim() || 'Passkey',
+    createdAt: input.createdAt ?? nowIso(),
+    updatedAt: input.updatedAt ?? nowIso(),
+    lastUsedAt: input.lastUsedAt ?? null,
+  };
+}
+
+function rowToWebAuthnCredential(row) {
+  if (!row) return null;
+  return normalizeWebAuthnCredential({
+    realm: row.realm_name,
+    userId: row.user_id,
+    id: row.credential_id,
+    userHandle: row.user_handle,
+    publicKey: row.public_key,
+    counter: row.counter,
+    transports: row.transports,
+    deviceType: row.credential_device_type,
+    backedUp: row.backed_up,
+    aaguid: row.aaguid,
+    name: row.display_name,
+    createdAt: row.created_at?.toISOString?.() ?? row.created_at,
+    updatedAt: row.updated_at?.toISOString?.() ?? row.updated_at,
+    lastUsedAt: row.last_used_at?.toISOString?.() ?? row.last_used_at,
+  });
+}
+
+function rowToWebAuthnChallenge(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    realm: row.realm_name,
+    purpose: row.purpose,
+    userId: row.user_id ?? null,
+    interactionUid: row.interaction_uid ?? null,
+    userHandle: row.user_handle ?? null,
+    challenge: row.challenge,
+    expiresAt: row.expires_at?.toISOString?.() ?? row.expires_at,
+    createdAt: row.created_at?.toISOString?.() ?? row.created_at,
+  };
+}
+
 export function publicUser(user) {
   if (!user) return null;
   const { passwordHash, totpSecret, pendingTotpSecret, pendingTotpCreatedAt, recoveryCodeHashes, lastTotpStep, securityVersion, ...safe } = user;
@@ -44,6 +102,8 @@ export function publicUser(user) {
 export class MemoryIdentityStore {
   #users = new Map();
   #audit = [];
+  #webauthnCredentials = new Map();
+  #webauthnChallenges = new Map();
 
   async ready() {
     return true;
@@ -106,6 +166,35 @@ export class MemoryIdentityStore {
     next.updatedAt = nowIso();
     this.#users.set(key, next);
     return structuredClone(next);
+  }
+
+  async deleteUser(realm, id) {
+    const key = `${realm}:${id}`;
+    const user = this.#users.get(key);
+    if (!user) return null;
+    this.#users.delete(key);
+    for (const [credentialKey, credential] of this.#webauthnCredentials) {
+      if (credential.realm === realm && credential.userId === id) this.#webauthnCredentials.delete(credentialKey);
+    }
+    for (const [challengeKey, challenge] of this.#webauthnChallenges) {
+      if (challenge.realm === realm && challenge.userId === id) this.#webauthnChallenges.delete(challengeKey);
+    }
+    return structuredClone(user);
+  }
+
+  async restoreUser(user) {
+    const restored = normalizeUser(user);
+    this.#users.set(`${restored.realm}:${restored.id}`, structuredClone(restored));
+    return structuredClone(restored);
+  }
+
+  async rehashPasswordIfCurrent(realm, id, expectedHash, passwordHash) {
+    const key = `${realm}:${id}`;
+    const user = this.#users.get(key);
+    if (!user || user.passwordHash !== expectedHash) return false;
+    user.passwordHash = passwordHash;
+    user.updatedAt = nowIso();
+    return true;
   }
 
   async recordLoginFailure(realm, id) {
@@ -202,6 +291,90 @@ export class MemoryIdentityStore {
     user.recoveryCodeHashes.splice(index, 1);
     user.updatedAt = nowIso();
     return true;
+  }
+
+  async createWebAuthnChallenge({ realm, purpose, userId = null, interactionUid = null, userHandle = null, challenge, expiresAt }) {
+    const record = {
+      id: randomUUID(),
+      realm,
+      purpose,
+      userId,
+      interactionUid,
+      userHandle,
+      challenge,
+      expiresAt: new Date(expiresAt).toISOString(),
+      createdAt: nowIso(),
+    };
+    this.#webauthnChallenges.set(`${realm}:${record.id}`, structuredClone(record));
+    return structuredClone(record);
+  }
+
+  async consumeWebAuthnChallenge({ realm, id, purpose, userId = null, interactionUid = null }) {
+    const key = `${realm}:${id}`;
+    const record = this.#webauthnChallenges.get(key);
+    if (!record
+      || record.purpose !== purpose
+      || record.userId !== userId
+      || record.interactionUid !== interactionUid
+      || new Date(record.expiresAt).getTime() <= Date.now()) return null;
+    this.#webauthnChallenges.delete(key);
+    return structuredClone(record);
+  }
+
+  async cleanupExpiredWebAuthnChallenges(limit = 1000) {
+    let deleted = 0;
+    for (const [key, record] of this.#webauthnChallenges) {
+      if (deleted >= limit) break;
+      if (new Date(record.expiresAt).getTime() <= Date.now()) {
+        this.#webauthnChallenges.delete(key);
+        deleted += 1;
+      }
+    }
+    return deleted;
+  }
+
+  async createWebAuthnCredential(input) {
+    const credential = normalizeWebAuthnCredential(input);
+    if (!this.#users.has(`${credential.realm}:${credential.userId}`)) return null;
+    const key = `${credential.realm}:${credential.id}`;
+    if (this.#webauthnCredentials.has(key)) {
+      throw Object.assign(new Error('This passkey is already registered'), { code: 'WEBAUTHN_CREDENTIAL_EXISTS' });
+    }
+    this.#webauthnCredentials.set(key, structuredClone(credential));
+    return structuredClone(credential);
+  }
+
+  async findWebAuthnCredential(realm, credentialId) {
+    const credential = this.#webauthnCredentials.get(`${realm}:${credentialId}`);
+    return credential ? structuredClone(credential) : null;
+  }
+
+  async listWebAuthnCredentials(realm, userId) {
+    return [...this.#webauthnCredentials.values()]
+      .filter((credential) => credential.realm === realm && credential.userId === userId)
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
+      .map((credential) => structuredClone(credential));
+  }
+
+  async updateWebAuthnCredentialCounter(realm, credentialId, { expectedCounter, newCounter, deviceType, backedUp }) {
+    const credential = this.#webauthnCredentials.get(`${realm}:${credentialId}`);
+    if (!credential || credential.counter !== expectedCounter) return false;
+    if (!Number.isSafeInteger(newCounter) || newCounter < 0 || newCounter > 0xffff_ffff
+      || ((expectedCounter > 0 || newCounter > 0) && newCounter <= expectedCounter)) return false;
+    credential.counter = newCounter;
+    credential.deviceType = deviceType;
+    credential.backedUp = Boolean(backedUp);
+    credential.lastUsedAt = nowIso();
+    credential.updatedAt = credential.lastUsedAt;
+    return true;
+  }
+
+  async deleteWebAuthnCredential(realm, userId, credentialId) {
+    const key = `${realm}:${credentialId}`;
+    const credential = this.#webauthnCredentials.get(key);
+    if (!credential || credential.userId !== userId) return null;
+    this.#webauthnCredentials.delete(key);
+    return structuredClone(credential);
   }
 
   async writeAudit(event) {
@@ -332,6 +505,24 @@ export class PostgresIdentityStore {
     }
   }
 
+  async deleteUser(realm, id) {
+    const result = await this.pool.query(
+      'DELETE FROM users WHERE realm_name=$1 AND id=$2 RETURNING *',
+      [realm, id],
+    );
+    return rowToUser(result.rows[0]);
+  }
+
+  async rehashPasswordIfCurrent(realm, id, expectedHash, passwordHash) {
+    const result = await this.pool.query(
+      `UPDATE users SET password_hash=$4, updated_at=now()
+       WHERE realm_name=$1 AND id=$2 AND password_hash=$3
+       RETURNING id`,
+      [realm, id, expectedHash, passwordHash],
+    );
+    return result.rowCount === 1;
+  }
+
   async recordLoginFailure(realm, id) {
     await this.pool.query(
       `UPDATE users SET
@@ -443,6 +634,105 @@ export class PostgresIdentityStore {
     }
   }
 
+  async createWebAuthnChallenge({ realm, purpose, userId = null, interactionUid = null, userHandle = null, challenge, expiresAt }) {
+    const result = await this.pool.query(
+      `INSERT INTO webauthn_challenges
+       (realm_name,id,purpose,user_id,interaction_uid,user_handle,challenge,expires_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+      [realm, randomUUID(), purpose, userId, interactionUid, userHandle, challenge, expiresAt],
+    );
+    return rowToWebAuthnChallenge(result.rows[0]);
+  }
+
+  async consumeWebAuthnChallenge({ realm, id, purpose, userId = null, interactionUid = null }) {
+    const result = await this.pool.query(
+      `DELETE FROM webauthn_challenges
+       WHERE realm_name=$1 AND id=$2 AND purpose=$3
+         AND user_id IS NOT DISTINCT FROM $4::uuid
+         AND interaction_uid IS NOT DISTINCT FROM $5
+         AND expires_at > now()
+       RETURNING *`,
+      [realm, id, purpose, userId, interactionUid],
+    );
+    return rowToWebAuthnChallenge(result.rows[0]);
+  }
+
+  async cleanupExpiredWebAuthnChallenges(limit = 1000) {
+    const result = await this.pool.query(
+      `DELETE FROM webauthn_challenges WHERE ctid IN (
+         SELECT ctid FROM webauthn_challenges
+         WHERE expires_at <= now() ORDER BY expires_at
+         FOR UPDATE SKIP LOCKED LIMIT $1
+       )`,
+      [limit],
+    );
+    return result.rowCount;
+  }
+
+  async createWebAuthnCredential(input) {
+    const credential = normalizeWebAuthnCredential(input);
+    try {
+      const result = await this.pool.query(
+        `INSERT INTO webauthn_credentials
+         (realm_name,user_id,credential_id,user_handle,public_key,counter,transports,
+          credential_device_type,backed_up,aaguid,display_name,created_at,updated_at,last_used_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+         RETURNING *`,
+        [credential.realm, credential.userId, credential.id, credential.userHandle,
+          Buffer.from(credential.publicKey), credential.counter, credential.transports,
+          credential.deviceType, credential.backedUp, credential.aaguid, credential.name,
+          credential.createdAt, credential.updatedAt, credential.lastUsedAt],
+      );
+      return rowToWebAuthnCredential(result.rows[0]);
+    } catch (error) {
+      if (error.code === '23505') {
+        throw Object.assign(new Error('This passkey is already registered'), { code: 'WEBAUTHN_CREDENTIAL_EXISTS' });
+      }
+      throw error;
+    }
+  }
+
+  async findWebAuthnCredential(realm, credentialId) {
+    const result = await this.pool.query(
+      'SELECT * FROM webauthn_credentials WHERE realm_name=$1 AND credential_id=$2',
+      [realm, credentialId],
+    );
+    return rowToWebAuthnCredential(result.rows[0]);
+  }
+
+  async listWebAuthnCredentials(realm, userId) {
+    const result = await this.pool.query(
+      `SELECT * FROM webauthn_credentials
+       WHERE realm_name=$1 AND user_id=$2 ORDER BY created_at, credential_id`,
+      [realm, userId],
+    );
+    return result.rows.map(rowToWebAuthnCredential);
+  }
+
+  async updateWebAuthnCredentialCounter(realm, credentialId, { expectedCounter, newCounter, deviceType, backedUp }) {
+    if (!Number.isSafeInteger(expectedCounter) || expectedCounter < 0
+      || !Number.isSafeInteger(newCounter) || newCounter < 0 || newCounter > 0xffff_ffff
+      || ((expectedCounter > 0 || newCounter > 0) && newCounter <= expectedCounter)) return false;
+    const result = await this.pool.query(
+      `UPDATE webauthn_credentials
+       SET counter=$4, credential_device_type=$5, backed_up=$6,
+           last_used_at=now(), updated_at=now()
+       WHERE realm_name=$1 AND credential_id=$2 AND counter=$3
+       RETURNING credential_id`,
+      [realm, credentialId, expectedCounter, newCounter, deviceType, Boolean(backedUp)],
+    );
+    return result.rowCount === 1;
+  }
+
+  async deleteWebAuthnCredential(realm, userId, credentialId) {
+    const result = await this.pool.query(
+      `DELETE FROM webauthn_credentials
+       WHERE realm_name=$1 AND user_id=$2 AND credential_id=$3 RETURNING *`,
+      [realm, userId, credentialId],
+    );
+    return rowToWebAuthnCredential(result.rows[0]);
+  }
+
   async writeAudit(event) {
     const ip = isIP(String(event.ip ?? '')) ? String(event.ip) : null;
     const result = await this.pool.query(
@@ -456,8 +746,9 @@ export class PostgresIdentityStore {
 
   async listAudit(realm, { limit = 100, offset = 0 } = {}) {
     const result = await this.pool.query(
-      `SELECT id, realm_name AS realm, event_type AS type, actor_id, subject_id, client_id,
-       ip_address, user_agent, metadata, created_at FROM audit_events
+      `SELECT id, realm_name AS realm, event_type AS type, actor_id AS "actorId",
+       subject_id AS "subjectId", client_id AS "clientId", ip_address AS ip,
+       user_agent AS "userAgent", metadata, created_at AS "createdAt" FROM audit_events
        WHERE realm_name=$1 ORDER BY created_at DESC LIMIT $2 OFFSET $3`,
       [realm, limit, offset],
     );

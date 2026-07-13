@@ -29,9 +29,13 @@ The upstream [`oidc-provider`](https://github.com/panva/node-oidc-provider#imple
 - Device Authorization Grant.
 - Pushed Authorization Requests (PAR).
 - DPoP-bound tokens for configured clients.
+- Explicit RFC 8707 resource audiences with audience-bound JWT access tokens,
+  filtered Keycloak-shaped authorization claims, and delegated introspection
+  for configured opaque-token resources.
+- Public and pairwise subject identifiers.
 - Dynamic client registration protected by an initial access token.
 - Basic users, clients, realm roles, client roles, groups, and Keycloak-shaped role/group claims.
-- Argon2id passwords, TOTP, and one-use recovery codes.
+- Argon2id passwords, TOTP, one-use recovery codes, and fresh WebAuthn passkey registration/login.
 - A minimal bearer-protected AuthMe administration API and append-only JSON audit events.
 - AuthMe-owned login/consent interactions.
 - Health, structured logging, migrations, container/development deployment assets, and automated tests.
@@ -41,7 +45,7 @@ The upstream [`oidc-provider`](https://github.com/panva/node-oidc-provider#imple
 - Not complete Keycloak parity.
 - Not an OpenID-certified AuthMe distribution.
 - No SAML, LDAP/AD, Kerberos, SCIM, or identity brokering.
-- No WebAuthn/passkeys; TOTP and one-use recovery codes are implemented.
+- No WebAuthn/U2F credential import, attestation-policy enforcement, or self-service passkey recovery; fresh user-verified passkeys are implemented.
 - No Keycloak Admin REST compatibility or complete administrator/account consoles.
 - No configurable authentication-flow/plugin system.
 - No UMA/Authorization Services policy engine.
@@ -59,17 +63,28 @@ The upstream [`oidc-provider`](https://github.com/panva/node-oidc-provider#imple
 - Migration, backup restore, key rotation, and load/failure rehearsals pass.
 - Threat model and independent security review are complete before broad production use.
 
-## v0.2: identity lifecycle and strong authentication
+## v0.2: enterprise identity baseline
+
+### Implemented product contract
+
+- User-verified WebAuthn/passkey registration and passwordless login with durable challenges/counters.
+- Versioned, realm-aware trusted identity-extension registry.
+- LDAP/Active Directory credential authentication over LDAPS/StartTLS with mapping and opt-in JIT.
+- Upstream OIDC brokering with Authorization Code + PKCE and strict issuer/callback/token validation.
+- SAML 2.0 SP-initiated federation with generated metadata, signed Response/Assertion checks, and durable replay protection.
+- Immutable external-subject repository, collision-safe opt-in JIT, and explicit audited administrator linking.
+- PostgreSQL SCIM 2.0 Users/Groups with discovery, core filtering, pagination, PATCH/PUT/CRUD, ETags, and account-state revocation.
+- Production Helm chart for Kubernetes and OpenShift restricted security constraints.
 
 ### Staged scope
 
 - Complete realm/client/user/group/role administration API and web console.
 - Self-registration policy, verified email, password reset, required actions, account console, and session/device management.
-- WebAuthn/passkeys plus stronger credential enrollment, replacement, and recovery policy around the existing TOTP/recovery baseline.
+- Self-service passkey enrollment, replacement, loss/recovery policy, attestation governance, and migration tooling around the implemented admin-managed passkey baseline.
 - Step-up authentication and `acr`/`amr`/`max_age` policy.
 - Nested groups, composite roles, reusable client scopes, and configurable claim mappers.
 - Offline access/session policy and richer revocation controls.
-- Propagation of an expected account security epoch through authentication and token issuance, closing the narrow mutation/in-flight issuance boundary race.
+- Propagation of an expected account security epoch through interactive authentication completion, closing the remaining mutation/in-flight login boundary race; grant-linked code/refresh issuance already requires a live same-epoch parent grant.
 - Front-channel logout and richer policy/telemetry for the implemented back-channel logout.
 - Software statements and richer policy/governance for the implemented protected dynamic registration.
 - Theme/branding model that does not permit arbitrary active content.
@@ -84,21 +99,21 @@ The upstream [`oidc-provider`](https://github.com/panva/node-oidc-provider#imple
 - Accessibility and localization testing for interaction/account/admin UIs.
 - Account-recovery abuse and user-enumeration review.
 
-## v0.3: federation and enterprise provisioning
+## v0.3: enterprise lifecycle and advanced federation
 
 ### Staged scope
 
-- OIDC identity brokering and curated social-provider templates.
-- SAML 2.0 identity-provider/broker surface.
-- LDAP/Active Directory import and synchronization.
-- SCIM 2.0 users/groups provisioning.
+- Curated social-provider templates and advanced upstream OIDC discovery/governance around the v0.2 broker.
+- SAML IdP operation, encrypted assertions, artifact binding, IdP-initiated login, and single logout around the v0.2 SP baseline.
+- LDAP/Active Directory import, synchronization, and reconciliation around the v0.2 credential-authentication baseline.
+- SCIM Bulk, sorting, arbitrary extensions, fine-grained token scopes, and full filtering around the v0.2 Users/Groups baseline.
 - Organizations within realms: domains, invitations, memberships, organization-specific IdPs, and token context.
 - Delegated fine-grained realm/organization administration.
 - Joiner/mover/leaver workflows with transactional events.
 - KMS/HSM-backed realm signing keys and automated rotation.
-- Helm/Kubernetes deployment, disruption budgets, backup/restore automation, and tested single-region HA.
+- Backup/restore automation and tested single-region HA around the implemented Helm/OpenShift deployment.
 
-Keycloak's official guide describes its [identity brokering](https://www.keycloak.org/docs/latest/server_admin/#_identity_broker), [LDAP federation](https://www.keycloak.org/docs/latest/server_admin/#_ldap), [organizations](https://www.keycloak.org/docs/latest/server_admin/#_managing_organizations), and [SCIM support](https://www.keycloak.org/docs/latest/server_admin/#_scim). Those behaviors form the parity reference, not an assertion that AuthMe already implements them.
+Keycloak's official guide describes its [identity brokering](https://www.keycloak.org/docs/latest/server_admin/#_identity_broker), [LDAP federation](https://www.keycloak.org/docs/latest/server_admin/#_ldap), [organizations](https://www.keycloak.org/docs/latest/server_admin/#_managing_organizations), and [SCIM support](https://www.keycloak.org/docs/latest/server_admin/#_scim). Those behaviors form the parity reference; AuthMe v0.2 implements only the explicitly documented baselines above.
 
 ### Exit gates
 
@@ -116,7 +131,7 @@ Keycloak's official guide describes its [identity brokering](https://www.keycloa
 - JARM.
 - `private_key_jwt` client authentication.
 - mTLS client authentication and certificate-bound tokens.
-- Resource Indicators.
+- Richer Resource Indicator policy, resource administration, and multi-audience token governance beyond the v0.1 configured baseline.
 - CIBA.
 - Selected FAPI 2.0 profiles.
 

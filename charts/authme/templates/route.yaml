@@ -1,0 +1,30 @@
+{{- if .Values.route.enabled }}
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: {{ include "authme.fullname" . }}
+  labels:
+    {{- include "authme.labels" . | nindent 4 }}
+  {{- with .Values.route.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.route.host }}
+  host: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.route.path }}
+  path: {{ . | quote }}
+  {{- end }}
+  to:
+    kind: Service
+    name: {{ include "authme.fullname" . }}
+    weight: 100
+  port:
+    targetPort: http
+  wildcardPolicy: {{ .Values.route.wildcardPolicy }}
+  {{- with .Values.route.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}

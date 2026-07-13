@@ -1,0 +1,58 @@
+{{- if .Values.test.enabled }}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "authme.testName" . }}
+  labels:
+    {{- include "authme.labels" . | nindent 4 }}
+    app.kubernetes.io/component: test
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+    {{- with .Values.test.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  securityContext:
+    {{- toYaml .Values.podSecurityContext | nindent 4 }}
+    {{- if ne (include "authme.isOpenShift" .) "true" }}
+    runAsUser: {{ .Values.kubernetesIdentity.runAsUser }}
+    runAsGroup: {{ .Values.kubernetesIdentity.runAsGroup }}
+    fsGroup: {{ .Values.kubernetesIdentity.fsGroup }}
+    fsGroupChangePolicy: {{ .Values.kubernetesIdentity.fsGroupChangePolicy }}
+    {{- end }}
+  {{- with .Values.imagePullSecrets }}
+  imagePullSecrets:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  containers:
+    - name: health-check
+      image: {{ include "authme.image" . | quote }}
+      imagePullPolicy: {{ .Values.image.pullPolicy }}
+      command: ["node"]
+      args:
+        - -e
+        - >-
+          fetch('http://{{ include "authme.fullname" . }}:{{ .Values.service.port }}/health/ready')
+          .then((response) => { if (!response.ok) throw new Error('readiness returned ' + response.status); })
+          .catch((error) => { console.error(error); process.exit(1); })
+      securityContext:
+        {{- toYaml .Values.containerSecurityContext | nindent 8 }}
+      resources:
+        requests:
+          cpu: 10m
+          memory: 32Mi
+        limits:
+          cpu: 100m
+          memory: 128Mi
+      volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+  volumes:
+    - name: tmp
+      emptyDir:
+        {{- toYaml .Values.tmpVolume.emptyDir | nindent 8 }}
+{{- end }}

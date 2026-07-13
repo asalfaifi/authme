@@ -34,6 +34,7 @@ function developmentClients(realm) {
     token_endpoint_auth_method: 'client_secret_basic',
     redirect_uris: ['http://127.0.0.1:3001/callback'],
     post_logout_redirect_uris: ['http://127.0.0.1:3001/'],
+    web_origins: ['http://127.0.0.1:3001'],
     response_types: ['code'],
     grant_types: ['authorization_code', 'refresh_token', 'urn:ietf:params:oauth:grant-type:device_code'],
     application_type: 'web',
@@ -49,13 +50,8 @@ function developmentClients(realm) {
   }];
 }
 
-function corsAllowed(origin, client) {
-  try {
-    return [...(client.redirectUris ?? []), ...(client.postLogoutRedirectUris ?? [])]
-      .some((uri) => new URL(uri).origin === origin);
-  } catch {
-    return false;
-  }
+export function corsAllowed(origin, client) {
+  return Array.isArray(client.web_origins) && client.web_origins.includes(origin);
 }
 
 function accountClaims(user) {
@@ -73,6 +69,49 @@ function accountClaims(user) {
   };
 }
 
+function normalizedAudience(value) {
+  try { return new URL(value).href; } catch { return undefined; }
+}
+
+export function pairwiseSubjectIdentifier(subjectSalt, realm, accountId, sector) {
+  return createHmac('sha256', subjectSalt)
+    .update(`${realm}\u0000${accountId}\u0000${sector}`)
+    .digest('base64url');
+}
+
+export function findConfiguredResourceServer(resourceServers, audience) {
+  const normalized = normalizedAudience(audience);
+  if (!normalized) return undefined;
+  return resourceServers.find((resourceServer) => resourceServer.audience === normalized);
+}
+
+export function resourceTokenClaims(resourceServer, user, scopes) {
+  if (!resourceServer || !user) return undefined;
+  const granted = scopes instanceof Set ? scopes : new Set(String(scopes ?? '').split(' ').filter(Boolean));
+  const claims = {};
+  if (granted.has('roles')) {
+    if (resourceServer.includeRealmRoles) claims.realm_access = { roles: [...user.roles] };
+    const resourceAccess = {};
+    for (const clientId of resourceServer.roleClientIds) {
+      const roles = user.clientRoles?.[clientId];
+      if (Array.isArray(roles) && roles.length) resourceAccess[clientId] = { roles: [...roles] };
+    }
+    if (Object.keys(resourceAccess).length) claims.resource_access = resourceAccess;
+  }
+  if (granted.has('groups') && resourceServer.includeGroups) claims.groups = [...user.groups];
+  return Object.keys(claims).length ? claims : undefined;
+}
+
+export function clientCanIntrospectToken(resourceServers, clientId, token, clientAuthMethod) {
+  if (token.clientId === clientId) return true;
+  if (clientAuthMethod === 'none') return false;
+  const audiences = Array.isArray(token.aud) ? token.aud : [token.aud];
+  return audiences.some((audience) => {
+    const resourceServer = findConfiguredResourceServer(resourceServers, audience);
+    return resourceServer?.introspectionClientIds.includes(clientId);
+  });
+}
+
 function secureUiResponse(ctx) {
   ctx.type = 'html';
   ctx.set('Cache-Control', 'no-store');
@@ -84,11 +123,43 @@ function isLoopback(hostname) {
   return hostname === '127.0.0.1' || hostname === '[::1]' || hostname === '::1';
 }
 
+function validateWebOrigins(metadata, { development = false } = {}) {
+  const origins = metadata.web_origins;
+  if (origins === undefined) return;
+  if (!Array.isArray(origins)) throw new Error('web_origins must be an array');
+  const unique = new Set();
+  for (const origin of origins) {
+    if (typeof origin !== 'string') throw new Error('web_origins entries must be strings');
+    let url;
+    try {
+      url = new URL(origin);
+    } catch {
+      throw new Error('web_origins entries must be valid origins');
+    }
+    if (!['http:', 'https:'].includes(url.protocol) || url.origin !== origin) {
+      throw new Error('web_origins entries must be exact HTTP(S) origins without a path, query, fragment, credentials, or wildcard');
+    }
+    if (!development && url.protocol !== 'https:') {
+      throw new Error('web_origins entries must use HTTPS in production');
+    }
+    if (unique.has(origin)) throw new Error('web_origins entries must be unique');
+    unique.add(origin);
+  }
+}
+
 function validateClientSecurity(metadata, { development = false } = {}) {
   const grantTypes = metadata.grant_types ?? ['authorization_code'];
   if (grantTypes.some((type) => type === 'implicit' || type === 'password')) {
     throw new Error('Implicit and password grants are not supported');
   }
+  const method = metadata.token_endpoint_auth_method ?? 'client_secret_basic';
+  if (!['client_secret_basic', 'none'].includes(method)) {
+    throw new Error(`Unsupported token endpoint authentication method: ${method}`);
+  }
+  if (metadata.subject_type !== undefined && !['public', 'pairwise'].includes(metadata.subject_type)) {
+    throw new Error(`Unsupported subject type: ${metadata.subject_type}`);
+  }
+  validateWebOrigins(metadata, { development });
   if (!development) {
     for (const field of ['redirect_uris', 'post_logout_redirect_uris']) {
       for (const value of metadata[field] ?? []) {
@@ -104,7 +175,6 @@ function validateClientSecurity(metadata, { development = false } = {}) {
       if (url.protocol !== 'https:') throw new Error(`${field} must use HTTPS`);
       if (url.username || url.password || url.hash) throw new Error(`${field} cannot contain credentials or a fragment`);
     }
-    const method = metadata.token_endpoint_auth_method ?? 'client_secret_basic';
     if (method.startsWith('client_secret') && Buffer.byteLength(metadata.client_secret ?? '') < 32) {
       throw new Error('Confidential client secrets must contain at least 32 bytes');
     }
@@ -113,6 +183,7 @@ function validateClientSecurity(metadata, { development = false } = {}) {
 
 export async function createRealmProvider({ realm, config, store, data, Adapter, jwks, logger, auditWriter }) {
   const issuer = issuerFor(config, realm);
+  const resourceServers = config.resourceServersByRealm[realm];
   const clients = [...config.clientsByRealm[realm]];
   if (config.devMode && clients.length === 0) clients.push(...developmentClients(realm));
   for (const client of clients) validateClientSecurity(client, { development: config.devMode });
@@ -138,6 +209,18 @@ export async function createRealmProvider({ realm, config, store, data, Adapter,
     routes: keycloakRoutes,
     scopes: ['openid', 'offline_access', 'profile', 'email', 'phone', 'address', 'roles', 'groups'],
     responseTypes: ['code'],
+    clientAuthMethods: ['client_secret_basic', 'none'],
+    subjectTypes: ['public', 'pairwise'],
+    extraClientMetadata: {
+      properties: ['web_origins'],
+      validator(_ctx, _key, _value, metadata) {
+        try {
+          validateWebOrigins(metadata, { development: config.devMode });
+        } catch (error) {
+          metadata.invalidate(error.message);
+        }
+      },
+    },
     claims: {
       address: ['address'],
       email: ['email', 'email_verified'],
@@ -212,7 +295,7 @@ export async function createRealmProvider({ realm, config, store, data, Adapter,
       introspection: {
         enabled: true,
         async allowedPolicy(_ctx, client, token) {
-          return token.clientId === client.clientId;
+          return clientCanIntrospectToken(resourceServers, client.clientId, token, client.clientAuthMethod);
         },
       },
       pushedAuthorizationRequests: { enabled: true },
@@ -223,7 +306,27 @@ export async function createRealmProvider({ realm, config, store, data, Adapter,
       },
       registrationManagement: { enabled: config.enableDynamicRegistration },
       requestObjects: { enabled: false },
-      resourceIndicators: { enabled: false },
+      resourceIndicators: {
+        enabled: resourceServers.length > 0,
+        async defaultResource(_ctx, _client, oneOf) {
+          if (Array.isArray(oneOf) && oneOf.length === 1) return oneOf[0];
+          return oneOf;
+        },
+        async useGrantedResource() {
+          return true;
+        },
+        async getResourceServerInfo(_ctx, audience, client) {
+          const resourceServer = findConfiguredResourceServer(resourceServers, audience);
+          if (!resourceServer || !resourceServer.authorizedClientIds.includes(client.clientId)) {
+            throw new errors.InvalidTarget('client is not authorized to use the requested resource');
+          }
+          return {
+            audience: resourceServer.audience,
+            scope: resourceServer.scopes.join(' '),
+            accessTokenFormat: resourceServer.accessTokenFormat,
+          };
+        },
+      },
       revocation: {
         enabled: true,
         async allowedPolicy(_ctx, client, token) {
@@ -278,9 +381,20 @@ export async function createRealmProvider({ realm, config, store, data, Adapter,
         },
       };
     },
+    async extraTokenClaims(_ctx, token) {
+      if (!token.accountId || token.aud === undefined) return undefined;
+      const audiences = Array.isArray(token.aud) ? token.aud : [token.aud];
+      if (audiences.length !== 1) return undefined;
+      const resourceServer = findConfiguredResourceServer(resourceServers, audiences[0]);
+      if (!resourceServer) return undefined;
+      const user = await store.findUserById(realm, token.accountId);
+      if (!user?.enabled) return undefined;
+      return resourceTokenClaims(resourceServer, user, token.scopes);
+    },
     async pairwiseIdentifier(_ctx, accountId, client) {
-      const sector = client.sectorIdentifierUri ?? client.clientId;
-      return createHmac('sha256', config.subjectSalt).update(`${realm}\u0000${accountId}\u0000${sector}`).digest('base64url');
+      const sector = client.sectorIdentifier;
+      if (!sector) throw new Error('Pairwise client has no resolved sector identifier');
+      return pairwiseSubjectIdentifier(config.subjectSalt, realm, accountId, sector);
     },
     clientBasedCORS(_ctx, origin, client) {
       return corsAllowed(origin, client);

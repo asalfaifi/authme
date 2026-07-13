@@ -95,16 +95,39 @@ export function createPostgresAdapter({ pool, realm }) {
       const result = await pool.query(
         `WITH account AS (
            SELECT security_version FROM users
-           WHERE realm_name=$1 AND id=$10::uuid
+           WHERE realm_name=$1 AND id=$10::uuid AND enabled
            FOR SHARE
+         ), parent_grant AS (
+           SELECT payload->>'accountId' AS account_id, account_security_version
+           FROM oidc_records
+           WHERE realm_name=$1 AND model='Grant' AND id=$7
+             AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)
+           FOR SHARE
+         ), parent_account AS (
+           SELECT users.id, users.security_version
+           FROM users
+           JOIN parent_grant ON parent_grant.account_id=users.id::text
+           WHERE users.realm_name=$1 AND users.enabled
+             AND parent_grant.account_security_version=users.security_version
+           FOR SHARE OF users
          ), security AS (
-           SELECT CASE WHEN $10::text IS NULL THEN NULL ELSE (SELECT security_version FROM account) END AS version,
-                  $10::text IS NULL OR EXISTS (SELECT 1 FROM account) AS valid
+           SELECT COALESCE(
+                    (SELECT security_version FROM account),
+                    (SELECT security_version FROM parent_account)
+                  ) AS version,
+                  COALESCE($10::text, (SELECT id::text FROM parent_account)) AS account_id,
+                  ($10::text IS NULL OR EXISTS (SELECT 1 FROM account))
+                    AND ($7::text IS NULL OR EXISTS (SELECT 1 FROM parent_account))
+                    AND ($10::text IS NULL OR $7::text IS NULL OR EXISTS (
+                      SELECT 1 FROM parent_account WHERE id=$10::uuid
+                    )) AS valid
          )
          INSERT INTO oidc_records
           (realm_name, model, id, payload, expires_at, consumed_at, grant_id, user_code, uid, account_security_version)
          SELECT
-           $1, $2, $3, $4::jsonb,
+           $1, $2, $3,
+           CASE WHEN security.account_id IS NULL THEN $4::jsonb
+             ELSE $4::jsonb || jsonb_build_object('accountId', security.account_id) END,
            CASE WHEN $5::double precision IS NULL THEN NULL
              ELSE CURRENT_TIMESTAMP + ($5::double precision * INTERVAL '1 second') END,
            $6, $7, $8, $9, security.version
@@ -113,8 +136,8 @@ export function createPostgresAdapter({ pool, realm }) {
          RETURNING id`,
         [realmName, this.model, recordId, record, lifetime, consumedAt, grantId, userCode, uid, accountId],
       );
-      if (accountId && result.rowCount !== 1) {
-        throw new errors.InvalidGrant('account-bound artifact references an unavailable account');
+      if ((accountId || grantId) && result.rowCount !== 1) {
+        throw new errors.InvalidGrant('account or parent grant is unavailable or stale');
       }
       if (this.model === 'ReplayDetection' && result.rowCount !== 1) {
         throw new errors.InvalidRequest('replayed assertion or proof detected');

@@ -2,7 +2,7 @@
 
 ## Production status
 
-AuthMe v0.1 is a production-oriented OIDC foundation, not a declaration of complete Keycloak parity or an independently certified identity product. A deployment is production-ready only after the exact build, configuration, proxy, database adapter, interactions, and operational controls pass the release gates below.
+AuthMe v0.2 is a production-oriented identity foundation with OAuth/OIDC, SAML/OIDC federation, LDAP/AD authentication, SCIM provisioning, and strong credentials. It is not a declaration of complete Keycloak parity or an independently certified identity product. A deployment is production-ready only after the exact build, configuration, proxy, external-provider trust, database adapter, interactions, and operational controls pass the release gates below.
 
 The protocol engine is [`oidc-provider` 9.9.1](https://oidc-provider.dev/changelog/#_9-9-1-2026-07-07), whose upstream project publishes OpenID/FAPI certifications and supported profiles. That certification does not automatically extend to AuthMe or a particular deployment.
 
@@ -20,7 +20,7 @@ PostgreSQL primary with managed backup/standby
 optional Redis: shared rate-limit counters only
 ```
 
-v0.1 supports a single writable PostgreSQL authority. Multi-site active/active writes are not supported. Do not distribute realms across independent databases behind one issuer without a designed consistency and failover model.
+v0.2 supports a single writable PostgreSQL authority. Multi-site active/active writes are not supported. Do not distribute realms across independent databases behind one issuer without a designed consistency and failover model.
 
 ## Base requirements
 
@@ -56,7 +56,7 @@ Production configuration must define, using the names supported by the current e
 
 Secrets belong in a secret manager or mounted secret file with restrictive permissions. Avoid environment-variable exposure where the platform includes environments in diagnostics, but never commit secrets to files or images. Fail startup when an example/default secret is detected.
 
-The v0.1 executable recognizes these security-critical inputs:
+The v0.2 executable recognizes these security-critical inputs:
 
 | Setting | Production requirement |
 |---|---|
@@ -72,10 +72,24 @@ The v0.1 executable recognizes these security-critical inputs:
 | `AUTHME_ADMIN_TOKEN` | Independent high-entropy bearer administration token |
 | `AUTHME_TRUST_PROXY` | Enable only behind the intended trusted proxy topology |
 | `AUTHME_CLIENTS_JSON` | Reviewed static clients grouped by configured realm |
+| `AUTHME_RESOURCE_SERVERS_JSON` | Explicit HTTPS API audiences, scopes, authorized clients, claim policy, and JWT/opaque format by realm |
+| `AUTHME_LDAP_PROVIDERS_JSON` | Secret-managed realm directory endpoints, bind credentials, CA trust, mappings, and opt-in JIT |
+| `AUTHME_OIDC_PROVIDERS_JSON` | Secret-managed upstream endpoints, client credentials, signing policy, mappings, and opt-in JIT |
+| `AUTHME_SAML_PROVIDERS_JSON` | Secret-managed IdP entity/SSO trust, signing certificates, optional SP signing key, mappings, and opt-in JIT |
+| `AUTHME_SCIM_TOKENS_JSON` | Independent high-entropy realm provisioning tokens; enabling any token requires PostgreSQL |
 | `AUTHME_ENABLE_DYNAMIC_REGISTRATION` | Off by default; enable only with protected token issuance and monitoring |
+| `AUTHME_WEBAUTHN_CHALLENGE_TTL_SECONDS` | 60–300 seconds; keep aligned with browser ceremony timeout |
 | `REDIS_URL` | Optional shared limiter; protect as a credential when present |
 
 Changing `AUTHME_SUBJECT_SALT` can change derived subject identifiers; changing `AUTHME_FIELD_ENCRYPTION_KEY` without a data re-encryption plan can make encrypted TOTP secrets unreadable. Back up and rotate both through a reviewed runbook.
+
+### External identity providers and SCIM
+
+Treat provider ID, issuer/entity ID, endpoint, CA, and attribute mapping changes as identity-security changes. Never repurpose an existing provider ID for a new authority. Keep JIT disabled until collision, deprovisioning, role/group mapping, and incident-recovery behavior have been rehearsed; pre-link accounts when deterministic assignment is required.
+
+Restrict egress from AuthMe to the exact LDAP, upstream OIDC/SAML, PostgreSQL, Redis, and DNS destinations. Validate directory and IdP certificate chains, rotate bind/client/SCIM credentials independently, and alert on provider unavailability, federation callback failures, replay rejection, SCIM mutation failures, and unexpected JIT creation. SAML certificate rollover needs an overlap period with both intended IdP verification certificates configured.
+
+Register only the exact callback/ACS URLs documented in [federation-and-provisioning.md](federation-and-provisioning.md). Verify metadata, one full sign-in, a rejected replay, account collision behavior, disabled/locked accounts, and multi-replica completion before enabling a provider for users. SCIM clients must read after ambiguous `5xx` responses because a mutation can commit before application audit persistence fails.
 
 ## Reverse proxy and TLS
 
@@ -86,7 +100,22 @@ Changing `AUTHME_SUBJECT_SALT` can change derived subject identifiers; changing 
 - Apply request header/body/URL limits and slow-client timeouts at both ingress and application layers.
 - Preserve a correlation ID or have AuthMe generate one; never accept it as authorization input.
 
-After deployment, retrieve discovery through the public ingress and confirm that `issuer`, authorization, token, UserInfo, JWKS, revocation, introspection, and logout URLs all use the intended external origin and realm.
+After deployment, retrieve both OIDC discovery and the RFC 8414 metadata path
+through the public ingress. Confirm that `issuer`, authorization, token,
+UserInfo, JWKS, revocation, introspection, and logout URLs in both documents use
+the intended external origin and realm.
+
+For each configured resource server, request a token using its exact `resource`
+URI. JWT resources must reject wrong issuer, audience, signature, algorithm,
+type, and time claims while accepting the current realm JWKS. Do not send JWT
+access tokens to introspection or revocation; validate them locally and account
+for their validity until expiration. For an API that requires immediate online
+revocation or introspection, explicitly select the opaque format and restrict
+`introspection_client_ids` to the API's confidential clients.
+
+Client CORS permissions use the `web_origins` metadata array. Each entry must
+be an exact HTTPS origin in production. AuthMe does not infer CORS permission
+from redirect or post-logout URIs, and it does not accept wildcard origins.
 
 ## PostgreSQL
 
@@ -95,6 +124,7 @@ PostgreSQL is in the authentication correctness path. Use a dedicated database a
 Operational rules:
 
 - Run migrations as an explicit release step, once, under an advisory lock where supported.
+- The migrator preflights applied names and checksums before applying pending files, then AuthMe verifies the exact release manifest again before production startup. A missing `schema_migrations` table, pending or modified migration, or migration unknown to the running image fails startup before realm state is touched. Run `npm run db:migrate` with the target image first; do not hand-edit migration history.
 - Back up before schema changes and verify that the target application can run against the migrated schema.
 - Bound each AuthMe replica's connection pool so the combined maximum remains below database capacity with headroom for migrations and operations.
 - Configure statement, lock, and idle transaction timeouts.
@@ -110,7 +140,7 @@ If PostgreSQL RLS is enabled as defense-in-depth, use a runtime role that cannot
 
 ## Redis
 
-Redis is optional for shared rate limiting. It must not contain canonical sessions, grants, authorization codes, tokens, users, clients, or signing keys in v0.1.
+Redis is optional for shared rate limiting. It must not contain canonical sessions, grants, authorization codes, tokens, users, clients, or signing keys in v0.2.
 
 For multi-replica deployments:
 
@@ -143,15 +173,17 @@ Rotate database, Redis, cookie, client, and administrative secrets independently
 
 ### Password and MFA secrets
 
-v0.1 hashes passwords with Argon2id using 64 MiB memory, three iterations, parallelism one, a 32-byte hash, a per-password salt supplied by the library, and `AUTHME_PASSWORD_PEPPER`. Recalibrate resource cost on deployment hardware without weakening it silently. The implementation follows the Argon2id family standardized in [RFC 9106](https://www.rfc-editor.org/rfc/rfc9106.html).
+v0.2 hashes passwords with Argon2id using 64 MiB memory, three iterations, parallelism one, a 32-byte hash, a per-password salt supplied by the library, and `AUTHME_PASSWORD_PEPPER`. Recalibrate resource cost on deployment hardware without weakening it silently. The implementation follows the Argon2id family standardized in [RFC 9106](https://www.rfc-editor.org/rfc/rfc9106.html).
 
 TOTP secrets are encrypted with AES-256-GCM using `AUTHME_FIELD_ENCRYPTION_KEY` and contextual associated data. Recovery codes are keyed digests and are consumed once. Protect the encryption key and password pepper separately from the PostgreSQL backup. Restore drills must include both.
 
-v0.1 accepts one active password pepper and one active field-encryption key. Replacing either value without migrating the dependent records locks users out: the pepper participates in password verification and recovery-code digests, while the field key decrypts TOTP secrets. Use a tested offline rehash/re-encryption or credential re-enrollment plan; do not rotate these values as an uncoordinated ordinary restart.
+Passkey credential public keys, signature counters, transports, and descriptive backup/device metadata are stored in PostgreSQL. They are not secrets, but credential IDs and user handles are authentication data and belong in protected backups. Passkey challenges are random, short-lived, server-side records consumed atomically on the first verification attempt. The RP ID is the exact `AUTHME_PUBLIC_URL` hostname and verification accepts only the exact configured origin. Changing that hostname makes existing credentials unusable; rehearse issuer/origin migration as passkey re-enrollment.
+
+v0.2 accepts one active password pepper and one active field-encryption key. Replacing either value without migrating the dependent records locks users out: the pepper participates in password verification and recovery-code digests, while the field key decrypts TOTP secrets. Use a tested offline rehash/re-encryption or credential re-enrollment plan; do not rotate these values as an uncoordinated ordinary restart.
 
 ## Administration and dynamic registration
 
-The v0.1 administration API uses `AUTHME_ADMIN_TOKEN`. Treat it as deployment-wide root-equivalent for the exposed API:
+The v0.2 administration API uses `AUTHME_ADMIN_TOKEN`. Treat it as deployment-wide root-equivalent for the exposed API:
 
 - restrict the route at ingress/network level where feasible;
 - never expose it to a browser or store it in local storage;
@@ -159,7 +191,7 @@ The v0.1 administration API uses `AUTHME_ADMIN_TOKEN`. Treat it as deployment-wi
 - alert on repeated failures and audit all successful mutations;
 - use a distinct short-lived initial access token for dynamic client registration instead of distributing the administration token.
 
-Initial access tokens must be short-lived and delivered out of band. AuthMe v0.1 does not attach fine-grained policies to these tokens, so treat each one as permission to submit any client metadata accepted by the protocol engine. Review every dynamically registered redirect/logout URI and authentication method. Revoke suspicious clients immediately.
+Initial access tokens must be short-lived and delivered out of band. AuthMe v0.2 does not attach fine-grained policies to these tokens, so treat each one as permission to submit any client metadata accepted by the protocol engine. Review every dynamically registered redirect/logout URI and authentication method. Revoke suspicious clients immediately.
 
 ## Cookies and browser security
 

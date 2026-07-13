@@ -24,7 +24,26 @@ test('authentication pages escape client-controlled display values', () => {
     assert.doesNotMatch(page, /<img src=x/);
     assert.match(page, /&lt;img src=x/);
     assert.match(page, /\/assets\/authme\.css/);
+    assert.match(page, /\/assets\/authme-passkeys\.css/);
   }
+  const login = renderLogin({ realm: 'master', uid: 'login', csrfToken: 'csrf', clientName: 'Client' });
+  assert.match(login, /data-passkey-options="\/realms\/master\/interaction\/login\/passkey\/options"/);
+  assert.match(login, /data-passkey-verify="\/realms\/master\/interaction\/login\/passkey"/);
+  assert.match(login, /src="\/assets\/authme-passkeys\.js"/);
+
+  const federated = renderLogin({
+    realm: 'master', uid: 'login', csrfToken: 'csrf', clientName: 'Client',
+    federationProviders: [{
+      extensionId: 'builtin.oidc-federation',
+      providerId: 'workforce',
+      displayName: '<Corporate SSO>',
+      csrfToken: 'provider-bound-csrf',
+    }],
+  });
+  assert.match(federated, /action="\/realms\/master\/interaction\/login\/federation\/builtin\.oidc-federation\/workforce"/);
+  assert.match(federated, /value="provider-bound-csrf"/);
+  assert.match(federated, /Continue with &lt;Corporate SSO&gt;/);
+  assert.doesNotMatch(federated, /Continue with <Corporate SSO>/);
 });
 
 test('device input embeds only the provider-generated form slot', () => {

@@ -1,0 +1,75 @@
+{{- if .Values.migration.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "authme.migrationName" . }}
+  labels:
+    {{- include "authme.labels" . | nindent 4 }}
+    app.kubernetes.io/component: migration
+  annotations:
+    "helm.sh/hook": {{ .Values.migration.hook | quote }}
+    "helm.sh/hook-weight": {{ .Values.migration.hookWeight | quote }}
+    "helm.sh/hook-delete-policy": {{ .Values.migration.hookDeletePolicy | quote }}
+    {{- with .Values.migration.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  backoffLimit: {{ .Values.migration.backoffLimit }}
+  activeDeadlineSeconds: {{ .Values.migration.activeDeadlineSeconds }}
+  {{- with .Values.migration.ttlSecondsAfterFinished }}
+  ttlSecondsAfterFinished: {{ . }}
+  {{- end }}
+  template:
+    metadata:
+      labels:
+        {{- include "authme.baseSelectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: migration
+      {{- with .Values.migration.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      {{- with .Values.migration.serviceAccountName }}
+      serviceAccountName: {{ . }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+        {{- if ne (include "authme.isOpenShift" .) "true" }}
+        runAsUser: {{ .Values.kubernetesIdentity.runAsUser }}
+        runAsGroup: {{ .Values.kubernetesIdentity.runAsGroup }}
+        fsGroup: {{ .Values.kubernetesIdentity.fsGroup }}
+        fsGroupChangePolicy: {{ .Values.kubernetesIdentity.fsGroupChangePolicy }}
+        {{- end }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: migrate
+          image: {{ include "authme.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["npm"]
+          args: ["run", "db:migrate"]
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          env:
+            - name: NODE_ENV
+              value: production
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "runtimeSecret.existingSecret is required" .Values.runtimeSecret.existingSecret }}
+                  key: {{ .Values.runtimeSecret.databaseUrlKey }}
+          resources:
+            {{- toYaml .Values.migration.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            {{- toYaml .Values.tmpVolume.emptyDir | nindent 12 }}
+{{- end }}

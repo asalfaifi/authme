@@ -1,0 +1,44 @@
+button:disabled {
+  cursor: wait;
+  opacity: .65;
+}
+
+.passkey-button {
+  width: 100%;
+}
+
+.auth-divider {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 17px 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.auth-divider::before,
+.auth-divider::after {
+  height: 1px;
+  content: "";
+  flex: 1;
+  background: var(--line);
+}
+
+.passkey-status {
+  min-height: 1.4em;
+  margin: 10px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: center;
+}
+
+.federation-options {
+  display: grid;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.federation-options form,
+.federation-options button {
+  width: 100%;
+}

@@ -33,9 +33,28 @@ export function createMemoryAdapter({ realm, securityVersionFor = async () => nu
       }
       const next = clone(payload);
       if (existing?.payload?.consumed && !next.consumed) next.consumed = existing.payload.consumed;
+      let parent;
+      if (next.grantId != null) {
+        parent = current(bucket(realm, 'Grant').get(next.grantId));
+        const parentAccountId = parent?.payload?.accountId;
+        const parentVersion = parentAccountId == null ? null : await securityVersionFor(parentAccountId);
+        if (!parent || parentAccountId == null || parentVersion == null || parent.securityVersion !== parentVersion) {
+          throw new errors.InvalidGrant('parent grant is unavailable or stale');
+        }
+        if (next.accountId != null && next.accountId !== parentAccountId) {
+          throw new errors.InvalidGrant('artifact account does not match its parent grant');
+        }
+        next.accountId = parentAccountId;
+      }
       const securityVersion = next.accountId == null ? null : await securityVersionFor(next.accountId);
       if (next.accountId != null && securityVersion == null) {
         throw new errors.InvalidGrant('account-bound artifact references an unavailable account');
+      }
+      if (next.grantId != null) {
+        const liveParent = current(bucket(realm, 'Grant').get(next.grantId));
+        if (liveParent !== parent || liveParent?.securityVersion !== securityVersion) {
+          throw new errors.InvalidGrant('parent grant changed while the artifact was being saved');
+        }
       }
       this.records.set(id, {
         payload: next,

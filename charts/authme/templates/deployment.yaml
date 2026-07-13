@@ -1,0 +1,168 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "authme.fullname" . }}
+  labels:
+    {{- include "authme.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
+  {{- with .Values.deployment.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  revisionHistoryLimit: {{ .Values.deployment.revisionHistoryLimit }}
+  progressDeadlineSeconds: {{ .Values.deployment.progressDeadlineSeconds }}
+  minReadySeconds: {{ .Values.deployment.minReadySeconds }}
+  strategy:
+    {{- toYaml .Values.deployment.strategy | nindent 4 }}
+  selector:
+    matchLabels:
+      {{- include "authme.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- $podLabels := mergeOverwrite (deepCopy .Values.deployment.podLabels) (include "authme.selectorLabels" . | fromYaml) }}
+      labels:
+        {{- toYaml $podLabels | nindent 8 }}
+      annotations:
+        {{- if .Values.config.existingConfigMap }}
+        checksum/config: {{ printf "%s:%s" .Values.config.existingConfigMap .Values.config.checksum | sha256sum }}
+        {{- else }}
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- end }}
+        checksum/runtime-secret: {{ include "authme.runtimeSecretChecksum" . }}
+        checksum/jwks-secret: {{ include "authme.jwksSecretChecksum" . }}
+        {{- with .Values.deployment.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "authme.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: {{ .Values.deployment.terminationGracePeriodSeconds }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+        {{- if ne (include "authme.isOpenShift" .) "true" }}
+        runAsUser: {{ .Values.kubernetesIdentity.runAsUser }}
+        runAsGroup: {{ .Values.kubernetesIdentity.runAsGroup }}
+        fsGroup: {{ .Values.kubernetesIdentity.fsGroup }}
+        fsGroupChangePolicy: {{ .Values.kubernetesIdentity.fsGroupChangePolicy }}
+        {{- end }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: authme
+          image: {{ include "authme.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: 3000
+              protocol: TCP
+          env:
+            - name: NODE_ENV
+              value: production
+            - name: AUTHME_DEV_MODE
+              value: "false"
+            - name: AUTHME_JWKS_DIR
+              value: {{ .Values.jwks.mountPath | quote }}
+            {{- with .Values.deployment.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "authme.configMapName" . }}
+            - secretRef:
+                name: {{ required "runtimeSecret.existingSecret is required" .Values.runtimeSecret.existingSecret }}
+            {{- with .Values.deployment.extraEnvFrom }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- if .Values.probes.startup.enabled }}
+          startupProbe:
+            httpGet:
+              path: {{ .Values.probes.startup.path }}
+              port: http
+              scheme: HTTP
+            failureThreshold: {{ .Values.probes.startup.failureThreshold }}
+            periodSeconds: {{ .Values.probes.startup.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.startup.timeoutSeconds }}
+          {{- end }}
+          {{- if .Values.probes.readiness.enabled }}
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.probes.readiness.path }}
+              port: http
+              scheme: HTTP
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+          {{- end }}
+          {{- if .Values.probes.liveness.enabled }}
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.probes.liveness.path }}
+              port: http
+              scheme: HTTP
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+          {{- end }}
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 5"]
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: jwks
+              mountPath: {{ .Values.jwks.mountPath }}
+              readOnly: true
+            {{- with .Values.deployment.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir:
+            {{- toYaml .Values.tmpVolume.emptyDir | nindent 12 }}
+        - name: jwks
+          secret:
+            secretName: {{ required "jwks.existingSecret is required" .Values.jwks.existingSecret }}
+            defaultMode: {{ .Values.jwks.defaultMode }}
+        {{- with .Values.deployment.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- if .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- range $constraint := .Values.topologySpreadConstraints }}
+        {{- $rendered := deepCopy $constraint }}
+        {{- if not (hasKey $rendered "labelSelector") }}
+        {{- $_ := set $rendered "labelSelector" (dict "matchLabels" (include "authme.selectorLabels" $ | fromYaml)) }}
+        {{- end }}
+        - {{ toYaml $rendered | nindent 10 | trim }}
+        {{- end }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- with .Values.runtimeClassName }}
+      runtimeClassName: {{ . }}
+      {{- end }}

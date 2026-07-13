@@ -1,0 +1,16 @@
+apiVersion: v2
+name: authme
+description: Production Helm chart for the AuthMe identity and access server
+type: application
+version: 0.2.0
+appVersion: "0.2.0"
+kubeVersion: ">=1.27.0-0"
+home: https://github.com/asalfaifi/authme
+sources:
+  - https://github.com/asalfaifi/authme
+maintainers:
+  - name: AuthMe maintainers
+    url: https://github.com/asalfaifi/authme
+annotations:
+  artifacthub.io/category: security
+  artifacthub.io/license: MIT

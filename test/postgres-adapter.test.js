@@ -90,8 +90,12 @@ test('upsert binds the record, lookup fields, consumed time, and parameterized e
 
   const sql = compactSql(first.text);
   assert.match(sql, /INSERT INTO oidc_records/);
-  assert.match(sql, /SELECT \$1, \$2, \$3, \$4::jsonb,/);
+  assert.match(sql, /SELECT \$1, \$2, \$3, CASE WHEN security\.account_id IS NULL THEN \$4::jsonb/);
   assert.match(sql, /SELECT security_version FROM users/);
+  assert.match(sql, /model='Grant' AND id=\$7/);
+  assert.match(sql, /parent_grant\.account_security_version=users\.security_version/);
+  assert.match(sql, /FOR SHARE OF users/);
+  assert.match(sql, /jsonb_build_object\('accountId', security\.account_id\)/);
   assert.match(sql, /CASE WHEN \$5::double precision IS NULL THEN NULL/);
   assert.match(sql, /CURRENT_TIMESTAMP \+ \(\$5::double precision \* INTERVAL '1 second'\)/);
   assert.match(sql, /ON CONFLICT \(realm_name, model, id\) DO UPDATE/);

@@ -7,8 +7,12 @@ import { loadConfig } from '../src/config.js';
 
 const port = Number(process.env.AUTHME_SMOKE_PORT ?? 33179);
 const base = `http://127.0.0.1:${port}`;
+const resourceAudience = `${base}/resources/orders`;
+const opaqueResourceAudience = `${base}/resources/metrics`;
 const adminToken = 'authme-smoke-administration-token-0001';
 const databaseUrl = process.env.AUTHME_SMOKE_DATABASE_URL;
+const scimToken = 'authme-smoke-scim-token-0000000000000001';
+const scimSuffix = randomBytes(6).toString('hex');
 const config = loadConfig({
   AUTHME_DEV_MODE: 'true',
   AUTHME_PUBLIC_URL: base,
@@ -23,7 +27,26 @@ const config = loadConfig({
   AUTHME_FIELD_ENCRYPTION_KEY: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
   AUTHME_DEV_ADMIN_PASSWORD: 'AuthMe-Change-Me-Now-2026!',
   AUTHME_ENABLE_DYNAMIC_REGISTRATION: 'true',
-  ...(databaseUrl ? { DATABASE_URL: databaseUrl } : {}),
+  AUTHME_RESOURCE_SERVERS_JSON: JSON.stringify({
+    master: [{
+      audience: resourceAudience,
+      scopes: ['orders.read', 'roles', 'groups'],
+      authorized_client_ids: ['authme-dev'],
+      role_client_ids: ['orders-api'],
+      include_realm_roles: true,
+      include_groups: true,
+    }, {
+      audience: opaqueResourceAudience,
+      scopes: ['metrics.read'],
+      authorized_client_ids: ['authme-dev-service'],
+      introspection_client_ids: ['authme-dev'],
+      access_token_format: 'opaque',
+    }],
+  }),
+  ...(databaseUrl ? {
+    DATABASE_URL: databaseUrl,
+    AUTHME_SCIM_TOKENS_JSON: JSON.stringify({ master: [{ id: 'smoke-provisioner', token: scimToken }] }),
+  } : {}),
 });
 const runtime = await createAuthMeApp(config);
 const server = createServer(runtime.app);
@@ -80,12 +103,43 @@ try {
   const ready = await request(`${base}/health/ready`);
   assert(ready.status === 200, 'Readiness check failed');
 
+  if (databaseUrl) {
+    const scimBase = `${base}/scim/v2/realms/master`;
+    const scimHeaders = { authorization: `Bearer ${scimToken}`, 'content-type': 'application/scim+json' };
+    const scimDiscovery = await request(`${scimBase}/ServiceProviderConfig`, { headers: scimHeaders });
+    assert(scimDiscovery.status === 200, 'SCIM discovery failed');
+    const scimCreate = await request(`${scimBase}/Users`, {
+      method: 'POST',
+      headers: scimHeaders,
+      body: JSON.stringify({
+        schemas: ['urn:ietf:params:scim:schemas:core:2.0:User'],
+        userName: `smoke-scim-${scimSuffix}`,
+        externalId: `smoke-scim-${scimSuffix}`,
+        displayName: 'SCIM Smoke User',
+        emails: [{ value: `smoke-scim-${scimSuffix}@example.test`, primary: true }],
+        active: true,
+      }),
+    });
+    const scimUser = await scimCreate.json();
+    assert(scimCreate.status === 201 && scimUser.id && scimUser.meta?.version, 'SCIM User creation failed');
+    const scimAudit = await runtime.store.listAudit('master', { limit: 20 });
+    assert(scimAudit.some(({ type, subjectId }) => type === 'scim.user.created' && subjectId === scimUser.id), 'SCIM mutation audit failed');
+  }
+
   const discoveryResponse = await request(`${base}/realms/master/.well-known/openid-configuration`);
   assert(discoveryResponse.status === 200, 'Discovery failed');
   const discovery = await discoveryResponse.json();
   assert(discovery.issuer === `${base}/realms/master`, 'Issuer mismatch');
   assert(!discovery.grant_types_supported.includes('implicit'), 'Implicit grant must not be advertised');
   assert(discovery.code_challenge_methods_supported.includes('S256'), 'S256 PKCE is not advertised');
+  assert(discovery.token_endpoint_auth_methods_supported.join(' ') === 'client_secret_basic none', 'Unsupported client authentication methods are advertised');
+  assert(discovery.subject_types_supported.includes('pairwise'), 'Pairwise subject identifiers are not advertised');
+  const oauthMetadataResponse = await request(`${base}/.well-known/oauth-authorization-server/realms/master`);
+  const oauthMetadata = await oauthMetadataResponse.json();
+  assert(oauthMetadataResponse.status === 200, 'RFC 8414 metadata failed');
+  for (const endpoint of ['authorization_endpoint', 'token_endpoint', 'jwks_uri', 'introspection_endpoint']) {
+    assert(oauthMetadata[endpoint] === discovery[endpoint], `RFC 8414 ${endpoint} does not use the realm mount`);
+  }
   const basic = `Basic ${Buffer.from('authme-dev:authme-dev-secret-change-me').toString('base64')}`;
 
   const malformedAuthorization = new URL(discovery.authorization_endpoint);
@@ -120,6 +174,7 @@ try {
     body: JSON.stringify({
       client_name: 'AuthMe smoke dynamically registered client',
       redirect_uris: ['http://127.0.0.1:3002/callback'],
+      web_origins: ['http://127.0.0.1:3002'],
       response_types: ['code'],
       grant_types: ['authorization_code'],
       token_endpoint_auth_method: 'client_secret_basic',
@@ -127,6 +182,7 @@ try {
   });
   const registeredClient = await response.json();
   assert(response.status === 201 && registeredClient.client_id && registeredClient.client_secret, `Protected dynamic registration failed: ${JSON.stringify(registeredClient)}`);
+  assert(registeredClient.web_origins?.[0] === 'http://127.0.0.1:3002', 'Dynamic registration did not retain explicit web origins');
   response = await request(discovery.registration_endpoint, {
     method: 'POST',
     headers: { authorization: `Bearer ${registrationAuthorization.token}`, 'content-type': 'application/json' },
@@ -207,9 +263,111 @@ try {
   const verified = await jwtVerify(tokens.id_token, jwks, { issuer: discovery.issuer, audience: 'authme-dev' });
   assert(verified.payload.sub, 'ID token did not contain a subject');
 
-  response = await request(discovery.userinfo_endpoint, { headers: { authorization: `Bearer ${tokens.access_token}` } });
+  response = await request(discovery.userinfo_endpoint, {
+    headers: {
+      authorization: `Bearer ${tokens.access_token}`,
+      origin: 'http://127.0.0.1:3001',
+    },
+  });
   const userinfo = await response.json();
   assert(response.status === 200 && userinfo.preferred_username === 'admin', 'UserInfo failed');
+  assert(response.headers.get('access-control-allow-origin') === 'http://127.0.0.1:3001', 'Explicit client web origin was not allowed by CORS');
+
+  await runtime.store.updateUser('master', verified.payload.sub, {
+    roles: ['admin', 'member'],
+    groups: ['/administrators', '/engineering'],
+    clientRoles: {
+      'orders-api': ['orders.read'],
+      'payroll-api': ['payroll.read'],
+    },
+  });
+  const resourceVerifier = randomBytes(48).toString('base64url');
+  const resourceChallenge = createHash('sha256').update(resourceVerifier).digest('base64url');
+  const resourceAuthorization = new URL(discovery.authorization_endpoint);
+  resourceAuthorization.search = new URLSearchParams({
+    client_id: 'authme-dev',
+    redirect_uri: 'http://127.0.0.1:3001/callback',
+    response_type: 'code',
+    scope: 'openid roles groups orders.read',
+    resource: resourceAudience,
+    prompt: 'consent',
+    code_challenge: resourceChallenge,
+    code_challenge_method: 'S256',
+    state: `${state}-resource`,
+  });
+  response = await request(resourceAuthorization);
+  let resourceCallback;
+  for (let step = 0; step < 8; step += 1) {
+    const target = location(response);
+    if (target.startsWith('http://127.0.0.1:3001/callback')) {
+      resourceCallback = new URL(target);
+      break;
+    }
+    response = await request(target);
+    if (![301, 302, 303, 307, 308].includes(response.status)) {
+      html = await response.text();
+      if (response.status === 200 && html.includes('/confirm')) {
+        assert(html.includes('orders.read'), 'Resource-server consent did not disclose the API scope');
+        response = await form(`${target}/confirm`, { csrf: csrf(html) });
+      } else {
+        throw new Error(`Unexpected resource authorization response ${response.status}`);
+      }
+    }
+  }
+  assert(resourceCallback, 'Resource authorization did not return to the client');
+  response = await form(discovery.token_endpoint, {
+    grant_type: 'authorization_code',
+    code: resourceCallback.searchParams.get('code'),
+    redirect_uri: 'http://127.0.0.1:3001/callback',
+    code_verifier: resourceVerifier,
+  }, { authorization: basic });
+  const resourceTokens = await response.json();
+  assert(response.status === 200 && resourceTokens.access_token?.split('.').length === 3, `Resource token was not a JWT: ${JSON.stringify(resourceTokens)}`);
+  const resourceVerified = await jwtVerify(resourceTokens.access_token, jwks, {
+    issuer: discovery.issuer,
+    audience: resourceAudience,
+    typ: 'at+jwt',
+  });
+  assert(resourceVerified.protectedHeader.typ === 'at+jwt', 'Resource access token type is not at+jwt');
+  assert(resourceVerified.payload.client_id === 'authme-dev', 'Resource token client_id is incorrect');
+  assert(resourceVerified.payload.realm_access?.roles.includes('member'), 'Resource token omitted configured realm roles');
+  assert(resourceVerified.payload.resource_access?.['orders-api']?.roles.includes('orders.read'), 'Resource token omitted audience roles');
+  assert(!resourceVerified.payload.resource_access?.['payroll-api'], 'Resource token leaked roles for another audience');
+  assert(resourceVerified.payload.groups?.includes('/engineering'), 'Resource token omitted configured groups');
+
+  response = await request(discovery.userinfo_endpoint, { headers: { authorization: `Bearer ${resourceTokens.access_token}` } });
+  assert(response.status === 401, 'An audience-bound API token was accepted at UserInfo');
+  response = await form(discovery.introspection_endpoint, { token: resourceTokens.access_token }, { authorization: basic });
+  const jwtIntrospection = await response.json();
+  assert(response.status === 400 && jwtIntrospection.error === 'unsupported_token_type', 'JWT introspection did not fail with the provider-defined error');
+
+  const serviceBasic = `Basic ${Buffer.from('authme-dev-service:authme-dev-service-secret-change-me').toString('base64')}`;
+  response = await form(discovery.token_endpoint, {
+    grant_type: 'client_credentials',
+    scope: 'metrics.read',
+    resource: opaqueResourceAudience,
+  }, { authorization: serviceBasic });
+  const opaqueResourceToken = await response.json();
+  assert(response.status === 200 && opaqueResourceToken.access_token?.split('.').length !== 3, 'Opaque resource server did not receive an opaque token');
+  response = await form(discovery.introspection_endpoint, {
+    token: opaqueResourceToken.access_token,
+  }, { authorization: basic });
+  const delegatedIntrospection = await response.json();
+  assert(response.status === 200 && delegatedIntrospection.active === true, 'Authorized resource-server introspection failed');
+  assert(delegatedIntrospection.aud === opaqueResourceAudience, 'Introspection returned the wrong resource audience');
+  const dynamicBasic = `Basic ${Buffer.from(`${registeredClient.client_id}:${registeredClient.client_secret}`).toString('base64')}`;
+  response = await form(discovery.introspection_endpoint, {
+    token: opaqueResourceToken.access_token,
+  }, { authorization: dynamicBasic });
+  const deniedIntrospection = await response.json();
+  assert(response.status === 200 && deniedIntrospection.active === false, 'Unauthorized client introspected another resource token');
+  response = await form(discovery.token_endpoint, {
+    grant_type: 'client_credentials',
+    scope: 'orders.read',
+    resource: resourceAudience,
+  }, { authorization: serviceBasic });
+  const deniedResource = await response.json();
+  assert(response.status === 400 && deniedResource.error === 'invalid_target', 'Unauthorized client received a token for another resource');
 
   response = await form(discovery.token_endpoint, {
     grant_type: 'refresh_token', refresh_token: tokens.refresh_token,
@@ -339,7 +497,7 @@ try {
   });
   assert(response.status === 401, 'A consumed recovery code was accepted again');
 
-  console.log('AuthMe smoke test passed: discovery, protected registration, consent disclosure, PKCE, signed ID token, UserInfo, refresh-family replay defense, introspection, revocation, device flow, atomic TOTP enrollment, MFA enforcement, and one-use recovery.');
+  console.log(`AuthMe smoke test passed: OIDC/RFC 8414 discovery, protected registration, consent disclosure, PKCE, signed ID and audience-bound access tokens, filtered resource claims, delegated opaque-token introspection, UserInfo, refresh-family replay defense, revocation, device flow, atomic TOTP enrollment, MFA enforcement, one-use recovery${databaseUrl ? ', and authenticated SCIM provisioning/audit' : ''}.`);
 } finally {
   await new Promise((resolve) => server.close(resolve));
   await runtime.close();

@@ -1,6 +1,7 @@
 import pg from 'pg';
 import { claimMemoryInitialAccessToken, createMemoryAdapter, revokeMemoryAccount } from './adapters/memory.js';
 import { createPostgresAdapter } from './adapters/postgres.js';
+import { verifyMigrationState } from './migrations.js';
 import { MemoryIdentityStore, PostgresIdentityStore } from './repositories/identity-store.js';
 
 const revokeAccountSql = `WITH account_grants AS MATERIALIZED (
@@ -21,6 +22,14 @@ const revokeAccountSql = `WITH account_grants AS MATERIALIZED (
   WHERE records.realm_name=doomed.realm_name
     AND records.model=doomed.model AND records.id=doomed.id`;
 
+async function restoreMemoryWebAuthnCredentials(store, realm, accountId, snapshot) {
+  const current = await store.listWebAuthnCredentials(realm, accountId);
+  for (const credential of current) {
+    await store.deleteWebAuthnCredential(realm, accountId, credential.id);
+  }
+  for (const credential of snapshot) await store.createWebAuthnCredential(credential);
+}
+
 export async function createDataLayer(config) {
   if (!config.databaseUrl) {
     if (!config.devMode) throw new Error('The in-memory store is permitted only in development mode');
@@ -36,16 +45,38 @@ export async function createDataLayer(config) {
       }),
       async claimInitialAccessToken(realm, id) { return claimMemoryInitialAccessToken(realm, id); },
       async revokeAccount(realm, accountId) { return revokeMemoryAccount(realm, accountId); },
+      async deleteAccount(realm, accountId, auditEvent) {
+        const credentials = await store.listWebAuthnCredentials(realm, accountId);
+        const user = await store.deleteUser(realm, accountId);
+        if (!user) return { found: false, user: null };
+        try {
+          if (auditEvent) await store.writeAudit(auditEvent);
+        } catch (error) {
+          await store.createUser(user);
+          await restoreMemoryWebAuthnCredentials(store, realm, accountId, credentials);
+          throw error;
+        }
+        revokeMemoryAccount(realm, accountId);
+        return { found: true, user };
+      },
       async mutateAccountSecurity(realm, accountId, mutate) {
         const current = await store.findUserById(realm, accountId);
         if (!current) return { found: false, applied: false, result: null, user: null };
-        const result = await mutate(store);
+        const credentials = await store.listWebAuthnCredentials(realm, accountId);
+        let result;
+        try {
+          result = await mutate(store);
+        } catch (error) {
+          await store.restoreUser(current);
+          await restoreMemoryWebAuthnCredentials(store, realm, accountId, credentials);
+          throw error;
+        }
         if (!result) return { found: true, applied: false, result, user: await store.findUserById(realm, accountId) };
         await store.bumpSecurityVersion(realm, accountId);
         revokeMemoryAccount(realm, accountId);
         return { found: true, applied: true, result, user: await store.findUserById(realm, accountId) };
       },
-      async cleanupExpired() { return 0; },
+      async cleanupExpired(limit = 1000) { return store.cleanupExpiredWebAuthnChallenges(limit); },
       async cleanupAudit() { return 0; },
       async close() { await store.close(); },
     };
@@ -59,13 +90,19 @@ export async function createDataLayer(config) {
     application_name: 'authme',
   });
   const store = new PostgresIdentityStore(pool);
-  await store.ready();
-  for (const realm of config.realms) {
-    await pool.query(
-      `INSERT INTO realms (name, display_name) VALUES ($1, $2)
-       ON CONFLICT (name) DO UPDATE SET display_name=EXCLUDED.display_name`,
-      [realm, realm === 'master' ? 'Master' : realm],
-    );
+  try {
+    await store.ready();
+    if (!config.devMode) await verifyMigrationState(pool);
+    for (const realm of config.realms) {
+      await pool.query(
+        `INSERT INTO realms (name, display_name) VALUES ($1, $2)
+         ON CONFLICT (name) DO UPDATE SET display_name=EXCLUDED.display_name`,
+        [realm, realm === 'master' ? 'Master' : realm],
+      );
+    }
+  } catch (error) {
+    await pool.end().catch(() => {});
+    throw error;
   }
   return {
     pool,
@@ -84,6 +121,31 @@ export async function createDataLayer(config) {
     async revokeAccount(realm, accountId) {
       const result = await pool.query(revokeAccountSql, [realm, accountId]);
       return result.rowCount;
+    },
+    async deleteAccount(realm, accountId, auditEvent) {
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const locked = await client.query(
+          'SELECT id FROM users WHERE realm_name=$1 AND id=$2 FOR UPDATE',
+          [realm, accountId],
+        );
+        if (locked.rowCount !== 1) {
+          await client.query('ROLLBACK');
+          return { found: false, user: null };
+        }
+        await client.query(revokeAccountSql, [realm, accountId]);
+        const transactionalStore = new PostgresIdentityStore(client);
+        const user = await transactionalStore.deleteUser(realm, accountId);
+        if (auditEvent) await transactionalStore.writeAudit(auditEvent);
+        await client.query('COMMIT');
+        return { found: true, user };
+      } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw error;
+      } finally {
+        client.release();
+      }
     },
     async mutateAccountSecurity(realm, accountId, mutate) {
       const client = await pool.connect();
@@ -120,7 +182,7 @@ export async function createDataLayer(config) {
       }
     },
     async cleanupExpired(limit = 1000) {
-      const result = await pool.query(
+      const oidc = await pool.query(
         `DELETE FROM oidc_records WHERE ctid IN (
            SELECT ctid FROM oidc_records
          WHERE expires_at <= CURRENT_TIMESTAMP
@@ -129,7 +191,7 @@ export async function createDataLayer(config) {
          )`,
         [limit],
       );
-      return result.rowCount;
+      return oidc.rowCount + await store.cleanupExpiredWebAuthnChallenges(limit);
     },
     async cleanupAudit(retentionDays, limit = 1000) {
       const result = await pool.query(

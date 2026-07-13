@@ -2,15 +2,15 @@
 
 ## Status and scope
 
-This document describes the AuthMe v0.1 architecture. In this document:
+This document describes the AuthMe v0.2 architecture. In this document:
 
-- **Implemented** means the behavior is part of the v0.1 repository and is expected to be covered by automated tests.
+- **Implemented** means the behavior is part of the v0.2 repository and is expected to be covered by automated tests.
 - **Staged** means the architecture reserves a boundary for it, but operators must not depend on it yet.
 - **Library capability** means `oidc-provider` can implement the protocol, but AuthMe has not necessarily enabled, configured, tested, or certified it.
 
 AuthMe is a standalone, multi-realm OpenID Provider for Node.js 22. It uses [`oidc-provider` 9.9.1](https://oidc-provider.dev/changelog/#_9-9-1-2026-07-07) for standards-sensitive OAuth 2.0 and OpenID Connect behavior rather than implementing those protocols independently. The upstream project is OpenID and FAPI certified and documents its supported specifications in its [official repository](https://github.com/panva/node-oidc-provider#implemented-specs--features). AuthMe still owns its configuration, interaction UI, storage adapter, tenant isolation, operational controls, and conformance testing.
 
-v0.1 is a secure OIDC foundation. It is not yet a complete replacement for every Keycloak feature. The exact boundary is documented in [keycloak-compatibility.md](keycloak-compatibility.md) and [roadmap.md](roadmap.md).
+v0.2 is a secure identity foundation with downstream OAuth/OIDC, upstream OIDC and SAML federation, LDAP/AD authentication, SCIM provisioning, and password/TOTP/passkey credentials. It is not yet a complete replacement for every Keycloak feature. The exact boundary is documented in [keycloak-compatibility.md](keycloak-compatibility.md), [federation-and-provisioning.md](federation-and-provisioning.md), and [roadmap.md](roadmap.md).
 
 ## Design goals
 
@@ -22,9 +22,9 @@ v0.1 is a secure OIDC foundation. It is not yet a complete replacement for every
 6. Make unsafe production configuration fail at startup.
 7. Keep optional infrastructure, such as Redis, outside the correctness path.
 
-## Explicit non-goals for v0.1
+## Explicit non-goals for v0.2
 
-v0.1 does not claim SAML, LDAP/Active Directory, Kerberos, identity brokering, SCIM, WebAuthn/passkeys, configurable authentication flows, Keycloak Admin REST compatibility, UMA authorization services, multi-site active/active operation, or OpenID certification of the AuthMe product. These are staged capabilities.
+v0.2 does not claim Kerberos/SPNEGO, RADIUS, X.509 login, SAML IdP operation, encrypted or IdP-initiated SAML, inbound LDAP synchronization, SCIM Bulk/full filter grammar, configurable authentication flows, Keycloak Admin REST compatibility, UMA authorization services, multi-site active/active operation, WebAuthn attestation assurance, imported U2F credentials, or OpenID certification of the AuthMe product. These are staged capabilities.
 
 ## Runtime topology
 
@@ -78,7 +78,7 @@ https://auth.example.com/realms/{realm}
 
 Realm slugs are URL-safe, unique, and immutable after exposure. Renaming a realm changes its issuer and therefore breaks token validation and relying-party configuration. Create a replacement realm instead of renaming an issuer in place.
 
-The v0.1 compatibility facade exposes these Keycloak-shaped paths:
+The v0.2 compatibility facade exposes these Keycloak-shaped paths:
 
 ```text
 /realms/{realm}/.well-known/openid-configuration
@@ -103,9 +103,10 @@ Every repository operation is realm-scoped. Compound uniqueness and foreign-key 
 
 AuthMe pins `oidc-provider` to 9.9.1. It does not fork protocol code. The pin is updated only through a reviewed dependency change with protocol, migration, and conformance tests.
 
-The supported v0.1 profile is deliberately smaller than the upstream library's capability surface:
+The supported v0.2 profile is deliberately smaller than the upstream library's capability surface:
 
 - OpenID Provider discovery and JWKS publication.
+- OAuth Authorization Server metadata at the RFC 8414 path for realm issuers.
 - Authorization Code flow.
 - PKCE using `S256`.
 - Refresh tokens where allowed by client policy.
@@ -118,10 +119,26 @@ The supported v0.1 profile is deliberately smaller than the upstream library's c
 - Pushed Authorization Requests (PAR).
 - DPoP-bound access tokens.
 - Dynamic client registration protected by an initial access token.
+- RFC 8707 resource indicators for explicitly configured API audiences, with JWT or opaque access-token policy per audience.
 
 Advanced endpoints are consumed from discovery metadata; clients must not guess their paths. [Dynamic registration](https://www.rfc-editor.org/rfc/rfc7591.html) requires a short-lived initial access token issued through the AuthMe administration API and is not an anonymous client-creation API. DPoP clients create a proof for the intended method and URL and handle provider nonce responses where required. PAR request URIs and device/user codes are short-lived provider artifacts persisted through the PostgreSQL adapter.
 
-Implicit flow, Resource Owner Password Credentials, CIBA, JAR, JARM, mTLS, and FAPI profiles are not part of the v0.1 product contract unless a release explicitly enables and tests them. The OAuth Security Best Current Practice requires authorization servers to support PKCE, requires it for public clients, recommends it for confidential clients, and requires exact redirect URI matching; see [RFC 9700](https://www.rfc-editor.org/rfc/rfc9700.html). PAR is defined by [RFC 9126](https://www.rfc-editor.org/rfc/rfc9126.html), DPoP by [RFC 9449](https://www.rfc-editor.org/rfc/rfc9449.html), and Device Authorization by [RFC 8628](https://www.rfc-editor.org/rfc/rfc8628.html).
+The v0.2 token-endpoint authentication allowlist is deliberately narrow:
+`client_secret_basic` for confidential clients and `none` for public clients.
+The provider advertises public and pairwise subject types. Pairwise identifiers
+are realm- and sector-bound HMAC values derived with `AUTHME_SUBJECT_SALT`.
+
+An ordinary OIDC access token without a `resource` audience remains opaque and
+is usable at UserInfo. A configured RFC 8707 resource produces an
+audience-bound token in that resource's declared format. JWT resource tokens
+use `typ: at+jwt` and are validated locally using the realm JWKS, issuer,
+audience, signature, and time claims. The upstream provider intentionally
+rejects JWTs at introspection and revocation; configured opaque resource tokens
+can instead be introspected by confidential clients explicitly listed for that
+audience and checked online for security-state changes. Offline JWT validators
+accept a token until its short expiration unless they operate a denylist.
+
+Implicit flow, Resource Owner Password Credentials, CIBA, JAR, JARM, mTLS, and FAPI profiles are not part of the v0.2 product contract unless a release explicitly enables and tests them. The OAuth Security Best Current Practice requires authorization servers to support PKCE, requires it for public clients, recommends it for confidential clients, and requires exact redirect URI matching; see [RFC 9700](https://www.rfc-editor.org/rfc/rfc9700.html). PAR is defined by [RFC 9126](https://www.rfc-editor.org/rfc/rfc9126.html), DPoP by [RFC 9449](https://www.rfc-editor.org/rfc/rfc9449.html), and Device Authorization by [RFC 8628](https://www.rfc-editor.org/rfc/rfc8628.html).
 
 ## Persistence
 
@@ -143,7 +160,7 @@ Process memory may cache non-sensitive, reconstructable configuration for bounde
 
 ## Redis boundary
 
-Redis is optional and is used only for shared rate-limit counters in v0.1. It is not the source of truth for users, clients, sessions, grants, tokens, or signing keys.
+Redis is optional and is used only for shared rate-limit counters in v0.2. It is not the source of truth for users, clients, sessions, grants, tokens, or signing keys.
 
 - Without Redis, a single-node deployment uses local rate limiting.
 - A multi-node production deployment should configure Redis so limits are enforced across replicas.
@@ -154,9 +171,21 @@ Redis is optional and is used only for shared rate-limit counters in v0.1. It is
 
 AuthMe owns the account lookup used by `oidc-provider`. A subject identifier is stable within its realm and must not be recycled. Client-visible identity claims are minimized to the scopes and mappers allowed for that client.
 
-Passwords are hashed with Argon2id plus an independent deployment pepper. v0.1 also implements [RFC 6238](https://www.rfc-editor.org/rfc/rfc6238.html)-compatible TOTP as a second factor and one-use recovery codes. TOTP secrets are protected with the field-encryption key and realm/user-bound context; recovery codes are shown once and stored as keyed digests. TOTP is not phishing-resistant. WebAuthn/passkeys are staged.
+Passwords are hashed with Argon2id plus an independent deployment pepper. v0.2 also implements [RFC 6238](https://www.rfc-editor.org/rfc/rfc6238.html)-compatible TOTP as a second factor and one-use recovery codes. TOTP secrets are protected with the field-encryption key and realm/user-bound context; recovery codes are shown once and stored as keyed digests. TOTP is not phishing-resistant.
 
-For migration compatibility, v0.1 can emit Keycloak-shaped authorization claims:
+Fresh passkey registration and passwordless interaction login use the maintained `@simplewebauthn/server` verifier. AuthMe requires discoverable credentials and authenticator user verification, derives non-identifying realm-scoped user handles, checks the exact configured origin and RP hostname, persists credential public keys/counters/transports, and atomically consumes short-lived server-side challenges. Registration requests use `attestation: none`; stored AAGUID/device metadata is descriptive and is not an attestation trust decision. Because realms share one path-based origin, the browser RP ID is common while database credentials, user handles, and challenges remain realm-scoped.
+
+## Identity extensions, federation, and provisioning
+
+Trusted built-in identity modules register through the versioned `authme.identity/v1` contract. An extension declares an `authenticator`, `federation`, or `provisioning` kind plus stable capabilities; the realm registry exposes only enabled entries. This isolates protocol code while keeping extensions compile-time reviewed and deployed with AuthMe. Arbitrary runtime plugin loading is deliberately not part of the trust model.
+
+LDAP/AD authentication uses an exact realm provider configuration, escaped and bounded directory search, a distinct user bind, TLS certificate validation, and an immutable directory subject. OIDC federation uses Authorization Code + PKCE with provider-bound one-use state and nonce, fixed endpoints, strict issuer/signature/audience/subject validation, and no redirect following. SAML federation publishes provider-specific SP metadata/ACS endpoints, binds RelayState to the active OIDC interaction, requires signed Response and Assertion validation, and persists response/assertion replay keys through the realm adapter.
+
+All external identities resolve through the `federated_identities` repository by realm, provider ID, canonical issuer, and upstream subject. Username/email collisions fail closed and require an explicit administration link. JIT account creation is provider opt-in. Upstream callback completion is converted to a short-lived, one-use same-origin handle before finishing the downstream OIDC interaction, so upstream assertions or tokens never enter an AuthMe front-channel URL.
+
+SCIM is a realm-scoped PostgreSQL provisioning surface under `/scim/v2/realms/{realm}`. Its Users and Groups map to the canonical identity tables, use optimistic ETag comparison, synchronize membership, and advance account security/revoke current state on identity changes. Discovery and core `eq` filtering are implemented; Bulk, sorting, arbitrary extension schemas, and the full filter grammar are outside this release. Configuration and endpoint details are in [federation-and-provisioning.md](federation-and-provisioning.md).
+
+For migration compatibility, v0.2 can emit Keycloak-shaped authorization claims:
 
 ```json
 {
@@ -172,13 +201,18 @@ For migration compatibility, v0.1 can emit Keycloak-shaped authorization claims:
 }
 ```
 
-Realm roles and client roles use separate namespaces. Claim emission is a client policy decision; possession of a role in the database does not imply that every token receives it. Composite roles and configurable protocol mappers are staged.
+Realm roles and client roles use separate namespaces. Resource-token claim
+emission requires both a granted `roles` or `groups` scope and the audience's
+explicit claim policy. `resource_access` is filtered to the configured role
+client IDs for that audience, so unrelated client assignments are not leaked.
+Possession of a role in the database does not imply that every token receives
+it. Composite roles and configurable protocol mappers are staged.
 
 ## Administration and audit
 
-v0.1 exposes a small AuthMe administration API protected by a dedicated bearer token. It manages the implemented user/client/bootstrap surface; it is not wire-compatible with the Keycloak Admin REST API and is not a substitute for delegated realm administration.
+v0.2 exposes a small AuthMe administration API protected by a dedicated bearer token. It manages the implemented user/client/bootstrap surface; it is not wire-compatible with the Keycloak Admin REST API and is not a substitute for delegated realm administration.
 
-The administration token is deployment-wide high privilege. It must be supplied through secret management, compared without timing leakage, restricted at the network layer where possible, rotated independently, and excluded from logs. Each administrative mutation emits a synchronous realm-scoped JSON audit record. High-volume protocol events use a bounded, sampled writer so unauthenticated traffic cannot create an unbounded database waiter queue; dropped/sampled/write-failure outcomes are metrics. PostgreSQL retention cleanup removes audit rows older than the configured window. Fine-grained administrator identities, roles, approvals, and a full console are staged.
+The administration token is deployment-wide high privilege. It must be supplied through secret management, compared without timing leakage, restricted at the network layer where possible, rotated independently, and excluded from logs. Administrative mutations synchronously write realm-scoped JSON audit records. Account-security changes, session revocation, and deletion commit their audit with the PostgreSQL mutation; user creation, unlock, and TOTP-enrollment start currently audit immediately after their mutation, so an audit-storage failure can produce an ambiguous `5xx` that operators must reconcile. High-volume protocol events use a bounded, sampled writer so unauthenticated traffic cannot create an unbounded database waiter queue; dropped/sampled/write-failure outcomes are metrics. PostgreSQL retention cleanup removes audit rows older than the configured window. Fine-grained administrator identities, roles, approvals, a transactional outbox, and a full console are staged.
 
 ## Cryptographic boundary
 
@@ -190,7 +224,7 @@ Each realm has its own logical signing keyring. Production private keys must be 
 2. **Retiring**: remains in JWKS for verification but does not sign new tokens.
 3. **Removed**: deleted only after every token it could have signed has expired, including clock skew and caches.
 
-KMS/HSM-backed signing and automated rotation are staged. v0.1 operators are responsible for controlled key injection and rotation.
+KMS/HSM-backed signing and automated rotation are staged. v0.2 operators are responsible for controlled key injection and rotation.
 
 ## Internal boundaries
 
@@ -212,7 +246,7 @@ Protocol routes do not query tables directly. They use provider/application inte
 
 AuthMe nodes are intended to be stateless between requests. PostgreSQL availability determines authentication availability. Redis availability affects shared throttling, not durable identity state.
 
-v0.1 targets a single PostgreSQL primary, optionally with platform-managed standby/failover. Multi-region active/active writes are not supported. Clock synchronization is required on application and database hosts because token validity is time-dependent.
+v0.2 targets a single PostgreSQL primary, optionally with platform-managed standby/failover. Multi-region active/active writes are not supported. Clock synchronization is required on application and database hosts because token validity is time-dependent.
 
 The service exposes separate liveness and readiness concepts:
 
