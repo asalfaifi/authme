@@ -49,7 +49,6 @@ jobs:
       AUTHME_REALMS: master
       DATABASE_URL: postgresql://authme:authme-ci-only@127.0.0.1:5432/authme_test
       REDIS_URL: redis://127.0.0.1:6379/0
-      AUTHME_JWKS_DIR: ${{ runner.temp }}/authme-jwks
       AUTHME_DEV_MODE: "false"
       AUTHME_TRUST_PROXY: "false"
       AUTHME_LOG_LEVEL: error
@@ -69,8 +68,10 @@ jobs:
       - name: Generate ephemeral test secrets
         shell: bash
         run: |
+          AUTHME_JWKS_DIR="$RUNNER_TEMP/authme-jwks"
           mkdir -p "$AUTHME_JWKS_DIR"
           {
+            echo "AUTHME_JWKS_DIR=$AUTHME_JWKS_DIR"
             echo "AUTHME_COOKIE_KEYS=$(openssl rand -hex 32),$(openssl rand -hex 32)"
             echo "AUTHME_CSRF_SECRET=$(openssl rand -hex 32)"
             echo "AUTHME_PASSWORD_PEPPER=$(openssl rand -hex 32)"
