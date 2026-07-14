@@ -273,7 +273,13 @@ test('administrator console uses its real OIDC flow and enforces session boundar
     server.on('request', runtime.app);
 
     const anonymous = new CookieClient(baseUrl);
-    let response = await anonymous.get('/admin/');
+    const loopbackAlias = new CookieClient(`http://localhost:${address.port}`);
+    let response = await loopbackAlias.get('/admin/');
+    assert.equal(response.status, 302);
+    assert.equal(response.headers.get('location'), `${baseUrl}/admin/`);
+    assert.equal(response.headers.get('cache-control'), 'no-store');
+
+    response = await anonymous.get('/admin/');
     const loginHtml = await response.text();
     assert.equal(response.status, 200);
     assert.match(response.headers.get('cache-control') ?? '', /no-store/iu);
@@ -301,6 +307,16 @@ test('administrator console uses its real OIDC flow and enforces session boundar
       assert(originBody.length <= 512, 'Invalid-origin response was not bounded');
       assert.equal(JSON.parse(originBody).title, 'Invalid request origin');
     }
+    response = await anonymous.request('/admin/ui/login', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/x-www-form-urlencoded;charset=UTF-8',
+        origin: `http://localhost:${address.port}`,
+      },
+      body: loginBody,
+    });
+    assert.equal(response.status, 303);
+    assert.equal(response.headers.get('location'), `${baseUrl}/admin/`);
 
     const throttled = new CookieClient(baseUrl);
     throttled.cookies.set('authme_admin_console\u0000/admin', {

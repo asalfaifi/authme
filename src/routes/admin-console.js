@@ -84,6 +84,23 @@ function sameOrigin(req, config) {
   return origin === config.publicUrl;
 }
 
+function requestOrigin(req) {
+  try {
+    return new URL(`${req.protocol}://${req.get('host')}`).origin;
+  } catch {
+    return null;
+  }
+}
+
+function isLoopbackOrigin(value) {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'http:' && ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname);
+  } catch {
+    return false;
+  }
+}
+
 function csrfFor(sessionValue, config) {
   return createHmac('sha256', config.csrfSecret)
     .update(`authme-admin-console-csrf-v1\u0000${sessionValue}`)
@@ -223,6 +240,9 @@ export function createAdminConsole({ config, store, rateLimits, jwksByRealm, fet
   async function beginLogin(req, res, realm, { jsonResponse = false, rateLimited = false } = {}) {
     if (!sameOrigin(req, config)) {
       consoleHeaders(res);
+      if (config.devMode && isLoopbackOrigin(req.get('origin')) && isLoopbackOrigin(config.publicUrl)) {
+        return res.redirect(303, new URL('/admin/', config.publicUrl).toString());
+      }
       return problem(
         res,
         403,
@@ -264,6 +284,9 @@ export function createAdminConsole({ config, store, rateLimits, jwksByRealm, fet
   router.get('/', async (req, res, next) => {
     try {
       consoleHeaders(res);
+      if (config.devMode && requestOrigin(req) !== config.publicUrl) {
+        return res.redirect(302, new URL('/admin/', config.publicUrl).toString());
+      }
       const { authentication, handled } = await authenticateConsoleRequest(req, res);
       if (handled) return undefined;
       if (!authentication) {
