@@ -76,7 +76,13 @@ function key(identity) {
 }
 
 function userProviderKey(identity, userId) {
-  return `user-provider\0${identity.realm}\0${userId}\0${identity.providerId}\0${identity.issuer}`;
+  return JSON.stringify([
+    'user-provider',
+    identity.realm,
+    userId,
+    identity.providerId,
+    identity.issuer,
+  ]);
 }
 
 function syntheticEmail(userId) {
@@ -297,6 +303,9 @@ export class PostgresFederatedIdentityRepository {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
+      await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [
+        userProviderKey(identity, input.userId),
+      ]);
       const user = await client.query(
         'SELECT 1 FROM users WHERE realm_name=$1 AND id=$2 FOR KEY SHARE',
         [identity.realm, input.userId],
