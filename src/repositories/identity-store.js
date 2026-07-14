@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { isIP } from 'node:net';
+import { normalizeAdminPermissions } from '../security/admin-permissions.js';
 
 function nowIso() {
   return new Date().toISOString();
@@ -58,6 +59,46 @@ function normalizeWebAuthnCredential(input) {
   };
 }
 
+function normalizeAdminGrant(input) {
+  const version = Number(input.version ?? 1);
+  if (!Number.isSafeInteger(version) || version < 1) throw new TypeError('Administrator grant version is invalid');
+  return {
+    realm: input.realm,
+    userId: input.userId,
+    permissions: [...normalizeAdminPermissions(input.permissions)],
+    enabled: input.enabled !== false,
+    version,
+    createdAt: input.createdAt ?? nowIso(),
+    updatedAt: input.updatedAt ?? nowIso(),
+  };
+}
+
+function normalizeAdminSession(input) {
+  if (!/^[A-Za-z0-9_-]{43}$/.test(input.idDigest ?? '')) throw new TypeError('Administrator session digest is invalid');
+  const grantVersion = Number(input.grantVersion);
+  const securityVersion = Number(input.securityVersion);
+  if (!Number.isSafeInteger(grantVersion) || grantVersion < 1
+    || !Number.isSafeInteger(securityVersion) || securityVersion < 0) {
+    throw new TypeError('Administrator session version snapshot is invalid');
+  }
+  const expiresAt = new Date(input.expiresAt);
+  const idleExpiresAt = new Date(input.idleExpiresAt);
+  if (!Number.isFinite(expiresAt.getTime()) || !Number.isFinite(idleExpiresAt.getTime())) {
+    throw new TypeError('Administrator session expiry is invalid');
+  }
+  return {
+    idDigest: input.idDigest,
+    realm: input.realm,
+    userId: input.userId,
+    grantVersion,
+    securityVersion,
+    createdAt: input.createdAt ?? nowIso(),
+    lastSeenAt: input.lastSeenAt ?? nowIso(),
+    idleExpiresAt: idleExpiresAt.toISOString(),
+    expiresAt: expiresAt.toISOString(),
+  };
+}
+
 function rowToWebAuthnCredential(row) {
   if (!row) return null;
   return normalizeWebAuthnCredential({
@@ -101,6 +142,8 @@ export function publicUser(user) {
 
 export class MemoryIdentityStore {
   #users = new Map();
+  #adminGrants = new Map();
+  #adminSessions = new Map();
   #audit = [];
   #webauthnCredentials = new Map();
   #webauthnChallenges = new Map();
@@ -173,6 +216,10 @@ export class MemoryIdentityStore {
     const user = this.#users.get(key);
     if (!user) return null;
     this.#users.delete(key);
+    this.#adminGrants.delete(key);
+    for (const [digest, session] of this.#adminSessions) {
+      if (session.realm === realm && session.userId === id) this.#adminSessions.delete(digest);
+    }
     for (const [credentialKey, credential] of this.#webauthnCredentials) {
       if (credential.realm === realm && credential.userId === id) this.#webauthnCredentials.delete(credentialKey);
     }
@@ -186,6 +233,76 @@ export class MemoryIdentityStore {
     const restored = normalizeUser(user);
     this.#users.set(`${restored.realm}:${restored.id}`, structuredClone(restored));
     return structuredClone(restored);
+  }
+
+  async findAdminGrant(realm, userId) {
+    const grant = this.#adminGrants.get(`${realm}:${userId}`);
+    return grant ? structuredClone(grant) : null;
+  }
+
+  async upsertAdminGrant(realm, userId, permissions, { enabled = true } = {}) {
+    if (!this.#users.has(`${realm}:${userId}`)) return null;
+    const key = `${realm}:${userId}`;
+    const current = this.#adminGrants.get(key);
+    const grant = normalizeAdminGrant({
+      realm,
+      userId,
+      permissions,
+      enabled,
+      version: current ? current.version + 1 : 1,
+      createdAt: current?.createdAt,
+    });
+    this.#adminGrants.set(key, structuredClone(grant));
+    return structuredClone(grant);
+  }
+
+  async revokeAdminGrant(realm, userId) {
+    const current = this.#adminGrants.get(`${realm}:${userId}`);
+    if (!current) return null;
+    return this.upsertAdminGrant(realm, userId, current.permissions, { enabled: false });
+  }
+
+  async restoreAdminGrant(grant) {
+    const restored = normalizeAdminGrant(grant);
+    this.#adminGrants.set(`${restored.realm}:${restored.userId}`, structuredClone(restored));
+    return structuredClone(restored);
+  }
+
+  async createAdminSession(input) {
+    const session = normalizeAdminSession(input);
+    if (!this.#users.has(`${session.realm}:${session.userId}`) || this.#adminSessions.has(session.idDigest)) return null;
+    this.#adminSessions.set(session.idDigest, structuredClone(session));
+    return structuredClone(session);
+  }
+
+  async findAdminSession(idDigest) {
+    const session = this.#adminSessions.get(idDigest);
+    return session ? structuredClone(session) : null;
+  }
+
+  async touchAdminSession(idDigest, idleExpiresAt) {
+    const session = this.#adminSessions.get(idDigest);
+    if (!session) return null;
+    session.lastSeenAt = nowIso();
+    session.idleExpiresAt = new Date(idleExpiresAt).toISOString();
+    return structuredClone(session);
+  }
+
+  async deleteAdminSession(idDigest) {
+    return this.#adminSessions.delete(idDigest);
+  }
+
+  async cleanupExpiredAdminSessions(limit = 1000) {
+    let deleted = 0;
+    const now = Date.now();
+    for (const [digest, session] of this.#adminSessions) {
+      if (deleted >= limit) break;
+      if (new Date(session.expiresAt).getTime() <= now || new Date(session.idleExpiresAt).getTime() <= now) {
+        this.#adminSessions.delete(digest);
+        deleted += 1;
+      }
+    }
+    return deleted;
   }
 
   async rehashPasswordIfCurrent(realm, id, expectedHash, passwordHash) {
@@ -421,6 +538,34 @@ function rowToUser(row) {
   });
 }
 
+function rowToAdminGrant(row) {
+  if (!row) return null;
+  return normalizeAdminGrant({
+    realm: row.realm_name,
+    userId: row.user_id,
+    permissions: row.permissions,
+    enabled: row.enabled,
+    version: row.version,
+    createdAt: row.created_at?.toISOString?.() ?? row.created_at,
+    updatedAt: row.updated_at?.toISOString?.() ?? row.updated_at,
+  });
+}
+
+function rowToAdminSession(row) {
+  if (!row) return null;
+  return normalizeAdminSession({
+    idDigest: row.id_digest,
+    realm: row.realm_name,
+    userId: row.user_id,
+    grantVersion: row.grant_version,
+    securityVersion: row.security_version,
+    createdAt: row.created_at?.toISOString?.() ?? row.created_at,
+    lastSeenAt: row.last_seen_at?.toISOString?.() ?? row.last_seen_at,
+    idleExpiresAt: row.idle_expires_at?.toISOString?.() ?? row.idle_expires_at,
+    expiresAt: row.expires_at?.toISOString?.() ?? row.expires_at,
+  });
+}
+
 export class PostgresIdentityStore {
   constructor(pool) {
     this.pool = pool;
@@ -476,6 +621,85 @@ export class PostgresIdentityStore {
       [realm, limit, offset],
     );
     return result.rows.map(rowToUser);
+  }
+
+  async findAdminGrant(realm, userId) {
+    const result = await this.pool.query(
+      'SELECT * FROM admin_grants WHERE realm_name=$1 AND user_id=$2',
+      [realm, userId],
+    );
+    return rowToAdminGrant(result.rows[0]);
+  }
+
+  async upsertAdminGrant(realm, userId, permissions, { enabled = true } = {}) {
+    const normalized = normalizeAdminPermissions(permissions);
+    const result = await this.pool.query(
+      `INSERT INTO admin_grants (realm_name, user_id, permissions, enabled)
+       VALUES ($1,$2,$3,$4)
+       ON CONFLICT (realm_name, user_id) DO UPDATE
+         SET permissions=EXCLUDED.permissions, enabled=EXCLUDED.enabled,
+             version=admin_grants.version+1, updated_at=CURRENT_TIMESTAMP
+       RETURNING *`,
+      [realm, userId, [...normalized], Boolean(enabled)],
+    );
+    return rowToAdminGrant(result.rows[0]);
+  }
+
+  async revokeAdminGrant(realm, userId) {
+    const result = await this.pool.query(
+      `UPDATE admin_grants SET enabled=FALSE, version=version+1, updated_at=CURRENT_TIMESTAMP
+       WHERE realm_name=$1 AND user_id=$2 RETURNING *`,
+      [realm, userId],
+    );
+    return rowToAdminGrant(result.rows[0]);
+  }
+
+  async createAdminSession(input) {
+    const session = normalizeAdminSession(input);
+    const result = await this.pool.query(
+      `INSERT INTO admin_sessions
+        (id_digest, realm_name, user_id, grant_version, security_version,
+         created_at, last_seen_at, idle_expires_at, expires_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+       ON CONFLICT (id_digest) DO NOTHING
+       RETURNING *`,
+      [session.idDigest, session.realm, session.userId, session.grantVersion, session.securityVersion,
+        session.createdAt, session.lastSeenAt, session.idleExpiresAt, session.expiresAt],
+    );
+    return rowToAdminSession(result.rows[0]);
+  }
+
+  async findAdminSession(idDigest) {
+    const result = await this.pool.query('SELECT * FROM admin_sessions WHERE id_digest=$1', [idDigest]);
+    return rowToAdminSession(result.rows[0]);
+  }
+
+  async touchAdminSession(idDigest, idleExpiresAt) {
+    const result = await this.pool.query(
+      `UPDATE admin_sessions SET last_seen_at=CURRENT_TIMESTAMP, idle_expires_at=$2
+       WHERE id_digest=$1 AND expires_at>CURRENT_TIMESTAMP AND idle_expires_at>CURRENT_TIMESTAMP
+       RETURNING *`,
+      [idDigest, idleExpiresAt],
+    );
+    return rowToAdminSession(result.rows[0]);
+  }
+
+  async deleteAdminSession(idDigest) {
+    const result = await this.pool.query('DELETE FROM admin_sessions WHERE id_digest=$1', [idDigest]);
+    return result.rowCount === 1;
+  }
+
+  async cleanupExpiredAdminSessions(limit = 1000) {
+    const result = await this.pool.query(
+      `DELETE FROM admin_sessions WHERE id_digest IN (
+         SELECT id_digest FROM admin_sessions
+         WHERE expires_at<=CURRENT_TIMESTAMP OR idle_expires_at<=CURRENT_TIMESTAMP
+         ORDER BY LEAST(expires_at, idle_expires_at)
+         FOR UPDATE SKIP LOCKED LIMIT $1
+       )`,
+      [limit],
+    );
+    return result.rowCount;
   }
 
   async updateUser(realm, id, patch) {

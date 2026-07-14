@@ -30,6 +30,7 @@ try {
     roles: ['admin'],
     groups: ['/administrators'],
   });
+  await store.upsertAdminGrant(realm, user.id, ['*']);
   await store.writeAudit({ realm, type: 'system.bootstrap_user.created', subjectId: user.id });
   console.log(JSON.stringify(publicUser(user), null, 2));
 } finally {

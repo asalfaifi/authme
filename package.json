@@ -1,6 +1,6 @@
 {
   "name": "authme",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A standards-first, self-hosted identity and access server.",
   "type": "module",
   "private": false,

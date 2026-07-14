@@ -2,9 +2,9 @@
 
 ## Scope
 
-This threat model covers the AuthMe v0.2 standalone service, its browser interactions, OAuth/OIDC endpoints including device flow, PAR, DPoP, dynamic registration and logout, upstream OIDC and SAML federation, LDAP/AD authentication, SCIM Users/Groups provisioning, PostgreSQL adapter, password/TOTP/recovery/passkey credentials, optional Redis rate limiter, bearer-protected administration API, and deployment behind a TLS proxy.
+This threat model covers the AuthMe v0.3 standalone service, its browser interactions, OAuth/OIDC endpoints including device flow, PAR, DPoP, dynamic registration and logout, upstream OIDC and SAML federation, LDAP/AD authentication, SCIM Users/Groups provisioning, PostgreSQL adapter, password/TOTP/recovery/passkey credentials, optional Redis rate limiter, the OIDC-authenticated administration console, the separately bearer-protected root API, and deployment behind a TLS proxy.
 
-It does not claim to cover Kerberos/SPNEGO, RADIUS, X.509 login, encrypted or IdP-initiated SAML, SAML IdP operation, inbound LDAP synchronization, SCIM Bulk/full filtering, imported U2F/WebAuthn credentials, authenticator attestation trust policy, KMS/HSM integration, a delegated administrator/account console, passkey recovery, or multi-site operation. Those features require their own threat-model updates before release.
+It does not claim to cover Kerberos/SPNEGO, RADIUS, X.509 login, encrypted or IdP-initiated SAML, SAML IdP operation, inbound LDAP synchronization, SCIM Bulk/full filtering, imported U2F/WebAuthn credentials, authenticator attestation trust policy, KMS/HSM integration, approval-backed administrator-grant lifecycle, organization-level delegation, a self-service account console, passkey recovery, or multi-site operation. Those features require their own threat-model updates before release.
 
 Normative protocol guidance comes from [OpenID Connect Core](https://openid.net/specs/openid-connect-core-1_0.html), the [OAuth 2.0 Security Best Current Practice](https://www.rfc-editor.org/rfc/rfc9700.html), and [JWT Best Current Practices](https://www.rfc-editor.org/rfc/rfc8725.html).
 
@@ -27,6 +27,7 @@ AuthMe must:
 - Client credentials.
 - Realm signing private keys.
 - Browser sessions, grants, authorization codes, access tokens, refresh tokens, and replay records.
+- Realm-scoped administrator grants, opaque console session bearers, and their durable digests/version snapshots.
 - User profile, group, and role data.
 - Realm/client configuration, especially redirect URIs and issuer values.
 - LDAP bind credentials, OIDC client secrets, SAML private keys/certificates, SCIM bearer tokens, and external subject links.
@@ -56,6 +57,8 @@ external IdP / LDAP / SCIM client boundaries connect to AuthMe over separately a
 
 The browser, OAuth client input, proxy headers, database contents, imported migration data, and administrator-supplied configuration are all treated as untrusted until validated for their use. A private network is not itself a trust control.
 
+The administrator browser and root automation client cross different credential boundaries. The browser authenticates through AuthMe OIDC and receives only a realm-bound opaque console cookie. Root automation presents `AUTHME_ADMIN_TOKEN` directly to the API. Neither credential is accepted as a substitute for the other's login flow, and the root bearer must never be delivered to browser code.
+
 ## Attacker profiles
 
 - An unauthenticated internet attacker.
@@ -70,7 +73,7 @@ The browser, OAuth client input, proxy headers, database contents, imported migr
 
 ## Threats and controls
 
-| Threat | v0.2 controls | Residual or staged work |
+| Threat | v0.3 controls | Residual or staged work |
 |---|---|---|
 | Redirect URI manipulation or open redirect | Exact registered redirect matching; no wildcard production redirects; validate post-logout redirects | Periodic client-configuration review |
 | Authorization-code interception/injection | Authorization Code flow, PKCE `S256`, short-lived one-use codes, client/redirect/PKCE binding; PAR for protected request submission; optional DPoP code/token binding | PAR/DPoP negative and conformance tests remain release gates |
@@ -110,8 +113,11 @@ The browser, OAuth client input, proxy headers, database contents, imported migr
 | Redis compromise | Redis holds only bounded, opaque throttling counters; never canonical tokens/sessions | A compromised limiter can affect availability; isolate credentials/network |
 | Denial of service | Body/URL/header limits, request timeouts, throttling, bounded DB pool, readiness and load shedding | Multi-region resilience is staged |
 | Supply-chain compromise | Exact dependency pin/lockfile, CI audit, provenance/SBOM review, minimal image, Node 22 security updates | Independent dependency monitoring and signed releases |
-| Malicious administrator | Least privilege, retained application audit events, separation of deployment and realm duties | Tamper-evident external export and delegated fine-grained administration are staged |
-| Administration bearer theft | High-entropy independent token, constant-time comparison, log redaction, TLS and recommended network restriction | v0.2 token is broad privilege; identity-based delegated admin is staged |
+| Administration-console login or session theft | OIDC Authorization Code with PKCE/state/nonce; production recent LoA2 requirement; opaque `HttpOnly`/`SameSite=Strict` cookie that is `Secure` in production; digest-only durable storage; idle/absolute expiry; account/grant version binding; server-side logout | An active administrator browser and same-origin XSS retain the granted authority; phishing-resistant passkeys are preferred over TOTP |
+| Administration cross-realm or permission confusion | Session is pinned to one realm; switching reauthorizes; every console API route fails closed on an explicit realm permission; unsafe calls require exact Origin, JSON, session-bound CSRF, and authentication no more than 15 minutes old; administrator-account mutations additionally require `administrators.manage` | Grant lifecycle has no approval workflow; wildcard bootstrap grants remain broad privilege |
+| Configuration-catalog disclosure | Catalog serializes an explicit safe field allowlist and excludes client/bind/upstream/SCIM/root secrets, private JWK members, and deployment keys | Client IDs, issuers, endpoints, topology, and capability metadata remain sensitive operational information |
+| Malicious administrator | Durable realm-scoped permission grants, versioned revocation, retained application audit events, and separation of deployment root from console authority | Tamper-evident external export, approval workflows, and organization delegation are staged |
+| Root administration bearer theft | High-entropy independent token, constant-time comparison, no browser delivery, log redaction, TLS, separate rotation, and recommended network restriction | Root bearer remains deployment-wide broad privilege and bypasses console grant restrictions |
 | Backup leakage | Encrypted backup, isolated credentials, retention and restore policy | Periodic restore and deletion verification |
 
 ## Protocol-specific requirements
@@ -166,9 +172,13 @@ Federation initiation is a POST protected by a provider- and interaction-bound C
 
 SCIM tokens are root-like provisioning credentials for one realm and must be independently generated, stored in secret management, rotated, and restricted at the network layer. A client must use resource ETags when it needs lost-update protection. Password attributes are accepted only over TLS, immediately hashed, and never serialized. Deactivation, deletion, identity changes, and group membership changes invalidate affected AuthMe account state. A failed audit after a committed SCIM mutation can produce an ambiguous `5xx`; clients must read the resource before retrying.
 
-### Browser session
+### Browser sessions and administration console
 
-The production cookie is `Secure`, `HttpOnly`, has an explicit `SameSite` policy, a minimal path/domain, and a name that cannot collide across unrelated applications. Authentication and consent POSTs use CSRF defenses. Sensitive pages use `Cache-Control: no-store`.
+Ordinary authentication cookies are `Secure` and `HttpOnly` in production, have an explicit `SameSite` policy and minimal path, and use realm-specific names. Authentication and consent POSTs use interaction-bound CSRF defenses. Sensitive pages use `Cache-Control: no-store`.
+
+The administration console adds a separate trust boundary. Its short-lived login transaction is signed and callback-scoped; the authorization request uses the reserved console client, PKCE `S256`, state, nonce, `max_age`, and requested LoA2. Production admission requires recent MFA/passkey evidence in the verified ID token plus an enabled realm grant. A bootstrap administrator must enroll TOTP through the restricted root API, or establish a reviewed passkey enrollment path, before first production console use.
+
+After callback, the browser receives a random opaque cookie while PostgreSQL stores only its HMAC digest, selected realm, administrator identifier, permission-grant/security version snapshots, and idle/absolute expiry. Every node can validate or revoke the session without affinity. Unsafe authenticated console API calls require exact Origin, JSON content type, and a CSRF value derived from the opaque bearer. Logout deletes the durable row, so replaying a captured pre-logout cookie fails. Console rendering and API responses must not embed `AUTHME_ADMIN_TOKEN`, one-time credentials, or private configuration.
 
 ## Abuse-control behavior
 
@@ -204,10 +214,10 @@ Before a production release:
 3. Run cross-realm isolation tests for every repository and provider artifact type.
 4. Test exact redirect and post-logout URI rejection.
 5. Test JWT negative cases: wrong issuer/audience/type/algorithm/key, expired/not-yet-valid, malformed JOSE.
-6. Run browser tests for CSRF, cookie attributes, CSP, caching, session rotation, and logout.
+6. Run browser tests for CSRF, exact Origin/media-type enforcement, cookie attributes, CSP, caching, durable session expiry, version invalidation, and logout replay.
 7. Run device-code guessing/polling, PAR replay, DPoP proof replay/nonce, and dynamic-registration authorization tests.
 8. Test TOTP enrollment/login and concurrent one-use recovery-code consumption.
-9. Test the administration API for missing, malformed, leaked-in-log, and rotated bearer credentials.
+9. Test root administration for missing, malformed, leaked-in-log, and rotated bearer credentials; separately test OIDC+PKCE console login, production LoA2 admission, realm/permission isolation, safe configuration serialization, and grant revocation.
 10. Run dependency, secret, container, and migration scans.
 11. Perform backup restoration and signing-key rotation drills.
 12. Complete an independent penetration test/security review before claiming production hardening.

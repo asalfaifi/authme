@@ -57,19 +57,25 @@ async function drainMaintenance(data, config, logger) {
 async function bootstrapDevelopmentUsers(config, store, logger) {
   if (!config.devMode) return;
   for (const realm of config.realms) {
-    if (await store.findUserByLogin(realm, 'admin')) continue;
-    const user = await store.createUser({
-      realm,
-      username: 'admin',
-      email: `admin@${realm}.authme.local`,
-      emailVerified: true,
-      name: 'AuthMe Administrator',
-      passwordHash: await hashPassword(config.devAdminPassword, config.passwordPepper),
-      roles: ['admin'],
-      groups: ['/administrators'],
-    });
-    await store.writeAudit({ realm, type: 'system.development_user.created', subjectId: user.id });
-    logger.warn({ realm, username: user.username }, 'Development administrator created; do not use development mode in production');
+    let user = await store.findUserByLogin(realm, 'admin');
+    if (!user) {
+      user = await store.createUser({
+        realm,
+        username: 'admin',
+        email: `admin@${realm}.authme.local`,
+        emailVerified: true,
+        name: 'AuthMe Administrator',
+        passwordHash: await hashPassword(config.devAdminPassword, config.passwordPepper),
+        roles: ['admin'],
+        groups: ['/administrators'],
+      });
+      await store.writeAudit({ realm, type: 'system.development_user.created', subjectId: user.id });
+      logger.warn({ realm, username: user.username }, 'Development administrator created; do not use development mode in production');
+    }
+    if (!await store.findAdminGrant(realm, user.id)) {
+      await store.upsertAdminGrant(realm, user.id, ['*']);
+      await store.writeAudit({ realm, type: 'system.development_admin_grant.created', subjectId: user.id });
+    }
   }
 }
 
@@ -118,14 +124,17 @@ export async function createAuthMeApp(config, overrides = {}) {
       fetch: overrides.fetch,
     });
     const providers = new Map();
+    const jwksByRealm = new Map();
     for (const realm of config.realms) {
+      const jwks = await loadRealmJwks(config, realm);
+      jwksByRealm.set(realm, jwks);
       const provider = await createRealmProvider({
         realm,
         config,
         store,
         data,
         Adapter: data.adapterFor(realm),
-        jwks: await loadRealmJwks(config, realm),
+        jwks,
         logger,
         auditWriter,
       });
@@ -149,7 +158,8 @@ export async function createAuthMeApp(config, overrides = {}) {
       return next();
     });
     app.use((req, res, next) => {
-      if (!config.devMode && (req.path.startsWith('/realms/') || req.path.startsWith('/.well-known/') || req.path.startsWith('/scim/'))) {
+      if (!config.devMode && (req.path.startsWith('/realms/') || req.path.startsWith('/.well-known/')
+        || req.path.startsWith('/scim/') || req.path.startsWith('/admin'))) {
         let requestOrigin;
         try { requestOrigin = new URL(`${req.protocol}://${req.host}`).origin; } catch { return res.status(400).end(); }
         if (requestOrigin !== config.publicUrl) {
@@ -187,7 +197,7 @@ export async function createAuthMeApp(config, overrides = {}) {
     app.get('/', (_req, res) => {
       res.set('Cache-Control', 'no-store').json({
         name: 'AuthMe',
-        version: '0.2.0',
+        version: '0.3.0',
         issuers: config.realms.map((realm) => `${config.publicUrl}/realms/${realm}`),
         capabilities: Object.fromEntries(config.realms.map((realm) => [
           realm,
@@ -240,6 +250,9 @@ export async function createAuthMeApp(config, overrides = {}) {
     app.use('/admin', createAdminRouter({
       config, store, rateLimits, metrics, providers, data, webauthn,
       federatedIdentities: identityRuntime.federatedIdentities,
+      jwksByRealm,
+      fetch: overrides.fetch,
+      extensions: identityRuntime.registry,
     }));
 
     for (const [realm, provider] of providers) {

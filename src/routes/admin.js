@@ -3,8 +3,11 @@ import { z } from 'zod';
 import { createRecoveryCodes, createTotp, totpStep } from '../crypto/mfa.js';
 import { hashPassword } from '../crypto/password.js';
 import { decryptSecret, encryptSecret, safeEqual } from '../crypto/secrets.js';
+import { configuredClientsForRealm } from '../provider.js';
 import { publicUser } from '../repositories/identity-store.js';
+import { hasAdminPermission } from '../security/admin-permissions.js';
 import { createWebAuthn } from '../security/webauthn.js';
+import { createAdminConsole } from './admin-console.js';
 
 const identifier = z.string().trim().min(1).max(128).regex(/^[a-zA-Z0-9._@+-]+$/);
 const role = z.string().trim().min(1).max(128).regex(/^[a-zA-Z0-9:._/-]+$/);
@@ -44,6 +47,7 @@ const paginationSchema = z.object({
   limit: z.string().regex(/^\d+$/).transform(Number).pipe(z.number().int().min(1).max(250)).optional().default(100),
   offset: z.string().regex(/^\d+$/).transform(Number).pipe(z.number().int().min(0).max(10_000_000)).optional().default(0),
 }).passthrough();
+const RECENT_ADMIN_AUTHENTICATION_MS = 15 * 60 * 1000;
 
 const createUserSchema = z.object({
   username: identifier,
@@ -99,6 +103,7 @@ function auditEvent(req, type, subjectId, metadata = {}) {
   return {
     realm: req.params.realm,
     type,
+    actorId: req.authmeAdmin?.user?.id,
     subjectId,
     ip: req.ip,
     userAgent: req.get('user-agent'),
@@ -115,6 +120,43 @@ function publicPasskey(credential) {
   return safe;
 }
 
+function normalizedAdminPath(path) {
+  return path.length > 1 ? path.replace(/\/+$/u, '') : path;
+}
+
+function requestedAdminRealm(path) {
+  const match = /^\/v1\/realms\/([^/]+)(?:\/|$)/iu.exec(path);
+  if (!match) return null;
+  try { return decodeURIComponent(match[1]); } catch { return ''; }
+}
+
+function hasRecentAdminAuthentication(authentication, now = Date.now()) {
+  const authenticatedAt = new Date(authentication?.session?.createdAt).getTime();
+  const age = now - authenticatedAt;
+  return Number.isFinite(authenticatedAt) && age >= -30_000 && age <= RECENT_ADMIN_AUTHENTICATION_MS;
+}
+
+function requiredAdminPermission(req) {
+  const path = normalizedAdminPath(req.path);
+  if (/^\/metrics$/iu.test(path)) return 'metrics.read';
+  if (/^\/v1\/realms$/iu.test(path)) return 'realms.read';
+  if (/^\/v1\/realms\/[^/]+\/configuration$/iu.test(path)) return 'configuration.read';
+  if (/^\/v1\/realms\/[^/]+\/audit$/iu.test(path)) return 'audit.read';
+  if (/^\/v1\/realms\/[^/]+\/client-registration-tokens$/iu.test(path)) return 'clients.register';
+  if (/^\/v1\/realms\/[^/]+\/users\/[^/]+\/federated-identities$/iu.test(path)) {
+    return req.method === 'GET' ? 'users.read' : 'federation.manage';
+  }
+  if (/^\/v1\/realms\/[^/]+\/users\/[^/]+\/(?:passkeys(?:\/.*)?|mfa\/totp(?:\/confirm)?|password|unlock)$/iu.test(path)) {
+    return 'credentials.manage';
+  }
+  if (/^\/v1\/realms\/[^/]+\/users\/[^/]+\/sessions\/revoke$/iu.test(path)) return 'sessions.revoke';
+  if (/^\/v1\/realms\/[^/]+\/users\/[^/]+$/iu.test(path) && req.method === 'DELETE') return 'users.delete';
+  if (/^\/v1\/realms\/[^/]+\/users(?:\/[^/]+)?$/iu.test(path)) {
+    return req.method === 'GET' ? 'users.read' : 'users.write';
+  }
+  return null;
+}
+
 export function createAdminRouter({
   config,
   store,
@@ -124,10 +166,18 @@ export function createAdminRouter({
   data,
   webauthn,
   federatedIdentities,
+  jwksByRealm,
+  fetch,
+  extensions,
 }) {
   const passkeys = webauthn ?? createWebAuthn(config);
   const router = Router();
-  router.use(json({ limit: '64kb', strict: true }));
+  const adminConsole = createAdminConsole({ config, store, rateLimits, jwksByRealm, fetch });
+  router.use(adminConsole.router);
+  router.use((_req, res, next) => {
+    res.set('Cache-Control', 'no-store');
+    next();
+  });
   router.use(async (req, res, next) => {
     try {
       await rateLimits.consumeAdmin(req.ip);
@@ -136,13 +186,46 @@ export function createAdminRouter({
       return problem(res, 429, 'Too many requests', 'Wait before retrying the administration API.');
     }
     const match = /^Bearer ([^\s]+)$/.exec(req.get('authorization') ?? '');
-    if (!match || !safeEqual(match[1], config.adminToken)) {
-      res.set('WWW-Authenticate', 'Bearer realm="authme-admin"');
-      return problem(res, 401, 'Unauthorized', 'A valid AuthMe administration token is required.');
+    if (match && safeEqual(match[1], config.adminToken)) {
+      req.authmeAdmin = { type: 'bearer' };
+      return next();
     }
-    res.set('Cache-Control', 'no-store');
+    const authentication = await adminConsole.authenticate(req);
+    if (!authentication) {
+      res.set('WWW-Authenticate', 'Bearer realm="authme-admin"');
+      return problem(res, 401, 'Unauthorized', 'A valid AuthMe administration token or console session is required.');
+    }
+    const requestedRealm = requestedAdminRealm(req.path);
+    if (requestedRealm !== null && requestedRealm !== authentication.realm) {
+      return problem(res, 403, 'Realm access denied', 'Switch to this realm before administering it.');
+    }
+    const permission = requiredAdminPermission(req);
+    if (!permission) {
+      return problem(res, 403, 'Permission denied', 'This administration route is not available to console sessions.');
+    }
+    if (!hasAdminPermission(authentication.grant, permission)) {
+      return problem(res, 403, 'Permission denied', `This administrator grant does not include ${permission}.`);
+    }
+    if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
+      if (!req.is('application/json')) {
+        return problem(res, 415, 'Unsupported media type', 'Console mutations require application/json.');
+      }
+      if (!adminConsole.verifyCsrf(req, authentication)) {
+        return problem(res, 403, 'Invalid CSRF token', 'Reload the console and try again.');
+      }
+      if (!hasRecentAdminAuthentication(authentication)) {
+        return problem(
+          res,
+          403,
+          'Recent administrator authentication required',
+          'Sign out and complete a fresh administrator sign-in before making security changes.',
+        );
+      }
+    }
+    req.authmeAdmin = authentication;
     return next();
   });
+  router.use(json({ limit: '64kb', strict: true }));
 
   router.get('/metrics', async (_req, res, next) => {
     try {
@@ -152,6 +235,68 @@ export function createAdminRouter({
 
   router.get('/v1/realms', (_req, res) => {
     res.json({ realms: config.realms.map((name) => ({ name, issuer: `${config.publicUrl}/realms/${name}` })) });
+  });
+
+  router.get('/v1/realms/:realm/configuration', (req, res) => {
+    const realm = req.params.realm;
+    if (!config.realms.includes(realm)) return problem(res, 404, 'Realm not found', 'The requested realm does not exist.');
+    const clientFields = [
+      'client_id', 'client_name', 'application_type', 'subject_type', 'token_endpoint_auth_method',
+      'redirect_uris', 'post_logout_redirect_uris', 'web_origins', 'response_types', 'grant_types', 'scope',
+    ];
+    const clients = configuredClientsForRealm(config, realm).map((client) => Object.fromEntries(
+      clientFields.filter((field) => client[field] !== undefined).map((field) => [field, structuredClone(client[field])]),
+    ));
+    const ldap = (config.ldapProvidersByRealm[realm] ?? []).map((provider) => ({
+      id: provider.id,
+      displayName: provider.displayName,
+      url: provider.url,
+      startTls: provider.startTls,
+      userBaseDn: provider.userBaseDn,
+      usernameAttribute: provider.usernameAttribute,
+      emailAttribute: provider.emailAttribute,
+      jitProvisioning: provider.jitProvisioning,
+      serviceAccountConfigured: Boolean(provider.bindDn),
+    }));
+    const oidc = (config.oidcProvidersByRealm[realm] ?? []).map((provider) => ({
+      id: provider.id,
+      displayName: provider.displayName,
+      issuer: provider.issuer,
+      clientId: provider.clientId,
+      scopes: provider.scopes,
+      tokenEndpointAuthMethod: provider.tokenEndpointAuthMethod,
+      jitProvisioning: provider.jitProvisioning,
+    }));
+    const saml = (config.samlProvidersByRealm[realm] ?? []).map((provider) => ({
+      id: provider.id,
+      displayName: provider.displayName,
+      idpEntityId: provider.idp.entityId,
+      idpSsoUrl: provider.idp.ssoUrl,
+      spEntityId: provider.sp.entityId,
+      assertionConsumerServiceUrl: provider.sp.assertionConsumerServiceUrl,
+      signedMetadata: provider.sp.signMetadata,
+      jitProvisioning: provider.jitProvisioning,
+    }));
+    return res.json({
+      realm,
+      issuer: `${config.publicUrl}/realms/${realm}`,
+      mode: config.devMode ? 'development' : 'production',
+      storage: config.databaseUrl ? 'postgresql' : 'memory',
+      redis: Boolean(config.redisUrl),
+      dynamicRegistration: config.enableDynamicRegistration,
+      ttls: {
+        accessToken: config.accessTokenTtl,
+        authorizationCode: config.authorizationCodeTtl,
+        session: config.sessionTtl,
+        webauthnChallenge: config.webauthnChallengeTtl,
+        auditRetentionDays: config.auditRetentionDays,
+      },
+      clients,
+      resourceServers: structuredClone(config.resourceServersByRealm[realm] ?? []),
+      federation: { ldap, oidc, saml },
+      scim: (config.scimTokensByRealm[realm] ?? []).map(({ id }) => ({ id })),
+      extensions: extensions?.describe?.(realm) ?? [],
+    });
   });
 
   router.post('/v1/realms/:realm/client-registration-tokens', async (req, res, next) => {
@@ -185,6 +330,21 @@ export function createAdminRouter({
       return problem(res, 400, 'Invalid passkey identifier', 'Passkey identifiers must be base64url values.');
     }
     return next();
+  });
+  router.use('/v1/realms/:realm/users/:id', async (req, res, next) => {
+    if (['GET', 'HEAD', 'OPTIONS'].includes(req.method) || req.authmeAdmin?.type === 'bearer') return next();
+    try {
+      const targetGrant = await store.findAdminGrant(req.params.realm, req.params.id);
+      if (!targetGrant || hasAdminPermission(req.authmeAdmin?.grant, 'administrators.manage')) return next();
+      return problem(
+        res,
+        403,
+        'Administrator account protection',
+        'Changing an account with an administrator grant requires administrators.manage.',
+      );
+    } catch (error) {
+      return next(error);
+    }
   });
 
   router.get('/v1/realms/:realm/users', async (req, res, next) => {

@@ -47,12 +47,14 @@ export async function createDataLayer(config) {
       async revokeAccount(realm, accountId) { return revokeMemoryAccount(realm, accountId); },
       async deleteAccount(realm, accountId, auditEvent) {
         const credentials = await store.listWebAuthnCredentials(realm, accountId);
+        const adminGrant = await store.findAdminGrant(realm, accountId);
         const user = await store.deleteUser(realm, accountId);
         if (!user) return { found: false, user: null };
         try {
           if (auditEvent) await store.writeAudit(auditEvent);
         } catch (error) {
           await store.createUser(user);
+          if (adminGrant) await store.restoreAdminGrant(adminGrant);
           await restoreMemoryWebAuthnCredentials(store, realm, accountId, credentials);
           throw error;
         }
@@ -76,7 +78,10 @@ export async function createDataLayer(config) {
         revokeMemoryAccount(realm, accountId);
         return { found: true, applied: true, result, user: await store.findUserById(realm, accountId) };
       },
-      async cleanupExpired(limit = 1000) { return store.cleanupExpiredWebAuthnChallenges(limit); },
+      async cleanupExpired(limit = 1000) {
+        return await store.cleanupExpiredWebAuthnChallenges(limit)
+          + await store.cleanupExpiredAdminSessions(limit);
+      },
       async cleanupAudit() { return 0; },
       async close() { await store.close(); },
     };
@@ -191,7 +196,9 @@ export async function createDataLayer(config) {
          )`,
         [limit],
       );
-      return oidc.rowCount + await store.cleanupExpiredWebAuthnChallenges(limit);
+      return oidc.rowCount
+        + await store.cleanupExpiredWebAuthnChallenges(limit)
+        + await store.cleanupExpiredAdminSessions(limit);
     },
     async cleanupAudit(retentionDays, limit = 1000) {
       const result = await pool.query(

@@ -78,10 +78,10 @@ The upstream [`oidc-provider`](https://github.com/panva/node-oidc-provider#imple
 
 ### Staged scope
 
-- Complete realm/client/user/group/role administration API and web console.
-- Self-registration policy, verified email, password reset, required actions, account console, and session/device management.
+- Complete mutable realm/client/group/role policy administration and a self-service account console; the v0.3 operator console already covers user, credential, session, federation, registration, and audit operations.
+- Self-registration policy, verified email, password reset, required actions, account console, and end-user session/device management.
 - Self-service passkey enrollment, replacement, loss/recovery policy, attestation governance, and migration tooling around the implemented admin-managed passkey baseline.
-- Step-up authentication and `acr`/`amr`/`max_age` policy.
+- General client-configurable step-up authentication and `acr`/`amr`/`max_age` policy beyond the v0.3 console's fixed recent-LoA2 production requirement.
 - Nested groups, composite roles, reusable client scopes, and configurable claim mappers.
 - Offline access/session policy and richer revocation controls.
 - Propagation of an expected account security epoch through interactive authentication completion, closing the remaining mutation/in-flight login boundary race; grant-linked code/refresh issuance already requires a live same-epoch parent grant.
@@ -101,6 +101,17 @@ The upstream [`oidc-provider`](https://github.com/panva/node-oidc-provider#imple
 
 ## v0.3: enterprise lifecycle and advanced federation
 
+### Implemented product contract
+
+- A permanently expanded, realm-scoped operator console at `/admin/` with user, credential, session, federation, dynamic-registration, audit, and safe configuration views.
+- A reserved `authme-admin-console` OIDC client using Authorization Code with PKCE `S256`, exact callback matching, and validated `state` and `nonce`.
+- Durable, enabled realm-administrator grants with explicit permissions and a revocable version snapshot. The development bootstrap grant uses `*`; production deployments should grant only required permissions.
+- Production console authentication requires a recent LoA2 result: a passkey, or password plus TOTP/recovery. Development mode deliberately permits password-only console authentication.
+- Opaque console cookies whose keyed digests—not bearer values—are stored in PostgreSQL, with idle and absolute expiry, user/grant version pinning, and server-side logout invalidation.
+- Exact-origin, JSON content-type, CSRF, realm-binding, and per-permission enforcement for unsafe authenticated console API operations.
+- A deployment-root bearer for automation under `/admin/v1`, kept separate from the console's OIDC login, cookie, and realm grants.
+- A read-only, allowlisted realm configuration catalog that exposes operator-safe policy and capability metadata without secrets, key material, credential hashes, or bootstrap tokens.
+
 ### Staged scope
 
 - Curated social-provider templates and advanced upstream OIDC discovery/governance around the v0.2 broker.
@@ -108,12 +119,12 @@ The upstream [`oidc-provider`](https://github.com/panva/node-oidc-provider#imple
 - LDAP/Active Directory import, synchronization, and reconciliation around the v0.2 credential-authentication baseline.
 - SCIM Bulk, sorting, arbitrary extensions, fine-grained token scopes, and full filtering around the v0.2 Users/Groups baseline.
 - Organizations within realms: domains, invitations, memberships, organization-specific IdPs, and token context.
-- Delegated fine-grained realm/organization administration.
+- Approval-backed administrator-grant lifecycle and organization-level delegation beyond the implemented realm permission model.
 - Joiner/mover/leaver workflows with transactional events.
 - KMS/HSM-backed realm signing keys and automated rotation.
 - Backup/restore automation and tested single-region HA around the implemented Helm/OpenShift deployment.
 
-Keycloak's official guide describes its [identity brokering](https://www.keycloak.org/docs/latest/server_admin/#_identity_broker), [LDAP federation](https://www.keycloak.org/docs/latest/server_admin/#_ldap), [organizations](https://www.keycloak.org/docs/latest/server_admin/#_managing_organizations), and [SCIM support](https://www.keycloak.org/docs/latest/server_admin/#_scim). Those behaviors form the parity reference; AuthMe v0.2 implements only the explicitly documented baselines above.
+Keycloak's official guide describes its [identity brokering](https://www.keycloak.org/docs/latest/server_admin/#_identity_broker), [LDAP federation](https://www.keycloak.org/docs/latest/server_admin/#_ldap), [organizations](https://www.keycloak.org/docs/latest/server_admin/#_managing_organizations), and [SCIM support](https://www.keycloak.org/docs/latest/server_admin/#_scim). Those behaviors form the parity reference; AuthMe v0.3 implements only the explicitly documented v0.1-v0.3 baselines above.
 
 ### Exit gates
 
@@ -121,6 +132,7 @@ Keycloak's official guide describes its [identity brokering](https://www.keycloa
 - LDAP/SCIM reconciliation, conflict, deletion, pagination, and outage tests.
 - SAML interoperability and XML signature/encryption review using maintained libraries.
 - Organization isolation and delegated-administration tests.
+- Console accessibility, localization, OIDC/PKCE, LoA2, realm-permission, CSRF, and session-revocation matrices.
 - KMS degradation and key recovery drills.
 
 ## v0.4: advanced OAuth and financial-grade profiles

@@ -26,6 +26,24 @@ const keycloakRoutes = Object.freeze({
   userinfo: '/protocol/openid-connect/userinfo',
 });
 
+export const ADMIN_CONSOLE_CLIENT_ID = 'authme-admin-console';
+
+function adminConsoleClient(config) {
+  return {
+    client_id: ADMIN_CONSOLE_CLIENT_ID,
+    client_name: 'AuthMe administration console',
+    token_endpoint_auth_method: 'none',
+    redirect_uris: [`${config.publicUrl}/admin/oidc/callback`],
+    post_logout_redirect_uris: [`${config.publicUrl}/admin/`],
+    web_origins: [config.publicUrl],
+    response_types: ['code'],
+    grant_types: ['authorization_code'],
+    application_type: 'web',
+    subject_type: 'public',
+    scope: 'openid profile email roles',
+  };
+}
+
 function developmentClients(realm) {
   return [{
     client_id: 'authme-dev',
@@ -48,6 +66,16 @@ function developmentClients(realm) {
     response_types: [],
     grant_types: ['client_credentials'],
   }];
+}
+
+export function configuredClientsForRealm(config, realm) {
+  const clients = structuredClone(config.clientsByRealm[realm] ?? []);
+  if (clients.some((client) => client.client_id === ADMIN_CONSOLE_CLIENT_ID)) {
+    throw new Error(`${ADMIN_CONSOLE_CLIENT_ID} is reserved for the built-in administration console`);
+  }
+  if (config.devMode && clients.length === 0) clients.push(...developmentClients(realm));
+  clients.push(adminConsoleClient(config));
+  return clients;
 }
 
 export function corsAllowed(origin, client) {
@@ -184,8 +212,7 @@ function validateClientSecurity(metadata, { development = false } = {}) {
 export async function createRealmProvider({ realm, config, store, data, Adapter, jwks, logger, auditWriter }) {
   const issuer = issuerFor(config, realm);
   const resourceServers = config.resourceServersByRealm[realm];
-  const clients = [...config.clientsByRealm[realm]];
-  if (config.devMode && clients.length === 0) clients.push(...developmentClients(realm));
+  const clients = configuredClientsForRealm(config, realm);
   for (const client of clients) validateClientSecurity(client, { development: config.devMode });
 
   async function secureRegistrationPolicy(ctx, properties) {

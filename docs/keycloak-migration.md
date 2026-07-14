@@ -17,7 +17,7 @@ Before scheduling a cutover:
 - Realm owners approve the password/credential migration strategy.
 - Every relying party has an owner and a test result.
 
-AuthMe v0.2 can replace documented upstream OIDC federation, SP-initiated SAML IdP federation, LDAP/AD credential authentication, and core SCIM Users/Groups use cases. A source realm that serves SAML clients, uses Kerberos, encrypted/IdP-initiated SAML, LDAP synchronization, advanced SCIM, custom authenticators, portable existing WebAuthn credentials, Keycloak Authorization Services, organizations, or custom protocol mappers is not a full-cutover candidate. AuthMe implements fresh passkey/TOTP/recovery enrollment, but not automatic portability of existing Keycloak MFA credentials. Retain Keycloak when seamless credential preservation is mandatory.
+AuthMe v0.3 can replace documented upstream OIDC federation, SP-initiated SAML IdP federation, LDAP/AD credential authentication, and core SCIM Users/Groups use cases. A source realm that serves SAML clients, uses Kerberos, encrypted/IdP-initiated SAML, LDAP synchronization, advanced SCIM, custom authenticators, portable existing WebAuthn credentials, Keycloak Authorization Services, organizations, or custom protocol mappers is not a full-cutover candidate. AuthMe implements fresh passkey/TOTP/recovery enrollment, but not automatic portability of existing Keycloak MFA credentials. Retain Keycloak when seamless credential preservation is mandatory.
 
 ## Phase 1: inventory
 
@@ -35,7 +35,7 @@ Capture the source version and, per realm:
 
 Classify each item as:
 
-1. direct v0.2 mapping;
+1. direct v0.3 mapping;
 2. transformable mapping;
 3. staged/blocked;
 4. intentionally retired.
@@ -94,23 +94,23 @@ Do not import active authorization codes, access tokens, refresh tokens, browser
 
 ### Claim mapper transformation
 
-For each Keycloak protocol mapper, write the expected claim name, source, type, scope, inclusion in ID/access/UserInfo responses, and audience. Map simple role/group/attribute cases to AuthMe's v0.2 claim policy. Mark scripts, custom SPIs, composite expansion, authorization-service permissions, and unsupported transforms as blockers.
+For each Keycloak protocol mapper, write the expected claim name, source, type, scope, inclusion in ID/access/UserInfo responses, and audience. Map simple role/group/attribute cases to AuthMe's v0.3 claim policy. Mark scripts, custom SPIs, composite expansion, authorization-service permissions, and unsupported transforms as blockers.
 
 ## Phase 5: credentials
 
 ### Passwords
 
-AuthMe v0.2 does not promise transparent import of Keycloak password hash records. Treat credential formats as sensitive, versioned implementation details. Choose one reviewed strategy:
+AuthMe v0.3 does not promise transparent import of Keycloak password hash records. Treat credential formats as sensitive, versioned implementation details. Choose one reviewed strategy:
 
-1. **Password reset:** import accounts without a password and require a one-use reset through a verified channel. This is the simplest v0.2 strategy.
-2. **Federated transition:** configure Keycloak as an upstream OIDC authority, use immutable-subject links or collision-safe JIT, and move users to a separate verified password-reset/re-enrollment workflow. The v0.2 broker does not receive or rehash the Keycloak password.
+1. **Password reset:** import accounts without a password and require a one-use reset through a verified channel. This is the simplest v0.3 strategy.
+2. **Federated transition:** configure Keycloak as an upstream OIDC authority, use immutable-subject links or collision-safe JIT, and move users to a separate verified password-reset/re-enrollment workflow. The v0.3 broker does not receive or rehash the Keycloak password.
 3. **Reviewed hash bridge:** implement a narrowly scoped verifier for the exact exported Keycloak algorithm/parameters, then replace it with AuthMe's current password hash after successful login. This requires its own threat model, test vectors, constant-time review, and removal plan.
 
 Never downgrade the AuthMe password policy to accept plaintext or reversibly encrypted passwords. Never email temporary passwords.
 
 ### MFA, passkeys, recovery codes, and federated credentials
 
-AuthMe v0.2 supports fresh passkey and TOTP enrollment and generates one-use recovery codes. It does not import Keycloak WebAuthn credential keys/counters, TOTP seeds, or recovery codes. Plan authenticated re-enrollment on the AuthMe origin and invalidate the source credential material. Federated links can be recreated through AuthMe's explicit administration API only after reconciling the exact provider issuer and immutable subject; never infer them from email. X.509 mappings have no v0.2 compatibility guarantee. Defer migration when existing passkeys must be retained without re-enrollment.
+AuthMe v0.3 supports fresh passkey and TOTP enrollment and generates one-use recovery codes. It does not import Keycloak WebAuthn credential keys/counters, TOTP seeds, or recovery codes. Plan authenticated re-enrollment on the AuthMe origin and invalidate the source credential material. Federated links can be recreated through AuthMe's explicit administration API only after reconciling the exact provider issuer and immutable subject; never infer them from email. X.509 mappings have no v0.3 compatibility guarantee. Defer migration when existing passkeys must be retained without re-enrollment.
 
 ### Client secrets
 

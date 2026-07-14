@@ -234,6 +234,60 @@ test('audit records are newest-first, realm-scoped, paginated, and defensively c
   assert.equal((await store.writeAudit({ realm: 'master', type: 'ip.invalid', ip: 'spoofed, 127.0.0.1' })).ip, null);
 });
 
+test('administrator grants and opaque sessions are realm-scoped, versioned, and revocable', async () => {
+  const store = new MemoryIdentityStore();
+  const user = await store.createUser(userInput());
+  assert.equal(await store.findAdminGrant('master', user.id), null);
+
+  const firstGrant = await store.upsertAdminGrant('master', user.id, ['users.read', 'audit.read']);
+  assert.equal(firstGrant.version, 1);
+  firstGrant.permissions.push('outside-mutation');
+  assert.deepEqual((await store.findAdminGrant('master', user.id)).permissions, ['users.read', 'audit.read']);
+  assert.equal(await store.upsertAdminGrant('other', user.id, ['users.read']), null);
+  await assert.rejects(
+    store.upsertAdminGrant('master', user.id, ['unsupported.permission']),
+    TypeError,
+  );
+
+  const secondGrant = await store.upsertAdminGrant('master', user.id, ['*']);
+  assert.equal(secondGrant.version, 2);
+  const digest = 'a'.repeat(43);
+  const created = await store.createAdminSession({
+    idDigest: digest,
+    realm: 'master',
+    userId: user.id,
+    grantVersion: secondGrant.version,
+    securityVersion: user.securityVersion,
+    idleExpiresAt: new Date(Date.now() + 60_000),
+    expiresAt: new Date(Date.now() + 120_000),
+  });
+  assert.equal(created.idDigest, digest);
+  assert.equal((await store.findAdminSession(digest)).userId, user.id);
+  const touched = await store.touchAdminSession(digest, new Date(Date.now() + 90_000));
+  assert.ok(Date.parse(touched.lastSeenAt) >= Date.parse(created.lastSeenAt));
+  assert.equal(await store.deleteAdminSession(digest), true);
+  assert.equal(await store.findAdminSession(digest), null);
+
+  const expiredDigest = 'b'.repeat(43);
+  await store.createAdminSession({
+    idDigest: expiredDigest,
+    realm: 'master',
+    userId: user.id,
+    grantVersion: secondGrant.version,
+    securityVersion: user.securityVersion,
+    idleExpiresAt: new Date(Date.now() - 1_000),
+    expiresAt: new Date(Date.now() + 120_000),
+  });
+  assert.equal(await store.cleanupExpiredAdminSessions(), 1);
+  assert.equal(await store.findAdminSession(expiredDigest), null);
+
+  const revoked = await store.revokeAdminGrant('master', user.id);
+  assert.equal(revoked.enabled, false);
+  assert.equal(revoked.version, 3);
+  await store.deleteUser('master', user.id);
+  assert.equal(await store.findAdminGrant('master', user.id), null);
+});
+
 test('WebAuthn challenges are expiring, context-bound, and consumed exactly once', async () => {
   const store = new MemoryIdentityStore();
   const user = await store.createUser(userInput());
