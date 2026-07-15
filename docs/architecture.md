@@ -111,8 +111,8 @@ The supported v0.3 profile is deliberately smaller than the upstream library's c
 - PKCE using `S256`.
 - Refresh tokens where allowed by client policy.
 - Client Credentials for service clients.
-- UserInfo.
-- Token introspection and revocation.
+- UserInfo, with optional realm-key-signed JWT responses per client.
+- Token introspection, with optional realm-key-signed JWT responses for authorized resource clients, and revocation.
 - RP-initiated logout.
 - Back-channel logout.
 - Device Authorization Grant.
@@ -137,6 +137,14 @@ rejects JWTs at introspection and revocation; configured opaque resource tokens
 can instead be introspected by confidential clients explicitly listed for that
 audience and checked online for security-state changes. Offline JWT validators
 accept a token until its short expiration unless they operate a denylist.
+
+### JWT-secured UserInfo and introspection responses
+
+AuthMe v0.4 supports signed JWT response opt-in without changing the endpoints or the default JSON response format. A client that registers `userinfo_signed_response_alg: RS256` receives UserInfo as `application/jwt`; the JWT contains `sub`, is issued to that client ID, and is signed with the realm's private provider key. This follows the signed UserInfo response defined by [OpenID Connect Core](https://openid.net/specs/openid-connect-core-1_0-errata2.html#UserInfoResponse) and the `userinfo_signed_response_alg` metadata defined by [OpenID Connect Dynamic Client Registration](https://openid.net/specs/openid-connect-registration-1_0-errata2.html#ClientMetadata). Clients without that metadata continue to receive `application/json`.
+
+An authorized resource client that registers `introspection_signed_response_alg: RS256` can request `Accept: application/token-introspection+jwt`. AuthMe then returns the [RFC 9701](https://www.rfc-editor.org/rfc/rfc9701.html) response: a realm-signed JWT with `typ: token-introspection+jwt`, the caller's client ID as audience, and the RFC 7662 result under `token_introspection`. Requests that do not negotiate that media type continue to receive JSON. Enabling the response format does not change introspection authorization: the existing issuing-client and configured `introspection_client_ids` audience policy still runs before token data is disclosed, and an unauthorized caller receives only an inactive result.
+
+Only asymmetric algorithms backed by the realm's validated private JWKS are advertised and accepted; `none` is rejected as client metadata. The public JWKS endpoint never returns private parameters. Consumers validate the signature against that realm's JWKS and require the exact issuer, their own client ID as audience, and the expected response type before using claims. Response signing provides integrity and origin authentication; TLS, bearer-token protection, scope/claim filtering, and introspection caller authorization remain mandatory.
 
 Implicit flow, Resource Owner Password Credentials, CIBA, JAR, mTLS, and FAPI profiles are not part of the v0.3 product contract unless a release explicitly enables and tests them. The OAuth Security Best Current Practice requires authorization servers to support PKCE, requires it for public clients, recommends it for confidential clients, and requires exact redirect URI matching; see [RFC 9700](https://www.rfc-editor.org/rfc/rfc9700.html). PAR is defined by [RFC 9126](https://www.rfc-editor.org/rfc/rfc9126.html), DPoP by [RFC 9449](https://www.rfc-editor.org/rfc/rfc9449.html), and Device Authorization by [RFC 8628](https://www.rfc-editor.org/rfc/rfc8628.html).
 

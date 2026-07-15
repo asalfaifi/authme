@@ -1,5 +1,6 @@
 import { createHmac } from 'node:crypto';
 import Provider, { errors } from 'oidc-provider';
+import { DEFAULTS as oidcClientMetadataDefaults } from 'oidc-provider/lib/consts/client_attributes.js';
 import { issuerFor } from './config.js';
 import {
   renderDeviceConfirmation,
@@ -9,6 +10,9 @@ import {
   renderLogoutConfirmation,
   renderLogoutSuccess,
 } from './ui/render.js';
+
+// oidc-provider 9.9.1 otherwise defaults every client to signed JWT introspection responses.
+delete oidcClientMetadataDefaults.introspection_signed_response_alg;
 
 const keycloakRoutes = Object.freeze({
   authorization: '/protocol/openid-connect/auth',
@@ -325,6 +329,7 @@ export async function createRealmProvider({ realm, config, store, data, Adapter,
           return clientCanIntrospectToken(resourceServers, client.clientId, token, client.clientAuthMethod);
         },
       },
+      jwtIntrospection: { enabled: true },
       jwtResponseModes: { enabled: true },
       pushedAuthorizationRequests: { enabled: true },
       registration: {
@@ -382,6 +387,7 @@ export async function createRealmProvider({ realm, config, store, data, Adapter,
         },
       },
       userinfo: { enabled: true },
+      jwtUserinfo: { enabled: true },
     },
     ttl: {
       AccessToken: config.accessTokenTtl,
