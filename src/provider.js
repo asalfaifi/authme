@@ -28,6 +28,9 @@ const keycloakRoutes = Object.freeze({
 
 export const ADMIN_CONSOLE_CLIENT_ID = 'authme-admin-console';
 
+const REQUEST_OBJECT_SIGNING_ALGORITHMS = Object.freeze(['RS256', 'PS256', 'ES256']);
+const PRIVATE_JWK_MEMBERS = Object.freeze(['d', 'p', 'q', 'dp', 'dq', 'qi', 'oth', 'k', 'priv']);
+
 function adminConsoleClient(config) {
   return {
     client_id: ADMIN_CONSOLE_CLIENT_ID,
@@ -175,6 +178,21 @@ function validateWebOrigins(metadata, { development = false } = {}) {
   }
 }
 
+function validateInlineClientJwks(metadata) {
+  if (metadata.jwks === undefined) return;
+  if (!metadata.jwks || !Array.isArray(metadata.jwks.keys)) {
+    throw new Error('jwks must be a JSON Web Key Set');
+  }
+  for (const key of metadata.jwks.keys) {
+    if (!key || Array.isArray(key) || typeof key !== 'object') {
+      throw new Error('jwks keys must be JSON Web Keys');
+    }
+    if (key.kty === 'oct' || PRIVATE_JWK_MEMBERS.some((member) => Object.hasOwn(key, member))) {
+      throw new Error('inline jwks must contain public keys only');
+    }
+  }
+}
+
 function validateClientSecurity(metadata, { development = false } = {}) {
   const grantTypes = metadata.grant_types ?? ['authorization_code'];
   if (grantTypes.some((type) => type === 'implicit' || type === 'password')) {
@@ -187,6 +205,11 @@ function validateClientSecurity(metadata, { development = false } = {}) {
   if (metadata.subject_type !== undefined && !['public', 'pairwise'].includes(metadata.subject_type)) {
     throw new Error(`Unsupported subject type: ${metadata.subject_type}`);
   }
+  if (metadata.request_object_signing_alg !== undefined
+    && !REQUEST_OBJECT_SIGNING_ALGORITHMS.includes(metadata.request_object_signing_alg)) {
+    throw new Error(`Unsupported request object signing algorithm: ${metadata.request_object_signing_alg}`);
+  }
+  validateInlineClientJwks(metadata);
   validateWebOrigins(metadata, { development });
   if (!development) {
     for (const field of ['redirect_uris', 'post_logout_redirect_uris']) {
@@ -237,6 +260,9 @@ export async function createRealmProvider({ realm, config, store, data, Adapter,
     scopes: ['openid', 'offline_access', 'profile', 'email', 'phone', 'address', 'roles', 'groups'],
     responseTypes: ['code'],
     clientAuthMethods: ['client_secret_basic', 'none'],
+    enabledJWA: {
+      requestObjectSigningAlgValues: [...REQUEST_OBJECT_SIGNING_ALGORITHMS],
+    },
     subjectTypes: ['public', 'pairwise'],
     extraClientMetadata: {
       properties: ['web_origins'],
@@ -333,7 +359,7 @@ export async function createRealmProvider({ realm, config, store, data, Adapter,
         policies: config.enableDynamicRegistration ? { 'authme-secure-client': secureRegistrationPolicy } : undefined,
       },
       registrationManagement: { enabled: config.enableDynamicRegistration },
-      requestObjects: { enabled: false },
+      requestObjects: { enabled: true },
       resourceIndicators: {
         enabled: resourceServers.length > 0,
         async defaultResource(_ctx, _client, oneOf) {
