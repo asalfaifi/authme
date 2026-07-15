@@ -87,6 +87,7 @@ test('production configuration normalizes its URL and maps clients by realm', ()
     audience: 'https://api.example.test/orders',
     scopes: ['orders.read', 'roles', 'groups'],
     authorizedClientIds: ['console'],
+    multiResourceClientIds: [],
     introspectionClientIds: ['orders-api'],
     roleClientIds: ['orders-api'],
     includeRealmRoles: true,
@@ -184,6 +185,18 @@ test('realm, client, key, URL, and TTL validation fail closed', () => {
       }] }),
     }),
     /invalid OAuth scope/,
+  );
+  assert.throws(
+    () => loadConfig({
+      AUTHME_DEV_MODE: 'true',
+      AUTHME_RESOURCE_SERVERS_JSON: JSON.stringify({ master: [{
+        audience: 'http://127.0.0.1:4000/api',
+        scopes: ['read'],
+        authorized_client_ids: ['client'],
+        multi_resource_client_ids: ['other-client'],
+      }] }),
+    }),
+    /must be a subset of authorized_client_ids/,
   );
   assert.throws(
     () => loadConfig({

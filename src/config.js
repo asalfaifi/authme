@@ -139,7 +139,8 @@ function resourceServersByRealm(value, realms, devMode) {
       if (!input || Array.isArray(input) || typeof input !== 'object') throw new Error(`${name} must be an object`);
       const known = new Set([
         'audience', 'scopes', 'authorized_client_ids', 'introspection_client_ids',
-        'role_client_ids', 'include_realm_roles', 'include_groups', 'access_token_format',
+        'multi_resource_client_ids', 'role_client_ids', 'include_realm_roles',
+        'include_groups', 'access_token_format',
       ]);
       for (const field of Object.keys(input)) {
         if (!known.has(field)) throw new Error(`${name}.${field} is not supported`);
@@ -161,6 +162,10 @@ function resourceServersByRealm(value, realms, devMode) {
       const scopes = stringArray(input.scopes, `${name}.scopes`, { required: true });
       if (scopes.some((scope) => !oauthScope.test(scope))) throw new Error(`${name}.scopes contains an invalid OAuth scope value`);
       const authorizedClientIds = stringArray(input.authorized_client_ids, `${name}.authorized_client_ids`, { required: true });
+      const multiResourceClientIds = stringArray(input.multi_resource_client_ids, `${name}.multi_resource_client_ids`);
+      if (multiResourceClientIds.some((clientId) => !authorizedClientIds.includes(clientId))) {
+        throw new Error(`${name}.multi_resource_client_ids must be a subset of authorized_client_ids`);
+      }
       const introspectionClientIds = stringArray(input.introspection_client_ids, `${name}.introspection_client_ids`);
       const roleClientIds = stringArray(input.role_client_ids, `${name}.role_client_ids`);
       if (input.include_realm_roles !== undefined && typeof input.include_realm_roles !== 'boolean') {
@@ -176,6 +181,7 @@ function resourceServersByRealm(value, realms, devMode) {
         audience: normalizedAudience,
         scopes,
         authorizedClientIds,
+        multiResourceClientIds,
         introspectionClientIds,
         roleClientIds,
         includeRealmRoles: input.include_realm_roles ?? false,

@@ -29,9 +29,10 @@ The upstream [`oidc-provider`](https://github.com/panva/node-oidc-provider#imple
 - Device Authorization Grant.
 - Pushed Authorization Requests (PAR).
 - DPoP-bound tokens for configured clients.
-- Explicit RFC 8707 resource audiences with audience-bound JWT access tokens,
-  filtered Keycloak-shaped authorization claims, and delegated introspection
-  for configured opaque-token resources.
+- Implemented RFC 8707 resource policy with per-client audience allowlists,
+  explicit multi-resource combinations, audience-bound JWT access tokens,
+  per-resource scope and claim filtering, and delegated introspection for
+  configured opaque-token resources.
 - Public and pairwise subject identifiers.
 - Dynamic client registration protected by an initial access token.
 - Basic users, clients, realm roles, client roles, groups, and Keycloak-shaped role/group claims.
