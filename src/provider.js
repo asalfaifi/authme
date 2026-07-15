@@ -1,4 +1,5 @@
 import { createHmac } from 'node:crypto';
+import { isIP } from 'node:net';
 import Provider, { errors } from 'oidc-provider';
 import { issuerFor } from './config.js';
 import {
@@ -25,6 +26,22 @@ const keycloakRoutes = Object.freeze({
   token: '/protocol/openid-connect/token',
   userinfo: '/protocol/openid-connect/userinfo',
 });
+
+const clientAuthMethods = Object.freeze([
+  'client_secret_basic',
+  'private_key_jwt',
+  'client_secret_jwt',
+  'none',
+]);
+const privateKeyJwtSigningAlgorithms = Object.freeze(['RS256', 'ES256', 'PS256']);
+const clientSecretJwtSigningAlgorithms = Object.freeze(['HS256']);
+const clientAuthSigningAlgorithms = Object.freeze([
+  ...privateKeyJwtSigningAlgorithms,
+  ...clientSecretJwtSigningAlgorithms,
+]);
+const privateJwkMembers = Object.freeze(['d', 'p', 'q', 'dp', 'dq', 'qi', 'oth', 'k', 'priv']);
+const clientAssertionClockSkew = 60;
+const clientAssertionMaxLifetime = 300;
 
 export const ADMIN_CONSOLE_CLIENT_ID = 'authme-admin-console';
 
@@ -151,6 +168,53 @@ function isLoopback(hostname) {
   return hostname === '127.0.0.1' || hostname === '[::1]' || hostname === '::1';
 }
 
+function isPrivateOrLoopbackAddress(hostname) {
+  const address = hostname.replace(/^\[|\]$/g, '').toLowerCase();
+  const name = address.endsWith('.') ? address.slice(0, -1) : address;
+  if (name === 'localhost' || name.endsWith('.localhost')) return true;
+
+  const version = isIP(address);
+  if (version === 4) {
+    const [first, second] = address.split('.').map(Number);
+    return first === 10
+      || first === 127
+      || (first === 169 && second === 254)
+      || (first === 172 && second >= 16 && second <= 31)
+      || (first === 192 && second === 168);
+  }
+  if (version === 6) {
+    if (address === '::' || address === '::1') return true;
+    const first = Number.parseInt(address.split(':', 1)[0], 16);
+    if ((first & 0xfe00) === 0xfc00 || (first & 0xffc0) === 0xfe80) return true;
+    if (address.startsWith('::ffff:')) {
+      const [high, low] = address.slice(7).split(':').map((part) => Number.parseInt(part, 16));
+      return isPrivateOrLoopbackAddress(`${high >> 8}.${high & 0xff}.${low >> 8}.${low & 0xff}`);
+    }
+  }
+  return false;
+}
+
+function validateClientJwks(metadata) {
+  for (const key of metadata.jwks?.keys ?? []) {
+    if (!key || typeof key !== 'object') continue;
+    const privateMember = privateJwkMembers.find((member) => Object.hasOwn(key, member));
+    if (privateMember) throw new Error(`jwks must not contain private key material (${privateMember})`);
+  }
+
+  if (!metadata.jwks_uri) return;
+  let url;
+  try {
+    url = new URL(metadata.jwks_uri);
+  } catch {
+    throw new Error('jwks_uri must be a valid URL');
+  }
+  if (url.protocol !== 'https:') throw new Error('jwks_uri must use HTTPS');
+  if (url.username || url.password || url.hash) throw new Error('jwks_uri cannot contain credentials or a fragment');
+  if (isPrivateOrLoopbackAddress(url.hostname)) {
+    throw new Error('jwks_uri must not target a private, loopback, or link-local address');
+  }
+}
+
 function validateWebOrigins(metadata, { development = false } = {}) {
   const origins = metadata.web_origins;
   if (origins === undefined) return;
@@ -181,12 +245,21 @@ function validateClientSecurity(metadata, { development = false } = {}) {
     throw new Error('Implicit and password grants are not supported');
   }
   const method = metadata.token_endpoint_auth_method ?? 'client_secret_basic';
-  if (!['client_secret_basic', 'none'].includes(method)) {
+  if (!clientAuthMethods.includes(method)) {
     throw new Error(`Unsupported token endpoint authentication method: ${method}`);
+  }
+  if (metadata.token_endpoint_auth_signing_alg !== undefined) {
+    const allowed = method === 'private_key_jwt'
+      ? privateKeyJwtSigningAlgorithms
+      : method === 'client_secret_jwt' ? clientSecretJwtSigningAlgorithms : [];
+    if (!allowed.includes(metadata.token_endpoint_auth_signing_alg)) {
+      throw new Error(`Unsupported token endpoint authentication signing algorithm: ${metadata.token_endpoint_auth_signing_alg}`);
+    }
   }
   if (metadata.subject_type !== undefined && !['public', 'pairwise'].includes(metadata.subject_type)) {
     throw new Error(`Unsupported subject type: ${metadata.subject_type}`);
   }
+  validateClientJwks(metadata);
   validateWebOrigins(metadata, { development });
   if (!development) {
     for (const field of ['redirect_uris', 'post_logout_redirect_uris']) {
@@ -197,7 +270,7 @@ function validateClientSecurity(metadata, { development = false } = {}) {
         if (url.username || url.password || url.hash) throw new Error(`${field} entries cannot contain credentials or fragments`);
       }
     }
-    for (const field of ['jwks_uri', 'sector_identifier_uri', 'backchannel_logout_uri', 'frontchannel_logout_uri']) {
+    for (const field of ['sector_identifier_uri', 'backchannel_logout_uri', 'frontchannel_logout_uri']) {
       if (!metadata[field]) continue;
       const url = new URL(metadata[field]);
       if (url.protocol !== 'https:') throw new Error(`${field} must use HTTPS`);
@@ -211,6 +284,7 @@ function validateClientSecurity(metadata, { development = false } = {}) {
 
 export async function createRealmProvider({ realm, config, store, data, Adapter, jwks, logger, auditWriter }) {
   const issuer = issuerFor(config, realm);
+  const clientAssertionAudiences = new Set([issuer, `${issuer}${keycloakRoutes.token}`]);
   const resourceServers = config.resourceServersByRealm[realm];
   const clients = configuredClientsForRealm(config, realm);
   for (const client of clients) validateClientSecurity(client, { development: config.devMode });
@@ -236,7 +310,24 @@ export async function createRealmProvider({ realm, config, store, data, Adapter,
     routes: keycloakRoutes,
     scopes: ['openid', 'offline_access', 'profile', 'email', 'phone', 'address', 'roles', 'groups'],
     responseTypes: ['code'],
-    clientAuthMethods: ['client_secret_basic', 'none'],
+    clientAuthMethods,
+    enabledJWA: { clientAuthSigningAlgValues: clientAuthSigningAlgorithms },
+    async assertJwtClientAuthClaimsAndHeader(_ctx, claims) {
+      if (typeof claims.aud !== 'string' || !clientAssertionAudiences.has(claims.aud)) {
+        throw new errors.InvalidClientAuth('audience (aud) must equal the issuer identifier or token endpoint url');
+      }
+      if (typeof claims.iat !== 'number' || !Number.isFinite(claims.iat)) {
+        throw new errors.InvalidClientAuth('issued at (iat) must be provided as a NumericDate');
+      }
+      const now = Math.floor(Date.now() / 1000);
+      if (Math.abs(now - claims.iat) > clientAssertionClockSkew) {
+        throw new errors.InvalidClientAuth(`issued at (iat) must be within ${clientAssertionClockSkew} seconds of the current time`);
+      }
+      if (typeof claims.exp !== 'number' || !Number.isFinite(claims.exp)
+        || claims.exp - claims.iat > clientAssertionMaxLifetime) {
+        throw new errors.InvalidClientAuth(`client assertion lifetime (exp - iat) must not exceed ${clientAssertionMaxLifetime} seconds`);
+      }
+    },
     subjectTypes: ['public', 'pairwise'],
     extraClientMetadata: {
       properties: ['web_origins'],
@@ -439,6 +530,7 @@ export async function createRealmProvider({ realm, config, store, data, Adapter,
     async fetch(url, options) {
       const target = new URL(url);
       if (target.protocol !== 'https:') throw new Error('External OIDC metadata must use HTTPS');
+      if (!options?.dispatcher) throw new Error('External OIDC metadata requires SSRF protection');
       // Redirects are rejected so an accepted HTTPS metadata URI cannot
       // downgrade transport or escape the provider's per-request SSRF checks.
       return globalThis.fetch(target, { ...options, redirect: 'manual' });

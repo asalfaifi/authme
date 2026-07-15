@@ -123,10 +123,19 @@ The supported v0.3 profile is deliberately smaller than the upstream library's c
 
 Advanced endpoints are consumed from discovery metadata; clients must not guess their paths. [Dynamic registration](https://www.rfc-editor.org/rfc/rfc7591.html) requires a short-lived initial access token issued through the AuthMe administration API and is not an anonymous client-creation API. DPoP clients create a proof for the intended method and URL and handle provider nonce responses where required. PAR request URIs and device/user codes are short-lived provider artifacts persisted through the PostgreSQL adapter.
 
-The v0.3 token-endpoint authentication allowlist is deliberately narrow:
-`client_secret_basic` for confidential clients and `none` for public clients.
-The provider advertises public and pairwise subject types. Pairwise identifiers
-are realm- and sector-bound HMAC values derived with `AUTHME_SUBJECT_SALT`.
+The client-authentication allowlist is `client_secret_basic`,
+`private_key_jwt`, `client_secret_jwt`, and `none`. The JWT assertion methods
+follow [RFC 7523](https://www.rfc-editor.org/rfc/rfc7523.html) at the token,
+introspection, and revocation endpoints. Private-key assertions allow only
+RS256, PS256, or ES256; shared-secret assertions allow only HS256. Assertions
+must use the exact realm issuer or token endpoint as a single audience and carry
+an expiring, one-use `jti` persisted through the realm adapter. A
+`private_key_jwt` client can register an inline public `jwks` or an HTTPS
+`jwks_uri`; inline keys avoid a runtime network dependency, while remote key
+retrieval is size-bounded, rejects redirects, and fails closed without the
+provider's socket-level SSRF protection. The provider advertises public and
+pairwise subject types. Pairwise identifiers are realm- and sector-bound HMAC
+values derived with `AUTHME_SUBJECT_SALT`.
 
 An ordinary OIDC access token without a `resource` audience remains opaque and
 is usable at UserInfo. A configured RFC 8707 resource produces an

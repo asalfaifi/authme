@@ -60,7 +60,12 @@ test('discovery advertises only supported client authentication and reachable su
     .set('host', '127.0.0.1:34991')
     .expect(200);
 
-  assert.deepEqual(response.body.token_endpoint_auth_methods_supported, ['client_secret_basic', 'none']);
+  assert.deepEqual(response.body.token_endpoint_auth_methods_supported, [
+    'client_secret_basic', 'private_key_jwt', 'client_secret_jwt', 'none',
+  ]);
+  assert.deepEqual(response.body.token_endpoint_auth_signing_alg_values_supported, [
+    'RS256', 'ES256', 'PS256', 'HS256',
+  ]);
   assert.deepEqual(response.body.subject_types_supported, ['public', 'pairwise']);
   const client = await runtime.providers.get('master').Client.find('pairwise-native');
   assert.equal(client.subjectType, 'pairwise');

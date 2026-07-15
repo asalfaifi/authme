@@ -19,6 +19,7 @@ Keycloak's current feature inventory includes OIDC/OAuth, SAML, identity brokeri
 | Authorization Code | Implemented | PKCE `S256` supported/required by client policy |
 | Refresh token | Implemented | Subject to client and scope policy |
 | Client Credentials | Implemented | For confidential service clients |
+| Client authentication | Implemented | `client_secret_basic`, `client_secret_jwt` (HS256), `private_key_jwt` (RS256, PS256, or ES256), and `none` |
 | UserInfo | Implemented | Scope-limited claims |
 | Introspection | Implemented | Issuing clients and audience-authorized confidential clients for opaque tokens; JWT access tokens are validated locally |
 | Revocation | Implemented | Standard OAuth revocation endpoint |
@@ -127,10 +128,13 @@ The ordinary Keycloak OIDC client concepts map as follows:
 
 Do not copy a Keycloak client secret into logs, command history, tickets, or migration files. Prefer rotating the secret during migration.
 
-The v0.3 authentication-method profile supports `client_secret_basic` and
-`none`. It does not advertise staged methods such as `private_key_jwt`.
-Keycloak deployments using another client authentication method must change
-the client or wait for the corresponding supported profile.
+The authentication-method profile supports `client_secret_basic`,
+`client_secret_jwt`, `private_key_jwt`, and `none` at the token, introspection,
+and revocation endpoints. JWT client assertions use the exact realm issuer or
+token endpoint as their audience and a durable one-use `jti`. Asymmetric clients
+can register public keys inline with `jwks` or at a constrained HTTPS
+`jwks_uri`. Keycloak deployments using another method, including
+`client_secret_post`, must change the client authentication configuration.
 
 Keycloak-style API tokens require an explicit AuthMe resource-server entry and
 an RFC 8707 `resource` parameter. JWT tokens are validated with the realm JWKS,

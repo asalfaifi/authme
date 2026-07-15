@@ -140,11 +140,11 @@ Keycloak's official guide describes its [identity brokering](https://www.keycloa
 ### Implemented product contract
 
 - [JWT Secured Authorization Response Mode (JARM)](https://openid.net/specs/oauth-v2-jarm.html) with realm-key-signed authorization responses for `jwt`, `query.jwt`, `fragment.jwt`, and `form_post.jwt` response modes.
+- [`private_key_jwt` and `client_secret_jwt` client authentication](https://www.rfc-editor.org/rfc/rfc7523.html) at the token, introspection, and revocation endpoints, with explicit signing-algorithm allowlists, exact assertion audiences, and durable one-use `jti` replay protection.
 
 ### Staged scope
 
 - JAR and richer policy profiles layered on the implemented PAR support.
-- `private_key_jwt` client authentication.
 - mTLS client authentication and certificate-bound tokens.
 - Richer Resource Indicator policy, resource administration, and multi-audience token governance beyond the v0.1 configured baseline.
 - CIBA.
