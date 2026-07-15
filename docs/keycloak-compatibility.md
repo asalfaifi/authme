@@ -26,6 +26,7 @@ Keycloak's current feature inventory includes OIDC/OAuth, SAML, identity brokeri
 | RP-initiated logout | Implemented | Exact registered post-logout redirect validation |
 | Back-channel logout | Implemented | Standards-based signed logout token delivery |
 | Device Authorization Grant | Implemented | Use discovery metadata; do not guess the endpoint |
+| CIBA | Implemented in v0.4 | OpenID CIBA Core poll mode for confidential clients; ping and push are not supported |
 | Pushed Authorization Requests | Implemented | Provider-issued expiring request URIs |
 | JAR | Implemented in v0.4 | Signed `request` objects using registered client public keys; remote client-hosted `request_uri` retrieval is not supported |
 | JARM | Implemented in v0.4 | Realm-key-signed `jwt`, `query.jwt`, `fragment.jwt`, and `form_post.jwt` authorization responses |
@@ -42,7 +43,9 @@ Keycloak's current feature inventory includes OIDC/OAuth, SAML, identity brokeri
 | Pairwise subjects | Implemented | Realm- and client/sector-bound identifiers |
 | Direct Access Grants/password grant | Not supported | Deliberately omitted under current OAuth security guidance |
 | Implicit/hybrid flows | Not in v0.3 contract | Upstream capability does not mean enabled AuthMe behavior |
-| CIBA/FAPI | Staged | Library capabilities require AuthMe configuration and conformance gates |
+| mTLS | Implemented in v0.4 | `tls_client_auth` + `self_signed_tls_client_auth` via trusted proxy; `cnf.x5t#S256` certificate-bound tokens |
+| CIBA | Implemented in v0.4 | Poll mode, confidential clients only; ping/push staged |
+| FAPI | Staged | Library capability requires AuthMe configuration and conformance gates |
 | Keycloak Admin REST API | Not supported | AuthMe administration is a separate API/model |
 | Upstream OIDC brokering | Implemented baseline | Fixed-provider Authorization Code + PKCE; collision-safe JIT/admin linking; no social presets |
 | SAML 2.0 federation | Implemented SP baseline | SP-initiated signed response/assertion; no encrypted assertions, SLO, IdP-initiated login, or SAML IdP |
@@ -68,11 +71,12 @@ The following public paths intentionally match Keycloak's OIDC layout, documente
 | Device authorization | `/realms/{realm}/protocol/openid-connect/auth/device` |
 | Device user verification | `/realms/{realm}/device` |
 | PAR | `/realms/{realm}/protocol/openid-connect/ext/par/request` |
+| CIBA backchannel authentication | `/realms/{realm}/protocol/openid-connect/ext/ciba/auth` |
 | Dynamic registration | `/realms/{realm}/clients-registrations/openid-connect` |
 
 The legacy Keycloak direct-POST logout format used by old Keycloak adapters is not part of the compatibility promise. Keycloak itself describes that format as non-standard and recommends standards-based logout.
 
-Device Authorization, PAR, DPoP, dynamic registration, and back-channel logout are implemented v0.3 capabilities; JAR, JARM, and mTLS are implemented in v0.4. JAR clients register a public inline `jwks` and one of the advertised `RS256`, `PS256`, or `ES256` request-object algorithms. They may set `require_signed_request_object` when every authorization request for that client must use JAR. The table records AuthMe's configured compatibility routes and response modes, but clients must still use discovery metadata as the canonical source for endpoints, response modes, signing algorithms, and advertised authentication methods rather than constructing URLs or assuming algorithm support.
+Device Authorization, PAR, DPoP, dynamic registration, and back-channel logout are implemented v0.3 capabilities; JAR, JARM, mTLS, and CIBA poll mode are implemented in v0.4. CIBA clients are confidential, register the CIBA grant and poll delivery mode, and use discovery for the backchannel endpoint and polling interval; Keycloak-specific CIBA extensions, ping, and push are not supported. JAR clients register a public inline `jwks` and one of the advertised `RS256`, `PS256`, or `ES256` request-object algorithms. They may set `require_signed_request_object` when every authorization request for that client must use JAR. The table records AuthMe's configured compatibility routes and response modes, but clients must still use discovery metadata as the canonical source for endpoints, response modes, signing algorithms, and advertised authentication methods rather than constructing URLs or assuming algorithm support.
 
 An issuer is an exact security identifier, not a display URL. To migrate without changing client issuer configuration, AuthMe must assume the same external scheme, host, port, and realm path previously used by Keycloak. Reverse-proxy rewrites must not cause discovery and token `iss` values to diverge.
 

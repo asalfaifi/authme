@@ -92,6 +92,7 @@ The v0.3 compatibility facade exposes these Keycloak-shaped paths:
 /realms/{realm}/protocol/openid-connect/auth/device
 /realms/{realm}/device
 /realms/{realm}/protocol/openid-connect/ext/par/request
+/realms/{realm}/protocol/openid-connect/ext/ciba/auth
 /realms/{realm}/clients-registrations/openid-connect
 ```
 
@@ -116,6 +117,7 @@ The supported v0.3 profile is deliberately smaller than the upstream library's c
 - RP-initiated logout.
 - Back-channel logout.
 - Device Authorization Grant.
+- OpenID CIBA Core in poll mode.
 - Pushed Authorization Requests (PAR).
 - DPoP-bound access tokens.
 - Mutual-TLS PKI and self-signed client authentication, with optional certificate-bound access tokens.
@@ -131,7 +133,8 @@ the deployment enables the trusted certificate-header boundary. The JWT assertio
 follow [RFC 7523](https://www.rfc-editor.org/rfc/rfc7523.html) at the token,
 introspection, and revocation endpoints. Private-key assertions allow only
 RS256, PS256, or ES256; shared-secret assertions allow only HS256. Assertions
-must use the exact realm issuer or token endpoint as a single audience and carry
+must use the exact realm issuer, token endpoint, or (for CIBA initiation) the
+backchannel authentication endpoint as a single audience and carry
 an expiring, one-use `jti` persisted through the realm adapter. A
 `private_key_jwt` client can register an inline public `jwks` or an HTTPS
 `jwks_uri`; inline keys avoid a runtime network dependency, while remote key
@@ -160,6 +163,16 @@ select one of those granted resources; AuthMe does not choose among them. Each
 resulting access token therefore has exactly one selected audience, and its
 scope is the intersection of requested, granted, and resource-server scopes.
 Scopes belonging only to another resource are not copied into the token.
+
+### Client-Initiated Backchannel Authentication
+
+AuthMe v0.4 implements [OpenID CIBA Core 1.0](https://openid.net/specs/openid-client-initiated-backchannel-authentication-core-1_0.html) for confidential clients in poll mode. A CIBA client registers the `urn:openid:params:grant-type:ciba` grant, `backchannel_token_delivery_mode: poll`, and a non-`none` token endpoint authentication method. The backchannel authentication endpoint accepts the same confidential client authentication methods as the token endpoint, including `private_key_jwt`. Ping and push delivery are outside this release.
+
+Plain `login_hint` values resolve only inside the issuer realm through the canonical, uniqueness-constrained username/email namespace. Unknown, disabled, locked, malformed, and unsupported token hints fail with bounded generic protocol errors that do not echo the hint. Signed CIBA Request Objects require an expiring one-use `jti`. The resulting high-entropy `auth_req_id` is stored as a realm- and account-bound `BackchannelAuthenticationRequest`; disabled accounts, security-version changes, expiry, client mismatch, and cross-realm lookup invalidate it.
+
+The provider persists the request before invoking the authentication-device hook. A trusted integration registers one handler through `authmeCiba.setAuthenticationDeviceHandler`; the handler receives only the realm, request/account/client identifiers, binding message, expiry, and requested scopes, then dispatches through the deployment's authentication-device channel. Production never auto-approves: after authenticating the user and obtaining authorization, the integration calls `authmeCiba.complete` with the account, decision, ACR, AMR, and authentication time. Development mode exposes `authmeCiba.approveForDevelopment` for deterministic integration tests; that helper is rejected outside development mode.
+
+Poll acknowledgements advertise a minimum interval. Each token poll atomically advances a PostgreSQL-backed per-request deadline; an early or overlapping request returns `slow_down` and increases the interval, while a timely incomplete request returns `authorization_pending`. Approval is a one-way compare-and-update transition, and successful redemption consumes the request once. PostgreSQL therefore enforces the same behavior across replicas; the memory adapter mirrors it only for development and tests.
 
 An ordinary OIDC access token without a `resource` audience remains opaque and
 is usable at UserInfo. A configured resource produces an audience-bound token
@@ -218,7 +231,7 @@ An authorized resource client that registers `introspection_signed_response_alg:
 
 Only asymmetric algorithms backed by the realm's validated private JWKS are advertised and accepted; `none` is rejected as client metadata. The public JWKS endpoint never returns private parameters. Consumers validate the signature against that realm's JWKS and require the exact issuer, their own client ID as audience, and the expected response type before using claims. Response signing provides integrity and origin authentication; TLS, bearer-token protection, scope/claim filtering, and introspection caller authorization remain mandatory.
 
-Implicit flow, Resource Owner Password Credentials, CIBA, and FAPI profiles are not part of the v0.3 product contract unless a release explicitly enables and tests them. The OAuth Security Best Current Practice requires authorization servers to support PKCE, requires it for public clients, recommends it for confidential clients, and requires exact redirect URI matching; see [RFC 9700](https://www.rfc-editor.org/rfc/rfc9700.html). PAR is defined by [RFC 9126](https://www.rfc-editor.org/rfc/rfc9126.html), DPoP by [RFC 9449](https://www.rfc-editor.org/rfc/rfc9449.html), and Device Authorization by [RFC 8628](https://www.rfc-editor.org/rfc/rfc8628.html).
+Implicit flow, Resource Owner Password Credentials, FAPI profiles, and CIBA ping/push delivery are not part of the v0.3 product contract unless a release explicitly enables and tests them. The OAuth Security Best Current Practice requires authorization servers to support PKCE, requires it for public clients, recommends it for confidential clients, and requires exact redirect URI matching; see [RFC 9700](https://www.rfc-editor.org/rfc/rfc9700.html). PAR is defined by [RFC 9126](https://www.rfc-editor.org/rfc/rfc9126.html), DPoP by [RFC 9449](https://www.rfc-editor.org/rfc/rfc9449.html), and Device Authorization by [RFC 8628](https://www.rfc-editor.org/rfc/rfc8628.html).
 
 ### JWT Secured Authorization Response Mode
 
@@ -235,7 +248,7 @@ PostgreSQL is the canonical store for AuthMe configuration and for all `oidc-pro
 - access and refresh tokens;
 - grants and consents;
 - replay-detection records;
-- device codes, pushed authorization requests, DPoP replay records, and dynamic-registration artifacts;
+- device codes, CIBA backchannel authentication requests and poll state, pushed authorization requests, DPoP replay records, and dynamic-registration artifacts;
 - client and user data;
 - realm-scoped administrator grants and opaque administration-console sessions;
 - realm configuration and signing material metadata;

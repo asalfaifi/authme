@@ -16,6 +16,29 @@ test('client security policy rejects obsolete grants in every mode', () => {
   assert.throws(() => validateClientSecurity({ grant_types: ['implicit'] }), /not supported/);
 });
 
+test('CIBA client policy requires confidential authentication and poll delivery', () => {
+  const grant_types = ['urn:openid:params:grant-type:ciba'];
+  assert.doesNotThrow(() => validateClientSecurity({
+    grant_types,
+    token_endpoint_auth_method: 'client_secret_basic',
+    backchannel_token_delivery_mode: 'poll',
+  }, { development: true }));
+  assert.throws(() => validateClientSecurity({
+    grant_types,
+    token_endpoint_auth_method: 'none',
+    backchannel_token_delivery_mode: 'poll',
+  }, { development: true }), /requires confidential/);
+  assert.throws(() => validateClientSecurity({
+    grant_types,
+    token_endpoint_auth_method: 'client_secret_basic',
+    backchannel_token_delivery_mode: 'ping',
+  }, { development: true }), /must use poll/);
+  assert.throws(() => validateClientSecurity({
+    grant_types,
+    token_endpoint_auth_method: 'client_secret_basic',
+  }, { development: true }), /must use poll/);
+});
+
 test('client security policy exposes only the supported authentication, algorithm, and subject methods', () => {
   assert.doesNotThrow(() => validateClientSecurity({ token_endpoint_auth_method: 'client_secret_basic' }, { development: true }));
   assert.doesNotThrow(() => validateClientSecurity({

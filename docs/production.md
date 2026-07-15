@@ -125,6 +125,7 @@ Operational rules:
 
 - Run migrations as an explicit release step, once, under an advisory lock where supported.
 - The migrator preflights applied names and checksums before applying pending files, then AuthMe verifies the exact release manifest again before production startup. A missing `schema_migrations` table, pending or modified migration, or migration unknown to the running image fails startup before realm state is touched. Run `npm run db:migrate` with the target image first; do not hand-edit migration history.
+- Migration `006_ciba.sql` adds durable CIBA polling deadline columns to `oidc_records`; apply it before enabling a release that accepts CIBA requests on any replica.
 - Back up before schema changes and verify that the target application can run against the migrated schema.
 - Bound each AuthMe replica's connection pool so the combined maximum remains below database capacity with headroom for migrations and operations.
 - Configure statement, lock, and idle transaction timeouts.
@@ -311,7 +312,7 @@ The release owner must record evidence for all of the following:
 - supported patched Node.js 22 and reviewed dependency audit;
 - database migration and clean-install tests;
 - full automated test suite, including concurrent replay and cross-realm isolation;
-- device-flow, PAR, DPoP, protected dynamic-registration, back-channel logout, TOTP, and recovery-code negative/concurrency tests;
+- device-flow, CIBA poll-mode, PAR, DPoP, protected dynamic-registration, back-channel logout, TOTP, and recovery-code negative/concurrency tests;
 - [OpenID Foundation Conformance Suite](https://openid.net/certification/about-conformance-suite/) against the release configuration;
 - public-ingress issuer/discovery/JWKS validation;
 - TLS, trusted-proxy, cookie, CSP, CORS, redirect, and cache-header review;
