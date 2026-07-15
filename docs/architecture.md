@@ -138,7 +138,13 @@ can instead be introspected by confidential clients explicitly listed for that
 audience and checked online for security-state changes. Offline JWT validators
 accept a token until its short expiration unless they operate a denylist.
 
-Implicit flow, Resource Owner Password Credentials, CIBA, JAR, JARM, mTLS, and FAPI profiles are not part of the v0.3 product contract unless a release explicitly enables and tests them. The OAuth Security Best Current Practice requires authorization servers to support PKCE, requires it for public clients, recommends it for confidential clients, and requires exact redirect URI matching; see [RFC 9700](https://www.rfc-editor.org/rfc/rfc9700.html). PAR is defined by [RFC 9126](https://www.rfc-editor.org/rfc/rfc9126.html), DPoP by [RFC 9449](https://www.rfc-editor.org/rfc/rfc9449.html), and Device Authorization by [RFC 8628](https://www.rfc-editor.org/rfc/rfc8628.html).
+Implicit flow, Resource Owner Password Credentials, CIBA, JAR, mTLS, and FAPI profiles are not part of the v0.3 product contract unless a release explicitly enables and tests them. The OAuth Security Best Current Practice requires authorization servers to support PKCE, requires it for public clients, recommends it for confidential clients, and requires exact redirect URI matching; see [RFC 9700](https://www.rfc-editor.org/rfc/rfc9700.html). PAR is defined by [RFC 9126](https://www.rfc-editor.org/rfc/rfc9126.html), DPoP by [RFC 9449](https://www.rfc-editor.org/rfc/rfc9449.html), and Device Authorization by [RFC 8628](https://www.rfc-editor.org/rfc/rfc8628.html).
+
+### JWT Secured Authorization Response Mode
+
+AuthMe v0.4 supports [JWT Secured Authorization Response Mode (JARM)](https://openid.net/specs/oauth-v2-jarm.html). A client can request `jwt`, `query.jwt`, `fragment.jwt`, or `form_post.jwt`; the authorization endpoint returns the response parameters inside a `response` JWT signed by the realm's provider key. The client's optional `authorization_signed_response_alg` defaults to `RS256` and must be an asymmetric algorithm advertised by the realm; `none` is neither advertised nor accepted. Existing non-JWT response modes remain available.
+
+Clients validate the JARM signature against the realm JWKS and require the exact issuer, their own client ID as audience, and a valid expiration before consuming `code`, `state`, or error claims. JARM protects authorization-response integrity; it does not replace PKCE, exact redirect URI validation, state handling, or TLS.
 
 ## Persistence
 
