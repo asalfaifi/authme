@@ -26,6 +26,7 @@ Keycloak's current feature inventory includes OIDC/OAuth, SAML, identity brokeri
 | Back-channel logout | Implemented | Standards-based signed logout token delivery |
 | Device Authorization Grant | Implemented | Use discovery metadata; do not guess the endpoint |
 | Pushed Authorization Requests | Implemented | Provider-issued expiring request URIs |
+| JARM | Implemented in v0.4 | Realm-key-signed `jwt`, `query.jwt`, `fragment.jwt`, and `form_post.jwt` authorization responses |
 | DPoP | Implemented | Enabled by client policy; proof validation and replay state are durable |
 | Dynamic client registration | Implemented | Requires an AuthMe initial access token |
 | TOTP and recovery codes | Implemented | New AuthMe enrollment; existing Keycloak credential import is not guaranteed |
@@ -38,7 +39,7 @@ Keycloak's current feature inventory includes OIDC/OAuth, SAML, identity brokeri
 | Pairwise subjects | Implemented | Realm- and client/sector-bound identifiers |
 | Direct Access Grants/password grant | Not supported | Deliberately omitted under current OAuth security guidance |
 | Implicit/hybrid flows | Not in v0.3 contract | Upstream capability does not mean enabled AuthMe behavior |
-| CIBA/JAR/JARM/mTLS/FAPI | Staged | Library capabilities require AuthMe configuration and conformance gates |
+| CIBA/JAR/mTLS/FAPI | Staged | Library capabilities require AuthMe configuration and conformance gates |
 | Keycloak Admin REST API | Not supported | AuthMe administration is a separate API/model |
 | Upstream OIDC brokering | Implemented baseline | Fixed-provider Authorization Code + PKCE; collision-safe JIT/admin linking; no social presets |
 | SAML 2.0 federation | Implemented SP baseline | SP-initiated signed response/assertion; no encrypted assertions, SLO, IdP-initiated login, or SAML IdP |
@@ -68,7 +69,7 @@ The following public paths intentionally match Keycloak's OIDC layout, documente
 
 The legacy Keycloak direct-POST logout format used by old Keycloak adapters is not part of the compatibility promise. Keycloak itself describes that format as non-standard and recommends standards-based logout.
 
-Device Authorization, PAR, DPoP, dynamic registration, and back-channel logout are implemented v0.3 capabilities. The table records AuthMe's configured compatibility routes, but clients must still use discovery metadata as the canonical source for endpoints and advertised authentication methods rather than constructing URLs.
+Device Authorization, PAR, DPoP, dynamic registration, and back-channel logout are implemented v0.3 capabilities; JARM is implemented in v0.4. The table records AuthMe's configured compatibility routes and response modes, but clients must still use discovery metadata as the canonical source for endpoints, response modes, signing algorithms, and advertised authentication methods rather than constructing URLs or assuming algorithm support.
 
 An issuer is an exact security identifier, not a display URL. To migrate without changing client issuer configuration, AuthMe must assume the same external scheme, host, port, and realm path previously used by Keycloak. Reverse-proxy rewrites must not cause discovery and token `iss` values to diverge.
 

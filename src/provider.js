@@ -325,6 +325,7 @@ export async function createRealmProvider({ realm, config, store, data, Adapter,
           return clientCanIntrospectToken(resourceServers, client.clientId, token, client.clientAuthMethod);
         },
       },
+      jwtResponseModes: { enabled: true },
       pushedAuthorizationRequests: { enabled: true },
       registration: {
         enabled: config.enableDynamicRegistration,
