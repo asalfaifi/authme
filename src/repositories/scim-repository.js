@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto';
 
+import { SCIM_URNS } from '../scim/constants.js';
 import { ScimRepositoryError } from '../scim/errors.js';
+import { parseFilter } from '../scim/filter.js';
 
 function repositoryError(code, message) {
   return new ScimRepositoryError(code, message);
@@ -94,11 +96,337 @@ function rowToGroup(row, members = []) {
   };
 }
 
-const userSelect = `SELECT users.*, resources.external_id, resources.version,
+const userColumns = `users.*, resources.external_id, resources.version,
   resources.created_at AS scim_created_at, resources.updated_at AS scim_updated_at,
-  users.attributes->'scim' AS scim_attributes
- FROM users JOIN scim_user_resources AS resources
-   ON resources.realm_name=users.realm_name AND resources.user_id=users.id`;
+  users.attributes->'scim' AS scim_attributes`;
+
+const userFrom = `FROM users JOIN scim_user_resources AS resources
+  ON resources.realm_name=users.realm_name AND resources.user_id=users.id`;
+
+const userSelect = `SELECT ${userColumns} ${userFrom}`;
+
+const userDocument = `(COALESCE(users.attributes->'scim', '{}'::jsonb) || jsonb_build_object(
+  'id', users.id::text,
+  'externalId', resources.external_id,
+  'userName', users.username,
+  'displayName', users.display_name,
+  'name', COALESCE(users.attributes->'scim'->'name', '{}'::jsonb)
+    || CASE WHEN users.given_name <> '' THEN jsonb_build_object('givenName', users.given_name) ELSE '{}'::jsonb END
+    || CASE WHEN users.family_name <> '' THEN jsonb_build_object('familyName', users.family_name) ELSE '{}'::jsonb END
+    || jsonb_build_object('formatted', users.display_name),
+  'emails', CASE
+    WHEN jsonb_typeof(users.attributes->'scim'->'emails') = 'array'
+      AND jsonb_array_length(users.attributes->'scim'->'emails') > 0
+      THEN users.attributes->'scim'->'emails'
+    ELSE jsonb_build_array(jsonb_build_object('value', users.email, 'primary', true))
+  END,
+  'roles', CASE
+    WHEN jsonb_typeof(users.attributes->'scim'->'roles') = 'array'
+      AND jsonb_array_length(users.attributes->'scim'->'roles') > 0
+      THEN users.attributes->'scim'->'roles'
+    ELSE (SELECT COALESCE(jsonb_agg(jsonb_build_object('value', role)), '[]'::jsonb)
+          FROM unnest(users.roles) AS role)
+  END,
+  'active', users.enabled
+))`;
+
+const commonSortPaths = [
+  'schemas', 'id', 'externalId', 'meta.resourceType', 'meta.created',
+  'meta.lastModified', 'meta.location', 'meta.version',
+];
+
+const userSortPaths = new Set([
+  ...commonSortPaths,
+  'userName', 'name.formatted', 'name.familyName', 'name.givenName', 'name.middleName',
+  'name.honorificPrefix', 'name.honorificSuffix', 'displayName', 'nickName', 'profileUrl',
+  'title', 'userType', 'preferredLanguage', 'locale', 'timezone', 'active',
+  ...['emails', 'phoneNumbers', 'ims', 'photos', 'entitlements', 'roles'].flatMap((name) => (
+    ['value', 'display', 'type', 'primary'].map((child) => `${name}.${child}`)
+  )),
+  ...['formatted', 'streetAddress', 'locality', 'region', 'postalCode', 'country', 'type', 'primary']
+    .map((child) => `addresses.${child}`),
+  ...['value', '$ref', 'display', 'type'].map((child) => `groups.${child}`),
+  'x509Certificates.value',
+]);
+
+const groupSortPaths = new Set([
+  ...commonSortPaths, 'displayName',
+  ...['value', '$ref', 'display', 'type'].map((child) => `members.${child}`),
+]);
+
+class SqlParameters {
+  constructor(realm) { this.values = [realm]; }
+
+  add(value) {
+    this.values.push(value);
+    return `$${this.values.length}`;
+  }
+}
+
+function normalizedFilter(filter, resourceType) {
+  if (!filter || filter.type) return filter;
+  const literal = JSON.stringify(filter.value);
+  if (typeof filter.attribute !== 'string' || literal === undefined) {
+    throw new TypeError('The repository filter is invalid');
+  }
+  return parseFilter(`${filter.attribute} eq ${literal}`, resourceType);
+}
+
+function jsonPath(segments) {
+  return `$${segments.map((segment) => `.${JSON.stringify(segment)}`).join('')}`;
+}
+
+function rawValuesSql(parameters, attribute, source) {
+  if (source.relative) {
+    const path = parameters.add(jsonPath(attribute.segments));
+    return `SELECT path.value FROM jsonb_path_query(${source.document}, ${path}::jsonpath) AS path(value)`;
+  }
+
+  let value;
+  if (source.columns?.[attribute.path]) {
+    value = `to_jsonb(${source.columns[attribute.path]})`;
+  } else if (attribute.path === 'schemas') {
+    value = `jsonb_build_array(to_jsonb(${parameters.add(source.schema)}::text))`;
+  } else if (attribute.path === 'meta.resourceType') {
+    value = `to_jsonb(${parameters.add(source.resourceType)}::text)`;
+  } else if (attribute.path === 'meta.created') {
+    value = `to_jsonb(${source.created})`;
+  } else if (attribute.path === 'meta.lastModified') {
+    value = `to_jsonb(${source.updated})`;
+  } else if (attribute.path === 'meta.version') {
+    value = `to_jsonb(('W/"' || ${source.version}::text || '"')::text)`;
+  } else if (attribute.path === 'meta' || attribute.path === 'meta.location') {
+    value = 'NULL::jsonb';
+  } else {
+    const path = parameters.add(jsonPath(attribute.segments));
+    return `SELECT path.value FROM jsonb_path_query(${source.document}, ${path}::jsonpath) AS path(value)`;
+  }
+  return `SELECT ${value} AS value`;
+}
+
+function attributeValuesSql(parameters, attribute, source, { flattenComplex = true } = {}) {
+  const raw = rawValuesSql(parameters, attribute, source);
+  const expanded = `SELECT CASE WHEN jsonb_typeof(raw.value) = 'array' THEN elements.value ELSE raw.value END AS value
+    FROM (${raw}) AS raw
+    LEFT JOIN LATERAL jsonb_array_elements(
+      CASE WHEN jsonb_typeof(raw.value) = 'array' THEN raw.value ELSE '[]'::jsonb END
+    ) AS elements(value) ON true
+    WHERE jsonb_typeof(raw.value) <> 'array' OR elements.value IS NOT NULL`;
+  if (!flattenComplex || attribute.type !== 'complex') return expanded;
+  return `SELECT CASE WHEN jsonb_typeof(expanded.value) = 'object' THEN children.value ELSE expanded.value END AS value
+    FROM (${expanded}) AS expanded
+    LEFT JOIN LATERAL jsonb_each(
+      CASE WHEN jsonb_typeof(expanded.value) = 'object' THEN expanded.value ELSE '{}'::jsonb END
+    ) AS children(key, value) ON true
+    WHERE jsonb_typeof(expanded.value) <> 'object' OR children.value IS NOT NULL`;
+}
+
+function stringComparison(parameters, expression, actual) {
+  const expected = parameters.add(expression.value);
+  const isString = `jsonb_typeof(candidate.value) = 'string'`;
+  if (expression.value === null) {
+    if (expression.operator === 'ne') return `${expected}::text IS NULL`;
+    return `${expected}::text IS NOT NULL AND false`;
+  }
+  const left = expression.attribute.caseExact ? actual : `lower(${actual})`;
+  const right = expression.attribute.caseExact ? `${expected}::text` : `lower(${expected}::text)`;
+  if (expression.operator === 'eq') return `${isString} AND ${left} = ${right}`;
+  if (expression.operator === 'ne') return `NOT ${isString} OR ${left} <> ${right}`;
+  if (expression.operator === 'co') return `${isString} AND strpos(${left}, ${right}) > 0`;
+  if (expression.operator === 'sw') return `${isString} AND left(${left}, length(${right})) = ${right}`;
+  if (expression.operator === 'ew') return `${isString} AND right(${left}, length(${right})) = ${right}`;
+  const operator = { gt: '>', ge: '>=', lt: '<', le: '<=' }[expression.operator];
+  if (!operator) throw new TypeError(`Unsupported SCIM comparison operator ${expression.operator}`);
+  return `${isString} AND (${left} COLLATE "C") ${operator} (${right} COLLATE "C")`;
+}
+
+function booleanComparison(parameters, expression, actual) {
+  const expectedValue = typeof expression.value === 'string'
+    ? expression.value.toLowerCase() === 'true' : expression.value;
+  const expected = parameters.add(expectedValue);
+  const valid = `(jsonb_typeof(candidate.value) = 'boolean'
+    OR (jsonb_typeof(candidate.value) = 'string' AND lower(${actual}) IN ('true', 'false')))`;
+  const left = `(CASE WHEN ${valid} THEN ${actual}::boolean END)`;
+  if (expression.operator === 'eq') return `${valid} AND ${left} = ${expected}::boolean`;
+  if (expression.operator === 'ne') return `NOT ${valid} OR ${left} <> ${expected}::boolean`;
+  throw new TypeError(`Unsupported SCIM boolean comparison operator ${expression.operator}`);
+}
+
+function dateComparison(parameters, expression, actual) {
+  const expected = parameters.add(expression.value);
+  const parsed = Date.parse(expression.value);
+  if (Number.isNaN(parsed)) {
+    if (expression.operator === 'ne') return `${expected}::text IS NOT NULL`;
+    return `${expected}::text IS NULL AND false`;
+  }
+  const instant = parameters.add(new Date(parsed).toISOString());
+  const isString = `jsonb_typeof(candidate.value) = 'string'`;
+  const operator = { eq: '=', ne: '<>', gt: '>', ge: '>=', lt: '<', le: '<=' }[expression.operator];
+  if (!operator) throw new TypeError(`Unsupported SCIM date comparison operator ${expression.operator}`);
+  if (expression.operator === 'ne') {
+    return `NOT ${isString} OR ${actual}::timestamptz ${operator} ${instant}::timestamptz`;
+  }
+  return `${isString} AND ${actual}::timestamptz ${operator} ${instant}::timestamptz`;
+}
+
+function comparisonSql(parameters, expression, source) {
+  const values = attributeValuesSql(parameters, expression.attribute, source);
+  const actual = `(candidate.value #>> '{}')`;
+  let predicate;
+  if (expression.attribute.type === 'boolean') {
+    predicate = booleanComparison(parameters, expression, actual);
+  } else if (expression.attribute.type === 'dateTime') {
+    predicate = dateComparison(parameters, expression, actual);
+  } else {
+    predicate = stringComparison(parameters, expression, actual);
+  }
+  return `EXISTS (SELECT 1 FROM (${values}) AS candidate
+    WHERE jsonb_typeof(candidate.value) <> 'null' AND (${predicate}))`;
+}
+
+// Every node emitted by parseFilter is compiled here. Unknown nodes fail
+// closed instead of falling back to an unbounded in-memory realm scan.
+function filterSql(parameters, expression, source) {
+  if (!expression) return 'true';
+  if (expression.type === 'logical') {
+    if (!['and', 'or'].includes(expression.operator)) throw new TypeError('Unsupported SCIM logical operator');
+    return `(${filterSql(parameters, expression.left, source)} ${expression.operator.toUpperCase()} ${filterSql(parameters, expression.right, source)})`;
+  }
+  if (expression.type === 'not') return `(NOT (${filterSql(parameters, expression.expression, source)}))`;
+  if (expression.type === 'presence') {
+    const values = attributeValuesSql(parameters, expression.attribute, source);
+    return `EXISTS (SELECT 1 FROM (${values}) AS candidate
+      WHERE jsonb_typeof(candidate.value) <> 'null'
+        AND (jsonb_typeof(candidate.value) <> 'string' OR candidate.value #>> '{}' <> ''))`;
+  }
+  if (expression.type === 'valuePath') {
+    const candidates = attributeValuesSql(parameters, expression.attribute, source, { flattenComplex: false });
+    const relative = { ...source, document: 'candidate.value', relative: true };
+    return `EXISTS (SELECT 1 FROM (${candidates}) AS candidate
+      WHERE jsonb_typeof(candidate.value) = 'object'
+        AND (${filterSql(parameters, expression.expression, relative)}))`;
+  }
+  if (expression.type === 'comparison') return comparisonSql(parameters, expression, source);
+  throw new TypeError(`Unsupported SCIM filter node ${expression.type}`);
+}
+
+function filterReferences(expression, path) {
+  if (!expression) return false;
+  if (expression.attribute?.path === path || expression.attribute?.path.startsWith(`${path}.`)) return true;
+  return filterReferences(expression.left, path)
+    || filterReferences(expression.right, path)
+    || filterReferences(expression.expression, path);
+}
+
+function sortRawValueSql(parameters, sort, source) {
+  const { attribute } = sort;
+  if (attribute.multiValued && attribute.segments.length > 1) {
+    const parentPath = parameters.add([attribute.segments[0]]);
+    const childPath = parameters.add(jsonPath(attribute.segments.slice(1)));
+    return `(SELECT (
+        SELECT child.value #>> '{}'
+        FROM jsonb_path_query(selected.value, ${childPath}::jsonpath) AS child(value)
+        WHERE jsonb_typeof(child.value) <> 'null'
+        LIMIT 1
+      )
+      FROM (
+        SELECT item.value
+        FROM jsonb_array_elements(CASE
+          WHEN jsonb_typeof(jsonb_extract_path(${source.document}, VARIADIC ${parentPath}::text[])) = 'array'
+            THEN jsonb_extract_path(${source.document}, VARIADIC ${parentPath}::text[])
+          ELSE '[]'::jsonb
+        END) WITH ORDINALITY AS item(value, ordinal)
+        ORDER BY (item.value->'primary' = 'true'::jsonb) DESC, item.ordinal
+        LIMIT 1
+      ) AS selected)`;
+  }
+  const values = attributeValuesSql(parameters, attribute, source);
+  return `(SELECT candidate.value #>> '{}' FROM (${values}) AS candidate
+    WHERE jsonb_typeof(candidate.value) <> 'null' LIMIT 1)`;
+}
+
+function sortSql(parameters, sort, source) {
+  if (!sort) {
+    return {
+      selection: `NULL::text AS scim_sort_key, false AS scim_sort_missing`,
+      order: 'id ASC',
+    };
+  }
+  const allowlist = source.resourceType === 'User' ? userSortPaths : groupSortPaths;
+  if (!allowlist.has(sort.attribute.path) || !['ascending', 'descending'].includes(sort.order)) {
+    throw new TypeError('Unsupported SCIM sort');
+  }
+  const raw = sortRawValueSql(parameters, sort, source);
+  let key = raw;
+  let missing = `${raw} IS NULL`;
+  if (sort.attribute.type === 'boolean') {
+    key = `${raw}::boolean`;
+  } else if (sort.attribute.type === 'dateTime') {
+    key = `${raw}::timestamptz`;
+  } else {
+    missing = `(${raw} IS NULL OR ${raw} = '')`;
+    key = sort.attribute.caseExact ? `(${raw} COLLATE "C")` : `(lower(${raw}) COLLATE "C")`;
+  }
+  const direction = sort.order === 'ascending' ? 'ASC' : 'DESC';
+  return {
+    selection: `${key} AS scim_sort_key, ${missing} AS scim_sort_missing`,
+    order: `scim_sort_missing ${direction}, scim_sort_key ${direction}, id ASC`,
+  };
+}
+
+function userSource() {
+  return {
+    document: 'listed.scim_document', schema: SCIM_URNS.user, resourceType: 'User',
+    created: 'listed.scim_created_at', updated: 'listed.scim_updated_at', version: 'listed.version',
+    columns: {
+      id: 'listed.id::text', externalId: 'listed.external_id', userName: 'listed.username',
+      displayName: 'listed.display_name', 'name.formatted': 'listed.display_name', active: 'listed.enabled',
+    },
+  };
+}
+
+function userListSource() {
+  return `SELECT ${userColumns}, ${userDocument} AS scim_document
+    ${userFrom} WHERE users.realm_name=$1`;
+}
+
+function groupDocument(members) {
+  return `jsonb_build_object(
+    'id', groups.id::text,
+    'externalId', groups.external_id,
+    'displayName', groups.display_name,
+    'members', ${members}
+  )`;
+}
+
+function groupListSource(includeMembers) {
+  const join = includeMembers ? `LEFT JOIN (
+      SELECT memberships.realm_name, memberships.group_id,
+        jsonb_agg(jsonb_build_object('value', memberships.user_id::text, 'type', 'User')
+          ORDER BY memberships.user_id) AS scim_members,
+        array_agg(memberships.user_id::text ORDER BY memberships.user_id) AS scim_member_ids
+      FROM scim_group_members AS memberships
+      WHERE memberships.realm_name=$1
+      GROUP BY memberships.realm_name, memberships.group_id
+    ) AS member_values
+      ON member_values.realm_name=groups.realm_name AND member_values.group_id=groups.id` : '';
+  const members = includeMembers ? `COALESCE(member_values.scim_members, '[]'::jsonb)` : `'[]'::jsonb`;
+  const memberIds = includeMembers ? `COALESCE(member_values.scim_member_ids, '{}'::text[])` : 'NULL::text[]';
+  return `SELECT groups.*, ${memberIds} AS scim_member_ids,
+      ${groupDocument(members)} AS scim_document
+    FROM scim_groups AS groups ${join}
+    WHERE groups.realm_name=$1`;
+}
+
+function groupSource() {
+  return {
+    document: 'listed.scim_document', schema: SCIM_URNS.group, resourceType: 'Group',
+    created: 'listed.created_at', updated: 'listed.updated_at', version: 'listed.version',
+    columns: {
+      id: 'listed.id::text', externalId: 'listed.external_id', displayName: 'listed.display_name',
+    },
+  };
+}
 
 function translateConstraint(error, resourceType) {
   if (error?.code === '23505') {
@@ -107,16 +435,6 @@ function translateConstraint(error, resourceType) {
   if (error?.code === '23503') return repositoryError('INVALID_VALUE', 'A referenced User does not exist in this realm.');
   if (error?.code === '22P02') return repositoryError('INVALID_VALUE', 'A SCIM resource identifier is invalid.');
   return error;
-}
-
-function filterSql(filter, resourceType, startParameter = 2) {
-  if (!filter) return { sql: '', values: [] };
-  const userColumns = { id: 'users.id::text', userName: 'lower(users.username)', externalId: 'resources.external_id', active: 'users.enabled::text' };
-  const groupColumns = { id: 'groups.id::text', displayName: 'lower(groups.display_name)', externalId: 'groups.external_id' };
-  const column = (resourceType === 'User' ? userColumns : groupColumns)[filter.attribute];
-  if (!column) return { sql: '', values: [] };
-  const insensitive = ['userName', 'displayName'].includes(filter.attribute);
-  return { sql: ` AND ${column}=$${startParameter}`, values: [insensitive ? filter.value.toLowerCase() : filter.value] };
 }
 
 async function withTransaction(pool, operation) {
@@ -170,27 +488,34 @@ export class PostgresScimRepository {
   }
 
   async listUsers(realm, options) {
-    const filtered = filterSql(options.filter, 'User');
-    const values = [realm, ...filtered.values, options.count, options.startIndex - 1];
-    const countParameter = 2 + filtered.values.length;
-    const offsetParameter = countParameter + 1;
-    const result = await this.pool.query(
-      `WITH selected AS (${userSelect} WHERE users.realm_name=$1${filtered.sql})
-       SELECT selected.*, count(*) OVER()::integer AS total_results
-       FROM selected ORDER BY id LIMIT $${countParameter} OFFSET $${offsetParameter}`,
-      values,
+    const filter = normalizedFilter(options.filter, 'User');
+    const countParameters = new SqlParameters(realm);
+    const countWhere = filterSql(countParameters, filter, userSource());
+    const count = await this.pool.query(
+      `SELECT count(*)::bigint AS total
+       FROM (${userListSource()}) AS listed
+       WHERE ${countWhere}`,
+      countParameters.values,
     );
-    let totalResults = result.rows[0]?.total_results ?? 0;
-    if (!result.rows.length) {
-      const count = await this.pool.query(
-        `SELECT count(*)::integer AS total FROM users JOIN scim_user_resources AS resources
-         ON resources.realm_name=users.realm_name AND resources.user_id=users.id
-         WHERE users.realm_name=$1${filtered.sql}`,
-        [realm, ...filtered.values],
-      );
-      totalResults = count.rows[0].total;
-    }
-    return { totalResults, resources: result.rows.map(rowToUser) };
+    const totalResults = Number(count.rows[0].total);
+    const offset = options.startIndex - 1;
+    if (options.count === 0 || offset >= totalResults) return { totalResults, resources: [] };
+
+    const pageParameters = new SqlParameters(realm);
+    const source = userSource();
+    const pageWhere = filterSql(pageParameters, filter, source);
+    const sorting = sortSql(pageParameters, options.sort, source);
+    const limit = pageParameters.add(options.count);
+    const pageOffset = pageParameters.add(offset);
+    const page = await this.pool.query(
+      `SELECT listed.*, ${sorting.selection}
+       FROM (${userListSource()}) AS listed
+       WHERE ${pageWhere}
+       ORDER BY ${sorting.order}
+       LIMIT ${limit}::bigint OFFSET ${pageOffset}::bigint`,
+      pageParameters.values,
+    );
+    return { totalResults, resources: page.rows.map(rowToUser) };
   }
 
   async getUser(realm, id) {
@@ -295,42 +620,77 @@ export class PostgresScimRepository {
 
   async #group(realm, id, client = this.pool) {
     if (!isUuid(id)) return undefined;
-    const result = await client.query('SELECT * FROM scim_groups WHERE realm_name=$1 AND id=$2', [realm, id]);
-    if (!result.rows.length) return undefined;
-    const members = await client.query(
-      'SELECT user_id::text FROM scim_group_members WHERE realm_name=$1 AND group_id=$2 ORDER BY user_id', [realm, id],
+    const result = await client.query(
+      `SELECT groups.*, COALESCE(member_values.member_ids, '{}'::text[]) AS scim_member_ids
+       FROM scim_groups AS groups
+       LEFT JOIN (
+         SELECT group_id, array_agg(user_id::text ORDER BY user_id) AS member_ids
+         FROM scim_group_members
+         WHERE realm_name=$1 AND group_id=$2
+         GROUP BY group_id
+       ) AS member_values ON member_values.group_id=groups.id
+       WHERE groups.realm_name=$1 AND groups.id=$2`,
+      [realm, id],
     );
-    return rowToGroup(result.rows[0], members.rows.map(({ user_id: userId }) => userId));
+    return rowToGroup(result.rows[0], result.rows[0]?.scim_member_ids);
   }
 
   async listGroups(realm, options) {
-    let join = '';
-    let memberCondition = '';
-    let filtered = filterSql(options.filter, 'Group');
-    if (options.filter?.attribute === 'members.value') {
-      join = ' JOIN scim_group_members AS membership ON membership.realm_name=groups.realm_name AND membership.group_id=groups.id';
-      memberCondition = ' AND membership.user_id::text=$2';
-      filtered = { sql: memberCondition, values: [options.filter.value] };
-    }
-    const values = [realm, ...filtered.values, options.count, options.startIndex - 1];
-    const limit = 2 + filtered.values.length;
-    const result = await this.pool.query(
-      `SELECT DISTINCT groups.*, count(*) OVER()::integer AS total_results
-       FROM scim_groups AS groups${join} WHERE groups.realm_name=$1${filtered.sql}
-       ORDER BY groups.id LIMIT $${limit} OFFSET $${limit + 1}`,
-      values,
+    const filter = normalizedFilter(options.filter, 'Group');
+    const countNeedsMembers = filterReferences(filter, 'members');
+    const countParameters = new SqlParameters(realm);
+    const countWhere = filterSql(countParameters, filter, groupSource());
+    const count = await this.pool.query(
+      `SELECT count(*)::bigint AS total
+       FROM (${groupListSource(countNeedsMembers)}) AS listed
+       WHERE ${countWhere}`,
+      countParameters.values,
     );
-    const resources = await Promise.all(result.rows.map((row) => this.#group(realm, row.id)));
-    let totalResults = result.rows[0]?.total_results ?? 0;
-    if (!result.rows.length) {
-      const count = await this.pool.query(
-        `SELECT count(DISTINCT groups.id)::integer AS total
-         FROM scim_groups AS groups${join} WHERE groups.realm_name=$1${filtered.sql}`,
-        [realm, ...filtered.values],
-      );
-      totalResults = count.rows[0].total;
+    const totalResults = Number(count.rows[0].total);
+    const offset = options.startIndex - 1;
+    if (options.count === 0 || offset >= totalResults) return { totalResults, resources: [] };
+
+    const pageNeedsMembers = countNeedsMembers || options.sort?.attribute.path.startsWith('members.') === true;
+    const pageParameters = new SqlParameters(realm);
+    const source = groupSource();
+    const pageWhere = filterSql(pageParameters, filter, source);
+    const sorting = sortSql(pageParameters, options.sort, source);
+    const limit = pageParameters.add(options.count);
+    const pageOffset = pageParameters.add(offset);
+    const pageSource = groupListSource(pageNeedsMembers);
+    let pageSql;
+    if (pageNeedsMembers) {
+      pageSql = `WITH page AS MATERIALIZED (
+          SELECT listed.*, ${sorting.selection}
+          FROM (${pageSource}) AS listed
+          WHERE ${pageWhere}
+          ORDER BY ${sorting.order}
+          LIMIT ${limit}::bigint OFFSET ${pageOffset}::bigint
+        )
+        SELECT page.* FROM page ORDER BY ${sorting.order}`;
+    } else {
+      pageSql = `WITH page AS MATERIALIZED (
+          SELECT listed.*, ${sorting.selection}
+          FROM (${pageSource}) AS listed
+          WHERE ${pageWhere}
+          ORDER BY ${sorting.order}
+          LIMIT ${limit}::bigint OFFSET ${pageOffset}::bigint
+        ), page_members AS (
+          SELECT memberships.group_id,
+            array_agg(memberships.user_id::text ORDER BY memberships.user_id) AS member_ids
+          FROM scim_group_members AS memberships
+          JOIN page ON page.realm_name=memberships.realm_name AND page.id=memberships.group_id
+          GROUP BY memberships.group_id
+        )
+        SELECT page.*, COALESCE(page_members.member_ids, '{}'::text[]) AS scim_member_ids
+        FROM page LEFT JOIN page_members ON page_members.group_id=page.id
+        ORDER BY ${sorting.order}`;
     }
-    return { totalResults, resources };
+    const page = await this.pool.query(pageSql, pageParameters.values);
+    return {
+      totalResults,
+      resources: page.rows.map((row) => rowToGroup(row, row.scim_member_ids)),
+    };
   }
 
   async getGroup(realm, id) { return this.#group(realm, id); }

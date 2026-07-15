@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { ScimRepositoryError } from './errors.js';
+import { queryResources } from './filter.js';
 
 function clone(value) {
   return value == null ? value : structuredClone(value);
@@ -18,25 +19,6 @@ function replaceRecord(current, attributes) {
   return {
     ...clone(attributes), id: current.id, version: current.version + 1,
     createdAt: current.createdAt, updatedAt: timestamp(),
-  };
-}
-
-function matches(resource, filter) {
-  if (!filter) return true;
-  if (filter.attribute === 'members.value') return (resource.members ?? []).some(({ value }) => value === filter.value);
-  const actual = resource[filter.attribute];
-  if (filter.attribute === 'active') return Boolean(actual) === (filter.value.toLowerCase() === 'true');
-  if (['userName', 'displayName'].includes(filter.attribute)) {
-    return String(actual ?? '').toLowerCase() === filter.value.toLowerCase();
-  }
-  return String(actual ?? '') === filter.value;
-}
-
-function page(resources, { filter, startIndex, count }) {
-  const selected = resources.filter((item) => matches(item, filter)).sort((a, b) => a.id.localeCompare(b.id));
-  return {
-    totalResults: selected.length,
-    resources: selected.slice(startIndex - 1, startIndex - 1 + count).map(clone),
   };
 }
 
@@ -101,7 +83,8 @@ export class MemoryScimRepository {
   }
 
   async listUsers(realm, options) {
-    return page([...this.#realm(realm).users.values()], options);
+    const result = queryResources([...this.#realm(realm).users.values()], options, 'User');
+    return { ...result, resources: result.resources.map(clone) };
   }
 
   async getUser(realm, id) {
@@ -138,7 +121,8 @@ export class MemoryScimRepository {
   }
 
   async listGroups(realm, options) {
-    return page([...this.#realm(realm).groups.values()], options);
+    const result = queryResources([...this.#realm(realm).groups.values()], options, 'Group');
+    return { ...result, resources: result.resources.map(clone) };
   }
 
   async getGroup(realm, id) {

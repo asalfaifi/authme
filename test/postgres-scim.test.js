@@ -6,6 +6,7 @@ import pg from 'pg';
 
 import { PostgresScimRepository } from '../src/repositories/scim-repository.js';
 import { ScimRepositoryError } from '../src/scim/errors.js';
+import { parseFilter, parseSort } from '../src/scim/filter.js';
 
 const databaseUrl = process.env.DATABASE_URL;
 const disabledPasswordHash = '!authme-scim-disabled-password!';
@@ -62,6 +63,25 @@ async function existingSessionIds(realm, ids) {
     [realm, ids],
   );
   return result.rows.map(({ id }) => id);
+}
+
+function trackedRepository() {
+  const queries = [];
+  const trackedPool = {
+    connect: pool.connect.bind(pool),
+    async query(text, values) {
+      const result = await pool.query(text, values);
+      queries.push({ text, values: [...values], rowCount: result.rowCount });
+      return result;
+    },
+  };
+  return {
+    queries,
+    repository: new PostgresScimRepository(trackedPool, {
+      disabledPasswordHash,
+      hashPassword: async (password) => digestPassword(password),
+    }),
+  };
 }
 
 before(async () => {
@@ -171,6 +191,60 @@ test('PostgreSQL SCIM repository satisfies the durable realm-scoped contract', {
       assert.equal(await repository.getUser(otherRealm, alice.id), undefined);
       assert.equal(await repository.getUser(realm, 'not-a-uuid'), undefined);
       assert.deepEqual(await repository.listUserGroups(realm, 'not-a-uuid'), []);
+    });
+
+    await t.test('User filter, sort, and pagination stay in parameterized SQL and materialize only the page', async () => {
+      await Promise.all(Array.from({ length: 64 }, (_, index) => {
+        const suffix = String(index).padStart(2, '0');
+        return repository.createUser(realm, userAttributes(`Bulk${suffix}`, {
+          title: 'Engineer',
+          emails: [{ value: `bulk${suffix}@bulk.test`, type: 'work', primary: true }],
+        }));
+      }));
+
+      const tracked = trackedRepository();
+      const page = await tracked.repository.listUsers(realm, {
+        startIndex: 3,
+        count: 5,
+        filter: parseFilter('title eq "Engineer" and emails[type eq "work" and value ew "@bulk.test"]', 'User'),
+        sort: parseSort({ sortBy: 'userName', sortOrder: 'descending' }, 'User'),
+      });
+
+      assert.equal(page.totalResults, 64);
+      assert.deepEqual(page.resources.map(({ userName }) => userName), [
+        'bulk61', 'bulk60', 'bulk59', 'bulk58', 'bulk57',
+      ]);
+      assert.equal(tracked.queries.length, 2);
+      assert.deepEqual(tracked.queries.map(({ rowCount }) => rowCount), [1, 5]);
+      assert.match(tracked.queries[0].text, /count\(\*\)/iu);
+      assert.match(tracked.queries[1].text, /ORDER BY[\s\S]+LIMIT \$\d+::bigint OFFSET \$\d+::bigint/iu);
+      for (const query of tracked.queries) {
+        assert.equal(query.values[0], realm);
+        assert.doesNotMatch(query.text, /Engineer|@bulk\.test/u);
+        assert.ok(query.values.includes('Engineer'));
+        assert.ok(query.values.includes('@bulk.test'));
+      }
+
+      const matrix = [
+        ['userName ne "alice"', 65],
+        ['displayName co "ULK2"', 10],
+        ['userName sw "BULK0"', 10],
+        ['userName ew "3"', 7],
+        ['userName gt "bulk60"', 3],
+        ['userName ge "bulk61"', 3],
+        ['title pr and userName lt "bulk02"', 2],
+        ['title pr and userName le "bulk02"', 3],
+        ['not (active eq false) and title pr', 64],
+        ['userName eq "alice" or userName eq "bob"', 2],
+        ['active ne "false"', 65],
+      ];
+      for (const [filter, expectedTotal] of matrix) {
+        const result = await repository.listUsers(realm, {
+          startIndex: 1, count: 0, filter: parseFilter(filter, 'User'), sort: null,
+        });
+        assert.equal(result.totalResults, expectedTotal, filter);
+        assert.deepEqual(result.resources, [], filter);
+      }
     });
 
     await t.test('User versions ignore login bookkeeping but protect identity changes with CAS', async () => {
@@ -337,6 +411,19 @@ test('PostgreSQL SCIM repository satisfies the durable realm-scoped contract', {
         startIndex: 1, count: 10, filter: { attribute: 'members.value', value: alice.id },
       });
       assert.deepEqual(byMember.resources.map(({ id }) => id), [engineering.id]);
+
+      const tracked = trackedRepository();
+      const sortedPage = await tracked.repository.listGroups(realm, {
+        startIndex: 1,
+        count: 1,
+        filter: null,
+        sort: parseSort({ sortBy: 'displayName' }, 'Group'),
+      });
+      assert.equal(sortedPage.totalResults, 2);
+      assert.equal(sortedPage.resources.length, 1);
+      assert.deepEqual(tracked.queries.map(({ rowCount }) => rowCount), [1, 1]);
+      assert.equal(tracked.queries.length, 2);
+
       assert.equal(await repository.getGroup(otherRealm, engineering.id), undefined);
       assert.equal(await repository.getGroup(realm, 'not-a-uuid'), undefined);
     });

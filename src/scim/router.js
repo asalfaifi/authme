@@ -3,8 +3,9 @@ import { isDeepStrictEqual } from 'node:util';
 import { GROUP_SCHEMA, SCIM_URNS, USER_SCHEMA, resourceTypes, serviceProviderConfig } from './constants.js';
 import { normalizeGroup, normalizeUser } from './attributes.js';
 import { ScimError, errorBody, repositoryError } from './errors.js';
-import { pagination, parseFilter } from './filter.js';
+import { pagination, parseFilter, parseSort } from './filter.js';
 import { applyGroupPatch, applyUserPatch } from './patch.js';
+import { processBulk } from './bulk.js';
 
 const realmPattern = /^[a-z][a-z0-9-]{0,62}$/;
 const internalFields = new Set(['id', 'version', 'createdAt', 'updatedAt']);
@@ -123,6 +124,25 @@ function checkIfMatch(req, record) {
   throw new ScimError(412, 'The If-Match version does not match the current SCIM resource.');
 }
 
+function checkVersion(version, record) {
+  if (version == null || version === '*' || version === etag(record)) return;
+  throw new ScimError(412, 'The Bulk operation version does not match the current SCIM resource.');
+}
+
+function bulkTarget(path, method) {
+  const match = method === 'POST'
+    ? /^\/(Users|Groups)\/?$/u.exec(path)
+    : /^\/(Users|Groups)\/([^/?#]+)$/u.exec(path);
+  if (!match) throw new ScimError(400, `Bulk path ${path} is not valid for ${method}.`, 'invalidPath');
+  let id;
+  if (match[2]) {
+    try { id = decodeURIComponent(match[2]); }
+    catch { throw new ScimError(400, `Bulk path ${path} is not valid.`, 'invalidPath'); }
+    if (!id || id.includes('/')) throw new ScimError(400, `Bulk path ${path} is not valid.`, 'invalidPath');
+  }
+  return { resourceType: match[1] === 'Users' ? 'User' : 'Group', collection: match[1], id };
+}
+
 function sendResource(res, status, resource) {
   res.set('ETag', resource.meta.version);
   res.set('Location', resource.meta.location);
@@ -161,6 +181,8 @@ export function createScimRouter({
   maxPageSize = 200,
   defaultPageSize = 100,
   bodyLimit = '256kb',
+  maxOperations = 1000,
+  maxPayloadSize = 1048576,
 } = {}) {
   requireRepository(repository);
   if (typeof authenticate !== 'function') throw new TypeError('authenticate must be a function');
@@ -169,6 +191,8 @@ export function createScimRouter({
   if (!Number.isSafeInteger(defaultPageSize) || defaultPageSize < 0 || defaultPageSize > maxPageSize) {
     throw new TypeError('defaultPageSize must be between zero and maxPageSize');
   }
+  if (!Number.isSafeInteger(maxOperations) || maxOperations < 1) throw new TypeError('maxOperations must be a positive integer');
+  if (!Number.isSafeInteger(maxPayloadSize) || maxPayloadSize < 1) throw new TypeError('maxPayloadSize must be a positive integer');
 
   const router = Router();
   router.use('/:realm', asyncRoute(async (req, res, next) => {
@@ -190,7 +214,9 @@ export function createScimRouter({
     res.type('application/scim+json');
     next();
   }));
-  router.use(json({ type: ['application/scim+json', 'application/json'], strict: true, limit: bodyLimit }));
+  const jsonTypes = ['application/scim+json', 'application/json'];
+  router.use('/:realm/Bulk', json({ type: jsonTypes, strict: true, limit: maxPayloadSize }));
+  router.use(json({ type: jsonTypes, strict: true, limit: bodyLimit }));
 
   function context(res) { return res.locals.scim; }
   async function writeAudit(req, res, type, resourceType, resourceId, changes = []) {
@@ -201,10 +227,96 @@ export function createScimRouter({
     });
   }
 
+  async function executeBulkOperation(req, res, operation) {
+    const { realm, baseUrl: root } = context(res);
+    const target = bulkTarget(operation.path, operation.method);
+    const location = (id) => `${root}/${target.collection}/${encodeURIComponent(id)}`;
+
+    if (operation.method === 'POST') {
+      let created;
+      if (target.resourceType === 'User') {
+        try { created = await repository.createUser(realm, normalizeUser(operation.data)); }
+        catch (error) { throw repositoryError(error); }
+        await writeAudit(req, res, 'scim.user.created', 'User', created.id, ['create']);
+      } else {
+        try { created = await repository.createGroup(realm, normalizeGroup(operation.data)); }
+        catch (error) { throw repositoryError(error); }
+        await writeAudit(req, res, 'scim.group.created', 'Group', created.id, ['create']);
+      }
+      return { status: 201, id: created.id, location: location(created.id), version: etag(created) };
+    }
+
+    const get = target.resourceType === 'User' ? repository.getUser.bind(repository) : repository.getGroup.bind(repository);
+    const current = requireCurrent(await get(realm, target.id));
+    checkVersion(operation.version, current);
+
+    if (operation.method === 'DELETE') {
+      try {
+        if (target.resourceType === 'User') await repository.deleteUser(realm, current.id, current.version);
+        else await repository.deleteGroup(realm, current.id, current.version);
+      } catch (error) { throw repositoryError(error); }
+      const prefix = target.resourceType === 'User' ? 'user' : 'group';
+      await writeAudit(req, res, `scim.${prefix}.deleted`, target.resourceType, current.id, ['delete']);
+      return { status: 204, id: current.id, location: location(current.id) };
+    }
+
+    if (operation.data?.id != null && operation.data.id !== current.id) {
+      throw new ScimError(400, 'id is immutable.', 'mutability');
+    }
+    if (operation.method === 'PUT') {
+      let updated;
+      try {
+        if (target.resourceType === 'User') {
+          updated = await repository.replaceUser(
+            realm, current.id,
+            normalizeUser(replacementBody(operation.data), { existingPassword: current.password }),
+            current.version,
+          );
+        } else {
+          updated = await repository.replaceGroup(realm, current.id, normalizeGroup(replacementBody(operation.data)), current.version);
+        }
+      } catch (error) { throw repositoryError(error); }
+      const prefix = target.resourceType === 'User' ? 'user' : 'group';
+      await writeAudit(req, res, `scim.${prefix}.replaced`, target.resourceType, current.id, ['replace']);
+      return { status: 200, id: updated.id, location: location(updated.id), version: etag(updated) };
+    }
+
+    let next;
+    if (target.resourceType === 'User') {
+      next = normalizeUser(applyUserPatch(attributes(current), operation.data), { existingPassword: current.password });
+    } else next = normalizeGroup(applyGroupPatch(attributes(current), operation.data));
+    if (isDeepStrictEqual(next, attributes(current))) {
+      return { status: 200, id: current.id, location: location(current.id), version: etag(current) };
+    }
+    let updated;
+    try {
+      if (target.resourceType === 'User') updated = await repository.replaceUser(realm, current.id, next, current.version);
+      else updated = await repository.replaceGroup(realm, current.id, next, current.version);
+    } catch (error) { throw repositoryError(error); }
+    const changes = operation.data.Operations.map(({ path, op }) => `${String(op).toLowerCase()}:${path ?? '*'}`);
+    const prefix = target.resourceType === 'User' ? 'user' : 'group';
+    await writeAudit(req, res, `scim.${prefix}.patched`, target.resourceType, current.id, changes);
+    return { status: 200, id: updated.id, location: location(updated.id), version: etag(updated) };
+  }
+
   router.get('/:realm/ServiceProviderConfig', (req, res) => {
     const { baseUrl: root } = context(res);
-    res.json(serviceProviderConfig(root, maxPageSize));
+    res.json(serviceProviderConfig(root, { maxResults: maxPageSize, maxOperations, maxPayloadSize }));
   });
+
+  router.post('/:realm/Bulk', asyncRoute(async (req, res) => {
+    const { baseUrl: root } = context(res);
+    const response = await processBulk(req.body, {
+      maxOperations,
+      execute: (operation) => executeBulkOperation(req, res, operation),
+      locationFor(path) {
+        const target = bulkTarget(path, 'PUT');
+        return `${root}/${target.collection}/${encodeURIComponent(target.id)}`;
+      },
+      onUnexpectedError(error) { req.log?.error?.({ err: error }, 'SCIM Bulk operation failed'); },
+    });
+    res.status(200).json(response);
+  }));
 
   router.get('/:realm/Schemas', (req, res) => {
     const { baseUrl: root } = context(res);
@@ -235,7 +347,9 @@ export function createScimRouter({
   router.get('/:realm/Users', asyncRoute(async (req, res) => {
     const { realm, baseUrl: root } = context(res);
     const page = pagination(req.query, maxPageSize, defaultPageSize);
-    const result = await repository.listUsers(realm, { ...page, filter: parseFilter(req.query.filter, 'User') });
+    const result = await repository.listUsers(realm, {
+      ...page, filter: parseFilter(req.query.filter, 'User'), sort: parseSort(req.query, 'User'),
+    });
     const resources = await Promise.all(result.resources.map((item) => userResource(repository, realm, item, root)));
     res.json(listResponse(resources, result.totalResults, page.startIndex));
   }));
@@ -298,7 +412,9 @@ export function createScimRouter({
   router.get('/:realm/Groups', asyncRoute(async (req, res) => {
     const { realm, baseUrl: root } = context(res);
     const page = pagination(req.query, maxPageSize, defaultPageSize);
-    const result = await repository.listGroups(realm, { ...page, filter: parseFilter(req.query.filter, 'Group') });
+    const result = await repository.listGroups(realm, {
+      ...page, filter: parseFilter(req.query.filter, 'Group'), sort: parseSort(req.query, 'Group'),
+    });
     const resources = await Promise.all(result.resources.map((item) => groupResource(repository, realm, item, root)));
     res.json(listResponse(resources, result.totalResults, page.startIndex));
   }));
@@ -363,6 +479,12 @@ export function createScimRouter({
   router.use((error, req, res, _next) => {
     let resolved = error;
     if (error instanceof SyntaxError && error.status === 400 && 'body' in error) resolved = new ScimError(400, 'The request body is not valid JSON.', 'invalidSyntax');
+    if (error?.type === 'entity.too.large') {
+      const detail = /\/Bulk(?:\/|$)/u.test(req.originalUrl)
+        ? `The Bulk request exceeds maxPayloadSize (${maxPayloadSize}).`
+        : 'The SCIM request payload is too large.';
+      resolved = new ScimError(413, detail);
+    }
     if (!(resolved instanceof ScimError)) {
       req.log?.error?.({ err: resolved }, 'SCIM request failed');
       resolved = new ScimError(500, 'The SCIM request could not be completed.');
