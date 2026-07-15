@@ -31,6 +31,7 @@ test('development configuration supplies safe defaults and freezes top-level col
 
   assert.equal(config.devMode, true);
   assert.equal(config.trustProxy, true);
+  assert.deepEqual(config.mtls, { enabled: false, trustedProxyCidrs: [] });
   assert.equal(config.publicUrl, 'http://127.0.0.1:4100');
   assert.equal(config.port, 4100);
   assert.deepEqual(config.realms, ['master', 'engineering']);
@@ -48,6 +49,55 @@ test('development configuration supplies safe defaults and freezes top-level col
   assert.equal(Object.isFrozen(config), true);
   assert.equal(Object.isFrozen(config.realms), true);
   assert.equal(Object.isFrozen(config.cookieKeys), true);
+});
+
+test('mTLS proxy configuration is explicit, normalized, and frozen', () => {
+  const config = loadConfig({
+    AUTHME_DEV_MODE: 'true',
+    AUTHME_TRUST_PROXY: 'true',
+    AUTHME_MTLS_CLIENT_CERT_HEADER: 'X-AuthMe-Client-Cert',
+    AUTHME_MTLS_CLIENT_CERT_VERIFIED_HEADER: 'X-AuthMe-Client-Verified',
+    AUTHME_MTLS_CLIENT_CERT_VERIFIED_VALUE: 'VERIFIED',
+    AUTHME_MTLS_TRUSTED_PROXY_CIDRS: '127.0.0.1/32, ::1/128',
+  });
+
+  assert.deepEqual(config.mtls, {
+    enabled: true,
+    clientCertHeader: 'x-authme-client-cert',
+    clientCertVerifiedHeader: 'x-authme-client-verified',
+    clientCertVerifiedValue: 'VERIFIED',
+    trustedProxyCidrs: [
+      { address: '127.0.0.1', family: 4, prefix: 32 },
+      { address: '::1', family: 6, prefix: 128 },
+    ],
+  });
+  assert.equal(Object.isFrozen(config.mtls), true);
+  assert.equal(Object.isFrozen(config.mtls.trustedProxyCidrs), true);
+});
+
+test('mTLS proxy configuration fails closed', () => {
+  assert.throws(() => loadConfig({
+    AUTHME_DEV_MODE: 'true',
+    AUTHME_MTLS_CLIENT_CERT_HEADER: 'x-client-cert',
+    AUTHME_MTLS_TRUSTED_PROXY_CIDRS: '127.0.0.1/32',
+  }), /AUTHME_TRUST_PROXY must be enabled/u);
+  assert.throws(() => loadConfig({
+    AUTHME_DEV_MODE: 'true',
+    AUTHME_TRUST_PROXY: 'true',
+    AUTHME_MTLS_CLIENT_CERT_HEADER: 'x-client-cert',
+  }), /AUTHME_MTLS_TRUSTED_PROXY_CIDRS is required/u);
+  assert.throws(() => loadConfig({
+    AUTHME_DEV_MODE: 'true',
+    AUTHME_TRUST_PROXY: 'true',
+    AUTHME_MTLS_CLIENT_CERT_HEADER: 'x-forwarded-for',
+    AUTHME_MTLS_TRUSTED_PROXY_CIDRS: '127.0.0.1/32',
+  }), /cannot use a routing, credential, or forwarding header/u);
+  assert.throws(() => loadConfig({
+    AUTHME_DEV_MODE: 'true',
+    AUTHME_TRUST_PROXY: 'true',
+    AUTHME_MTLS_CLIENT_CERT_HEADER: 'x-client-cert',
+    AUTHME_MTLS_TRUSTED_PROXY_CIDRS: '127.0.0.1/129',
+  }), /Invalid AUTHME_MTLS_TRUSTED_PROXY_CIDRS entry/u);
 });
 
 test('an empty optional Redis URL is treated as disabled', () => {

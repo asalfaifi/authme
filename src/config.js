@@ -1,4 +1,5 @@
 import { randomBytes } from 'node:crypto';
+import { isIP } from 'node:net';
 import { z } from 'zod';
 import { parseLdapProviders } from './federation/ldap.js';
 import { parseOidcProviders } from './federation/oidc.js';
@@ -10,12 +11,21 @@ const booleanValue = z
   .optional()
   .transform((value) => ['1', 'true', 'yes', 'on'].includes((value ?? '').toLowerCase()));
 
+const optionalString = z.preprocess(
+  (value) => value === '' ? undefined : value,
+  z.string().trim().min(1).optional(),
+);
+
 const rawSchema = z.object({
   AUTHME_PUBLIC_URL: z.string().url().optional(),
   AUTHME_PORT: z.coerce.number().int().min(1).max(65535).optional(),
   AUTHME_REALMS: z.string().optional(),
   AUTHME_DEV_MODE: booleanValue,
   AUTHME_TRUST_PROXY: booleanValue,
+  AUTHME_MTLS_CLIENT_CERT_HEADER: optionalString,
+  AUTHME_MTLS_CLIENT_CERT_VERIFIED_HEADER: optionalString,
+  AUTHME_MTLS_CLIENT_CERT_VERIFIED_VALUE: optionalString,
+  AUTHME_MTLS_TRUSTED_PROXY_CIDRS: optionalString,
   AUTHME_COOKIE_KEYS: z.string().optional(),
   AUTHME_CSRF_SECRET: z.string().optional(),
   AUTHME_PASSWORD_PEPPER: z.string().optional(),
@@ -40,6 +50,85 @@ const rawSchema = z.object({
   DATABASE_URL: z.string().optional(),
   REDIS_URL: z.preprocess((value) => value === '' ? undefined : value, z.string().url().optional()),
 });
+
+const httpHeaderName = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/u;
+const reservedMtlsHeaders = new Set([
+  'authorization', 'cookie', 'forwarded', 'host',
+  'x-forwarded-for', 'x-forwarded-host', 'x-forwarded-proto',
+]);
+
+function mtlsHeaderName(value, setting) {
+  if (!httpHeaderName.test(value) || value.length > 128) {
+    throw new Error(`${setting} must be a valid HTTP header name`);
+  }
+  const normalized = value.toLowerCase();
+  if (reservedMtlsHeaders.has(normalized)) {
+    throw new Error(`${setting} cannot use a routing, credential, or forwarding header`);
+  }
+  return normalized;
+}
+
+function mtlsTrustedProxyCidrs(value) {
+  if (!value) return [];
+  const result = [];
+  const seen = new Set();
+  for (const input of value.split(',').map((entry) => entry.trim()).filter(Boolean)) {
+    if (seen.has(input)) throw new Error('AUTHME_MTLS_TRUSTED_PROXY_CIDRS contains duplicate entries');
+    seen.add(input);
+    const separator = input.lastIndexOf('/');
+    const address = separator === -1 ? input : input.slice(0, separator);
+    const family = isIP(address);
+    const prefix = separator === -1 ? undefined : Number(input.slice(separator + 1));
+    const maxPrefix = family === 4 ? 32 : 128;
+    if (!family || (prefix !== undefined && (!Number.isInteger(prefix) || prefix < 0 || prefix > maxPrefix))) {
+      throw new Error(`Invalid AUTHME_MTLS_TRUSTED_PROXY_CIDRS entry: ${input}`);
+    }
+    result.push({ address, family, prefix });
+  }
+  return result;
+}
+
+function mtlsConfiguration(raw) {
+  const configured = [
+    raw.AUTHME_MTLS_CLIENT_CERT_VERIFIED_HEADER,
+    raw.AUTHME_MTLS_CLIENT_CERT_VERIFIED_VALUE,
+    raw.AUTHME_MTLS_TRUSTED_PROXY_CIDRS,
+  ].some((value) => value !== undefined);
+  if (!raw.AUTHME_MTLS_CLIENT_CERT_HEADER) {
+    if (configured) throw new Error('AUTHME_MTLS_CLIENT_CERT_HEADER is required when other mTLS settings are configured');
+    return deepFreeze({ enabled: false, trustedProxyCidrs: [] });
+  }
+  if (!raw.AUTHME_TRUST_PROXY) {
+    throw new Error('AUTHME_TRUST_PROXY must be enabled when mTLS proxy headers are configured');
+  }
+
+  const clientCertHeader = mtlsHeaderName(
+    raw.AUTHME_MTLS_CLIENT_CERT_HEADER,
+    'AUTHME_MTLS_CLIENT_CERT_HEADER',
+  );
+  const clientCertVerifiedHeader = mtlsHeaderName(
+    raw.AUTHME_MTLS_CLIENT_CERT_VERIFIED_HEADER ?? 'x-ssl-client-verify',
+    'AUTHME_MTLS_CLIENT_CERT_VERIFIED_HEADER',
+  );
+  if (clientCertHeader === clientCertVerifiedHeader) {
+    throw new Error('The mTLS certificate and verification headers must be distinct');
+  }
+  const clientCertVerifiedValue = raw.AUTHME_MTLS_CLIENT_CERT_VERIFIED_VALUE ?? 'SUCCESS';
+  if (clientCertVerifiedValue.length > 128 || /[\r\n]/u.test(clientCertVerifiedValue)) {
+    throw new Error('AUTHME_MTLS_CLIENT_CERT_VERIFIED_VALUE must be a single header value of at most 128 characters');
+  }
+  const trustedProxyCidrs = mtlsTrustedProxyCidrs(raw.AUTHME_MTLS_TRUSTED_PROXY_CIDRS);
+  if (!trustedProxyCidrs.length) {
+    throw new Error('AUTHME_MTLS_TRUSTED_PROXY_CIDRS is required when mTLS proxy headers are configured');
+  }
+  return deepFreeze({
+    enabled: true,
+    clientCertHeader,
+    clientCertVerifiedHeader,
+    clientCertVerifiedValue,
+    trustedProxyCidrs,
+  });
+}
 
 function secret(value, name, devMode, bytes = 32) {
   if (!value) {
@@ -229,6 +318,7 @@ export function loadConfig(environment = process.env) {
   const config = {
     devMode,
     trustProxy: raw.AUTHME_TRUST_PROXY,
+    mtls: mtlsConfiguration(raw),
     publicUrl: normalizedPublicUrl,
     port,
     realms,

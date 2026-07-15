@@ -118,13 +118,16 @@ The supported v0.3 profile is deliberately smaller than the upstream library's c
 - Device Authorization Grant.
 - Pushed Authorization Requests (PAR).
 - DPoP-bound access tokens.
+- Mutual-TLS PKI and self-signed client authentication, with optional certificate-bound access tokens.
 - Dynamic client registration protected by an initial access token.
 - RFC 8707 resource indicators for explicitly configured API audiences, with JWT or opaque access-token policy per audience.
 
 Advanced endpoints are consumed from discovery metadata; clients must not guess their paths. [Dynamic registration](https://www.rfc-editor.org/rfc/rfc7591.html) requires a short-lived initial access token issued through the AuthMe administration API and is not an anonymous client-creation API. DPoP clients create a proof for the intended method and URL and handle provider nonce responses where required. PAR request URIs and device/user codes are short-lived provider artifacts persisted through the PostgreSQL adapter.
 
 The client-authentication allowlist is `client_secret_basic`,
-`private_key_jwt`, `client_secret_jwt`, and `none`. The JWT assertion methods
+`private_key_jwt`, `client_secret_jwt`, `none`, `tls_client_auth`, and
+`self_signed_tls_client_auth`. The two mTLS methods are advertised only when
+the deployment enables the trusted certificate-header boundary. The JWT assertion methods
 follow [RFC 7523](https://www.rfc-editor.org/rfc/rfc7523.html) at the token,
 introspection, and revocation endpoints. Private-key assertions allow only
 RS256, PS256, or ES256; shared-secret assertions allow only HS256. Assertions
@@ -168,6 +171,39 @@ by confidential clients explicitly listed for that audience and checked online
 for security-state changes. Offline JWT validators accept a token until its
 short expiration unless they operate a denylist.
 
+### Mutual TLS
+
+AuthMe v0.4 implements [OAuth 2.0 mutual-TLS client authentication and
+certificate-bound access tokens (RFC 8705)](https://www.rfc-editor.org/rfc/rfc8705.html)
+behind a TLS-terminating reverse proxy. `tls_client_auth` uses one registered
+subject DN or SAN and requires the proxy's configured certificate-chain
+verification result. `self_signed_tls_client_auth` compares the forwarded leaf
+certificate thumbprint with an `x5c` certificate in the client's public `jwks`
+or constrained `jwks_uri`. A client opts into certificate-bound tokens with
+`tls_client_certificate_bound_access_tokens: true`; resulting access tokens
+carry the DER certificate's base64url SHA-256 thumbprint as
+`cnf["x5t#S256"]`, and opaque-token introspection returns the same confirmation
+value. Resource servers must compare it with the certificate used on their own
+mutually authenticated TLS connection.
+
+mTLS is disabled unless `AUTHME_MTLS_CLIENT_CERT_HEADER` is set. Enabling it
+also requires `AUTHME_TRUST_PROXY=true` and one or more exact source ranges in
+`AUTHME_MTLS_TRUSTED_PROXY_CIDRS`. AuthMe accepts the certificate header only
+when the socket peer is in that allowlist and the request contains exactly one
+valid `X-Forwarded-For` address. The certificate header may contain PEM directly
+or percent-encoded PEM. `AUTHME_MTLS_CLIENT_CERT_VERIFIED_HEADER` and
+`AUTHME_MTLS_CLIENT_CERT_VERIFIED_VALUE` default to `x-ssl-client-verify` and
+`SUCCESS`; the PKI method requires that exact result.
+
+The proxy is part of the mTLS security boundary. It must remove externally
+supplied certificate, verification-status, and forwarding headers; request and
+validate the client's TLS `CertificateVerify`; inject only the leaf
+certificate; and reach AuthMe from an allowlisted source address over an
+isolated or authenticated backend channel. For PKI clients it must validate the
+chain against the deployment's deliberately limited client CA set before
+emitting the success value. The backend must not be directly reachable by
+untrusted clients. A compromised proxy can impersonate any mTLS client.
+
 ### JWT-Secured Authorization Requests
 
 AuthMe v0.4 supports signed [JWT-Secured Authorization Requests (JAR, RFC 9101)](https://www.rfc-editor.org/rfc/rfc9101.html) through the authorization endpoint's `request` parameter. Clients register `request_object_signing_alg` as `RS256`, `PS256`, or `ES256` and provide verification keys through public inline `jwks` metadata; inline private and symmetric key material is rejected. A client can set `require_signed_request_object` to prevent downgrade to a plain authorization request. Server-wide mandatory JAR remains off so clients that have not opted into JAR continue to use ordinary Authorization Code requests.
@@ -182,7 +218,7 @@ An authorized resource client that registers `introspection_signed_response_alg:
 
 Only asymmetric algorithms backed by the realm's validated private JWKS are advertised and accepted; `none` is rejected as client metadata. The public JWKS endpoint never returns private parameters. Consumers validate the signature against that realm's JWKS and require the exact issuer, their own client ID as audience, and the expected response type before using claims. Response signing provides integrity and origin authentication; TLS, bearer-token protection, scope/claim filtering, and introspection caller authorization remain mandatory.
 
-Implicit flow, Resource Owner Password Credentials, CIBA, mTLS, and FAPI profiles are not part of the v0.3 product contract unless a release explicitly enables and tests them. The OAuth Security Best Current Practice requires authorization servers to support PKCE, requires it for public clients, recommends it for confidential clients, and requires exact redirect URI matching; see [RFC 9700](https://www.rfc-editor.org/rfc/rfc9700.html). PAR is defined by [RFC 9126](https://www.rfc-editor.org/rfc/rfc9126.html), DPoP by [RFC 9449](https://www.rfc-editor.org/rfc/rfc9449.html), and Device Authorization by [RFC 8628](https://www.rfc-editor.org/rfc/rfc8628.html).
+Implicit flow, Resource Owner Password Credentials, CIBA, and FAPI profiles are not part of the v0.3 product contract unless a release explicitly enables and tests them. The OAuth Security Best Current Practice requires authorization servers to support PKCE, requires it for public clients, recommends it for confidential clients, and requires exact redirect URI matching; see [RFC 9700](https://www.rfc-editor.org/rfc/rfc9700.html). PAR is defined by [RFC 9126](https://www.rfc-editor.org/rfc/rfc9126.html), DPoP by [RFC 9449](https://www.rfc-editor.org/rfc/rfc9449.html), and Device Authorization by [RFC 8628](https://www.rfc-editor.org/rfc/rfc8628.html).
 
 ### JWT Secured Authorization Response Mode
 

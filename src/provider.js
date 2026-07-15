@@ -3,6 +3,7 @@ import { isIP } from 'node:net';
 import Provider, { errors } from 'oidc-provider';
 import { DEFAULTS as oidcClientMetadataDefaults } from 'oidc-provider/lib/consts/client_attributes.js';
 import { issuerFor } from './config.js';
+import { createMtlsFeatureConfiguration } from './security/mtls.js';
 import {
   renderDeviceConfirmation,
   renderDeviceInput,
@@ -31,12 +32,17 @@ const keycloakRoutes = Object.freeze({
   userinfo: '/protocol/openid-connect/userinfo',
 });
 
-const clientAuthMethods = Object.freeze([
+const baseClientAuthMethods = Object.freeze([
   'client_secret_basic',
   'private_key_jwt',
   'client_secret_jwt',
   'none',
 ]);
+const mtlsClientAuthMethods = Object.freeze([
+  'tls_client_auth',
+  'self_signed_tls_client_auth',
+]);
+const clientAuthMethods = Object.freeze([...baseClientAuthMethods, ...mtlsClientAuthMethods]);
 const privateKeyJwtSigningAlgorithms = Object.freeze(['RS256', 'ES256', 'PS256']);
 const clientSecretJwtSigningAlgorithms = Object.freeze(['HS256']);
 const clientAuthSigningAlgorithms = Object.freeze([
@@ -272,7 +278,7 @@ function validateInlineClientJwks(metadata) {
   }
 }
 
-function validateClientSecurity(metadata, { development = false } = {}) {
+function validateClientSecurity(metadata, { development = false, mtlsEnabled = true } = {}) {
   const grantTypes = metadata.grant_types ?? ['authorization_code'];
   if (grantTypes.some((type) => type === 'implicit' || type === 'password')) {
     throw new Error('Implicit and password grants are not supported');
@@ -280,6 +286,9 @@ function validateClientSecurity(metadata, { development = false } = {}) {
   const method = metadata.token_endpoint_auth_method ?? 'client_secret_basic';
   if (!clientAuthMethods.includes(method)) {
     throw new Error(`Unsupported token endpoint authentication method: ${method}`);
+  }
+  if (!mtlsEnabled && mtlsClientAuthMethods.includes(method)) {
+    throw new Error(`Token endpoint authentication method ${method} requires mTLS proxy configuration`);
   }
   if (metadata.token_endpoint_auth_signing_alg !== undefined) {
     const allowed = method === 'private_key_jwt'
@@ -325,11 +334,15 @@ export async function createRealmProvider({ realm, config, store, data, Adapter,
   const clientAssertionAudiences = new Set([issuer, `${issuer}${keycloakRoutes.token}`]);
   const resourceServers = config.resourceServersByRealm[realm];
   const clients = configuredClientsForRealm(config, realm);
-  for (const client of clients) validateClientSecurity(client, { development: config.devMode });
+  const mtls = createMtlsFeatureConfiguration(config);
+  const enabledClientAuthMethods = config.mtls.enabled ? clientAuthMethods : baseClientAuthMethods;
+  for (const client of clients) {
+    validateClientSecurity(client, { development: config.devMode, mtlsEnabled: config.mtls.enabled });
+  }
 
   async function secureRegistrationPolicy(ctx, properties) {
     try {
-      validateClientSecurity(properties, { development: config.devMode });
+      validateClientSecurity(properties, { development: config.devMode, mtlsEnabled: config.mtls.enabled });
     } catch (error) {
       throw new errors.InvalidClientMetadata(error.message);
     }
@@ -348,7 +361,7 @@ export async function createRealmProvider({ realm, config, store, data, Adapter,
     routes: keycloakRoutes,
     scopes: ['openid', 'offline_access', 'profile', 'email', 'phone', 'address', 'roles', 'groups'],
     responseTypes: ['code'],
-    clientAuthMethods,
+    clientAuthMethods: enabledClientAuthMethods,
     enabledJWA: {
       clientAuthSigningAlgValues: clientAuthSigningAlgorithms,
       requestObjectSigningAlgValues: [...REQUEST_OBJECT_SIGNING_ALGORITHMS],
@@ -459,6 +472,7 @@ export async function createRealmProvider({ realm, config, store, data, Adapter,
       },
       jwtIntrospection: { enabled: true },
       jwtResponseModes: { enabled: true },
+      mTLS: mtls,
       pushedAuthorizationRequests: { enabled: true },
       registration: {
         enabled: config.enableDynamicRegistration,
