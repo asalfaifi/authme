@@ -16,13 +16,29 @@ test('client security policy rejects obsolete grants in every mode', () => {
   assert.throws(() => validateClientSecurity({ grant_types: ['implicit'] }), /not supported/);
 });
 
-test('client security policy exposes only the supported v0.2 authentication and subject methods', () => {
+test('client security policy exposes only the supported authentication, algorithm, and subject methods', () => {
   assert.doesNotThrow(() => validateClientSecurity({ token_endpoint_auth_method: 'client_secret_basic' }, { development: true }));
+  assert.doesNotThrow(() => validateClientSecurity({
+    token_endpoint_auth_method: 'private_key_jwt',
+    token_endpoint_auth_signing_alg: 'PS256',
+  }, { development: true }));
+  assert.doesNotThrow(() => validateClientSecurity({
+    token_endpoint_auth_method: 'client_secret_jwt',
+    token_endpoint_auth_signing_alg: 'HS256',
+  }, { development: true }));
   assert.doesNotThrow(() => validateClientSecurity({ token_endpoint_auth_method: 'none', subject_type: 'pairwise' }, { development: true }));
   assert.throws(
-    () => validateClientSecurity({ token_endpoint_auth_method: 'private_key_jwt' }, { development: true }),
+    () => validateClientSecurity({ token_endpoint_auth_method: 'client_secret_post' }, { development: true }),
     /Unsupported token endpoint authentication method/,
   );
+  assert.throws(() => validateClientSecurity({
+    token_endpoint_auth_method: 'private_key_jwt',
+    token_endpoint_auth_signing_alg: 'none',
+  }, { development: true }), /Unsupported token endpoint authentication signing algorithm/);
+  assert.throws(() => validateClientSecurity({
+    token_endpoint_auth_method: 'client_secret_jwt',
+    token_endpoint_auth_signing_alg: 'RS256',
+  }, { development: true }), /Unsupported token endpoint authentication signing algorithm/);
   assert.throws(
     () => validateClientSecurity({ subject_type: 'sector-specific' }, { development: true }),
     /Unsupported subject type/,
