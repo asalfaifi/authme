@@ -142,6 +142,8 @@ Keycloak's official guide describes its [identity brokering](https://www.keycloa
 - [JWT Secured Authorization Response Mode (JARM)](https://openid.net/specs/oauth-v2-jarm.html) with realm-key-signed authorization responses for `jwt`, `query.jwt`, `fragment.jwt`, and `form_post.jwt` response modes.
 - [`private_key_jwt` and `client_secret_jwt` client authentication](https://www.rfc-editor.org/rfc/rfc7523.html) at the token, introspection, and revocation endpoints, with explicit signing-algorithm allowlists, exact assertion audiences, and durable one-use `jti` replay protection.
 - [JWT-Secured Authorization Request (JAR, RFC 9101)](https://www.rfc-editor.org/rfc/rfc9101.html) by value with signed request objects, registered client public keys, and an asymmetric algorithm allowlist.
+- [Signed JWT UserInfo responses](https://openid.net/specs/openid-connect-core-1_0-errata2.html#UserInfoResponse) for clients that register `userinfo_signed_response_alg`; clients without the opt-in continue to receive JSON.
+- [JWT responses for OAuth token introspection](https://www.rfc-editor.org/rfc/rfc9701.html) for authorized resource clients that register `introspection_signed_response_alg` and request `application/token-introspection+jwt`; ordinary introspection remains JSON.
 
 ### Staged scope
 
@@ -151,7 +153,7 @@ Keycloak's official guide describes its [identity brokering](https://www.keycloa
 - CIBA.
 - Selected FAPI 2.0 profiles.
 
-PAR and DPoP are already part of the v0.1 product contract, and JAR and JARM are part of the v0.4 product contract. The remaining profiles—and stronger financial-grade combinations of existing features—need additional AuthMe policy, persistence, proxy, key-management, metadata, operational, and conformance integration. PAR is standardized by [RFC 9126](https://www.rfc-editor.org/rfc/rfc9126.html), DPoP by [RFC 9449](https://www.rfc-editor.org/rfc/rfc9449.html), JAR by [RFC 9101](https://www.rfc-editor.org/rfc/rfc9101.html), JARM by the [JWT Secured Authorization Response Mode specification](https://openid.net/specs/oauth-v2-jarm.html), and the provider's certifications are listed in its [official README](https://github.com/panva/node-oidc-provider#certification).
+PAR and DPoP are already part of the v0.1 product contract. JAR, JARM, `private_key_jwt`/`client_secret_jwt` client authentication, signed JWT UserInfo, and JWT-secured introspection responses are part of the v0.4 product contract. The remaining profiles—and stronger financial-grade combinations of existing features—need additional AuthMe policy, persistence, proxy, key-management, metadata, operational, and conformance integration. PAR is standardized by [RFC 9126](https://www.rfc-editor.org/rfc/rfc9126.html), DPoP by [RFC 9449](https://www.rfc-editor.org/rfc/rfc9449.html), JAR by [RFC 9101](https://www.rfc-editor.org/rfc/rfc9101.html), JARM by the [JWT Secured Authorization Response Mode specification](https://openid.net/specs/oauth-v2-jarm.html), client JWT authentication by [RFC 7523](https://www.rfc-editor.org/rfc/rfc7523.html), signed UserInfo responses by [OpenID Connect Core](https://openid.net/specs/openid-connect-core-1_0-errata2.html#UserInfoResponse), and JWT introspection responses by [RFC 9701](https://www.rfc-editor.org/rfc/rfc9701.html). The provider's certifications are listed in its [official README](https://github.com/panva/node-oidc-provider#certification).
 
 ### Exit gates
 

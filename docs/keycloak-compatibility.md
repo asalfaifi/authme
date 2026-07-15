@@ -20,8 +20,8 @@ Keycloak's current feature inventory includes OIDC/OAuth, SAML, identity brokeri
 | Refresh token | Implemented | Subject to client and scope policy |
 | Client Credentials | Implemented | For confidential service clients |
 | Client authentication | Implemented | `client_secret_basic`, `client_secret_jwt` (HS256), `private_key_jwt` (RS256, PS256, or ES256), and `none` |
-| UserInfo | Implemented | Scope-limited claims |
-| Introspection | Implemented | Issuing clients and audience-authorized confidential clients for opaque tokens; JWT access tokens are validated locally |
+| UserInfo | Implemented | Scope-limited JSON by default; optional realm-signed JWT per client |
+| Introspection | Implemented | JSON by default or optional realm-signed JWT; issuing clients and audience-authorized confidential clients for opaque tokens; JWT access tokens are validated locally |
 | Revocation | Implemented | Standard OAuth revocation endpoint |
 | RP-initiated logout | Implemented | Exact registered post-logout redirect validation |
 | Back-channel logout | Implemented | Standards-based signed logout token delivery |
@@ -137,6 +137,8 @@ can register public keys inline with `jwks` or at a constrained HTTPS
 `jwks_uri`. Keycloak deployments using another method, including
 `client_secret_post`, must change the client authentication configuration.
 
+AuthMe v0.4 clients can register `userinfo_signed_response_alg: RS256` to receive a signed `application/jwt` UserInfo response, as defined by [OpenID Connect Core](https://openid.net/specs/openid-connect-core-1_0-errata2.html#UserInfoResponse). An authorized resource client can register `introspection_signed_response_alg: RS256` and send `Accept: application/token-introspection+jwt` to receive the signed response defined by [RFC 9701](https://www.rfc-editor.org/rfc/rfc9701.html). Both response types use the realm signing key and are verified with its public JWKS; `none` is rejected. Clients without these opt-ins keep the existing JSON behavior. Signed introspection is a response-format option, not an authorization bypass: the configured opaque-token audience and `introspection_client_ids` policy remains in force.
+
 Keycloak-style API tokens require an explicit AuthMe resource-server entry and
 an RFC 8707 `resource` parameter. JWT tokens are validated with the realm JWKS,
 exact issuer and configured audience; the upstream provider intentionally
@@ -150,6 +152,7 @@ immediate online revocation or authorized introspection.
 Even when URLs and claims match, test these behaviors:
 
 - supported signing algorithms and key size;
+- UserInfo and introspection response metadata, media types, and JWT verification;
 - access-token format and whether the application incorrectly relies on undocumented token internals;
 - token/session lifetimes and refresh rotation;
 - audience values;
@@ -185,7 +188,7 @@ Every migration should run a client-by-client contract suite that compares:
 2. authorization redirect/error behavior;
 3. token signature, standard claims, audience, and role/group claims;
 4. refresh and revocation behavior;
-5. UserInfo and introspection authorization;
+5. UserInfo and introspection authorization, response format, signature, issuer, audience, and type;
 6. browser session and RP-initiated logout;
 7. CORS and native-client redirect behavior where relevant.
 
