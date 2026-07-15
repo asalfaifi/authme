@@ -1,6 +1,7 @@
 import { errors } from 'oidc-provider';
 
 const stores = new Map();
+const backchannelRequestModel = 'BackchannelAuthenticationRequest';
 
 function bucket(realm, model) {
   const key = `${realm}\u0000${model}`;
@@ -28,10 +29,17 @@ export function createMemoryAdapter({ realm, securityVersionFor = async () => nu
 
     async upsert(id, payload, expiresIn) {
       const existing = this.records.get(id);
+      const next = clone(payload);
       if (this.model === 'ReplayDetection' && current(existing)) {
         throw new errors.InvalidRequest('replayed assertion or proof detected');
       }
-      const next = clone(payload);
+      if (this.model === backchannelRequestModel && existing) {
+        const incomingFinal = next.grantId != null || next.error != null;
+        const existingFinal = existing.payload.grantId != null || existing.payload.error != null;
+        if (!incomingFinal || existingFinal || existing.payload.consumed) {
+          throw new errors.InvalidGrant('backchannel authentication request state transition was rejected');
+        }
+      }
       if (existing?.payload?.consumed && !next.consumed) next.consumed = existing.payload.consumed;
       let parent;
       if (next.grantId != null) {
@@ -60,11 +68,14 @@ export function createMemoryAdapter({ realm, securityVersionFor = async () => nu
         payload: next,
         securityVersion,
         expiresAt: expiresIn === undefined ? null : Date.now() + Number(expiresIn) * 1000,
+        cibaPollIntervalSeconds: existing?.cibaPollIntervalSeconds,
+        cibaNextPollAt: existing?.cibaNextPollAt,
       });
     }
 
     async find(id) {
-      const record = current(this.records.get(id));
+      const stored = this.records.get(id);
+      const record = this.model === backchannelRequestModel ? stored : current(stored);
       if (!record) return undefined;
       if (record.securityVersion != null && await securityVersionFor(record.payload.accountId) !== record.securityVersion) return undefined;
       return clone(record.payload);
@@ -95,12 +106,29 @@ export function createMemoryAdapter({ realm, securityVersionFor = async () => nu
     async consume(id) {
       const record = current(this.records.get(id));
       if (!record || record.payload.consumed) {
-        if (['AuthorizationCode', 'RefreshToken', 'DeviceCode', 'BackchannelAuthenticationRequest'].includes(this.model)) {
+        if (['AuthorizationCode', 'RefreshToken', 'DeviceCode', backchannelRequestModel].includes(this.model)) {
           throw new errors.InvalidGrant('one-use grant artifact was already consumed');
         }
         throw new errors.InvalidRequest('one-use artifact was already consumed');
       }
       record.payload.consumed = Math.floor(Date.now() / 1000);
+    }
+
+    async checkCibaPoll(id, clientId, intervalSeconds) {
+      if (this.model !== backchannelRequestModel) throw new TypeError('CIBA polling is only valid for backchannel authentication requests');
+      const record = current(this.records.get(id));
+      if (!record || record.payload.clientId !== clientId || record.payload.consumed) return { status: 'invalid' };
+      if (record.securityVersion != null && await securityVersionFor(record.payload.accountId) !== record.securityVersion) {
+        return { status: 'invalid' };
+      }
+      const now = Date.now();
+      const allowed = record.cibaNextPollAt == null || record.cibaNextPollAt <= now;
+      const interval = allowed
+        ? record.cibaPollIntervalSeconds ?? intervalSeconds
+        : Math.min((record.cibaPollIntervalSeconds ?? intervalSeconds) + 5, 300);
+      record.cibaPollIntervalSeconds = interval;
+      record.cibaNextPollAt = now + interval * 1000;
+      return { status: allowed ? 'allowed' : 'slow_down', interval };
     }
 
     async destroy(id) {

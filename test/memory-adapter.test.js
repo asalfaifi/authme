@@ -89,3 +89,41 @@ test('a grant-linked save cannot cross an in-memory account revocation', async (
   assert.equal(await grants.find('grant'), undefined);
   assert.equal(await tokens.find('late'), undefined);
 });
+
+test('backchannel requests enforce one-way completion and realm-local polling cadence', async () => {
+  const securityVersionFor = async () => 1;
+  const Master = createMemoryAdapter({ realm: 'master', securityVersionFor });
+  const Staff = createMemoryAdapter({ realm: 'staff', securityVersionFor });
+  const requests = new Master('BackchannelAuthenticationRequest');
+  const staffRequests = new Staff('BackchannelAuthenticationRequest');
+  const grants = new Master('Grant');
+
+  await requests.upsert('auth-request', { accountId: 'alice', clientId: 'client' }, 600);
+  assert.deepEqual(await requests.checkCibaPoll('auth-request', 'client', 1), {
+    status: 'allowed', interval: 1,
+  });
+  assert.deepEqual(await requests.checkCibaPoll('auth-request', 'client', 1), {
+    status: 'slow_down', interval: 6,
+  });
+  assert.deepEqual(await requests.checkCibaPoll('auth-request', 'other-client', 1), { status: 'invalid' });
+  assert.deepEqual(await staffRequests.checkCibaPoll('auth-request', 'client', 1), { status: 'invalid' });
+
+  await grants.upsert('grant', { accountId: 'alice', clientId: 'client' }, 600);
+  await requests.upsert('auth-request', { accountId: 'alice', clientId: 'client', grantId: 'grant' }, 600);
+  await assert.rejects(
+    requests.upsert('auth-request', { accountId: 'alice', clientId: 'client', grantId: 'grant' }, 600),
+    /invalid_grant/,
+  );
+  await assert.rejects(
+    requests.upsert('auth-request', { accountId: 'alice', clientId: 'client' }, 600),
+    /invalid_grant/,
+  );
+});
+
+test('expired backchannel payloads remain readable so the provider can return expired_token', async () => {
+  const Adapter = createMemoryAdapter({ realm: 'master', securityVersionFor: async () => 1 });
+  const requests = new Adapter('BackchannelAuthenticationRequest');
+  await requests.upsert('expired', { accountId: 'alice', clientId: 'client' }, 0);
+  assert.deepEqual(await requests.find('expired'), { accountId: 'alice', clientId: 'client' });
+  assert.deepEqual(await requests.checkCibaPoll('expired', 'client', 1), { status: 'invalid' });
+});

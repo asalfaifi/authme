@@ -1,5 +1,7 @@
 import { errors } from 'oidc-provider';
 
+const backchannelRequestModel = 'BackchannelAuthenticationRequest';
+
 function requiredIdentifier(value, name) {
   if (typeof value !== 'string' || value.length === 0) {
     throw new TypeError(`${name} must be a non-empty string`);
@@ -81,9 +83,17 @@ export function createPostgresAdapter({ pool, realm }) {
       const accountId = optionalIdentifier(record.accountId, 'payload.accountId');
       if (accountId && !uuid.test(accountId)) throw new TypeError('payload.accountId must be a UUID');
 
-      const conflict = this.model === 'ReplayDetection'
-        ? 'DO NOTHING'
-        : `DO UPDATE SET
+      let conflict;
+      if (this.model === 'ReplayDetection') {
+        conflict = 'DO NOTHING';
+      } else {
+        const transition = this.model === backchannelRequestModel
+          ? `WHERE (EXCLUDED.grant_id IS NOT NULL OR EXCLUDED.payload ? 'error')
+             AND oidc_records.grant_id IS NULL
+             AND NOT (oidc_records.payload ? 'error')
+             AND oidc_records.consumed_at IS NULL`
+          : '';
+        conflict = `DO UPDATE SET
            payload = EXCLUDED.payload,
            expires_at = EXCLUDED.expires_at,
            consumed_at = COALESCE(oidc_records.consumed_at, EXCLUDED.consumed_at),
@@ -91,7 +101,9 @@ export function createPostgresAdapter({ pool, realm }) {
            user_code = EXCLUDED.user_code,
            uid = EXCLUDED.uid,
            account_security_version = EXCLUDED.account_security_version,
-           updated_at = CURRENT_TIMESTAMP`;
+           updated_at = CURRENT_TIMESTAMP
+           ${transition}`;
+      }
       const result = await pool.query(
         `WITH account AS (
            SELECT security_version FROM users
@@ -136,6 +148,9 @@ export function createPostgresAdapter({ pool, realm }) {
          RETURNING id`,
         [realmName, this.model, recordId, record, lifetime, consumedAt, grantId, userCode, uid, accountId],
       );
+      if (this.model === backchannelRequestModel && result.rowCount !== 1) {
+        throw new errors.InvalidGrant('backchannel authentication request state transition was rejected');
+      }
       if ((accountId || grantId) && result.rowCount !== 1) {
         throw new errors.InvalidGrant('account or parent grant is unavailable or stale');
       }
@@ -145,11 +160,14 @@ export function createPostgresAdapter({ pool, realm }) {
     }
 
     async find(id) {
+      const expiry = this.model === backchannelRequestModel
+        ? ''
+        : 'AND (records.expires_at IS NULL OR records.expires_at > CURRENT_TIMESTAMP)';
       const result = await pool.query(
         `SELECT records.payload, records.consumed_at
            FROM oidc_records AS records
           WHERE records.realm_name = $1 AND records.model = $2 AND records.id = $3
-            AND (records.expires_at IS NULL OR records.expires_at > CURRENT_TIMESTAMP)
+            ${expiry}
             AND (records.account_security_version IS NULL OR EXISTS (
               SELECT 1 FROM users
               WHERE users.realm_name=records.realm_name
@@ -212,11 +230,62 @@ export function createPostgresAdapter({ pool, realm }) {
         [realmName, this.model, requiredIdentifier(id, 'id')],
       );
       if (result.rowCount !== 1) {
-        if (['AuthorizationCode', 'RefreshToken', 'DeviceCode', 'BackchannelAuthenticationRequest'].includes(this.model)) {
+        if (['AuthorizationCode', 'RefreshToken', 'DeviceCode', backchannelRequestModel].includes(this.model)) {
           throw new errors.InvalidGrant('one-use grant artifact was already consumed');
         }
         throw new errors.InvalidRequest('one-use artifact was already consumed');
       }
+    }
+
+    async checkCibaPoll(id, clientId, intervalSeconds) {
+      if (this.model !== backchannelRequestModel) throw new TypeError('CIBA polling is only valid for backchannel authentication requests');
+      const interval = Number(intervalSeconds);
+      if (!Number.isSafeInteger(interval) || interval < 1 || interval > 300) {
+        throw new TypeError('CIBA polling interval must be an integer between 1 and 300 seconds');
+      }
+      const result = await pool.query(
+        `WITH target AS MATERIALIZED (
+           SELECT records.id, records.ciba_poll_interval_seconds,
+                  records.ciba_next_poll_at IS NULL
+                    OR records.ciba_next_poll_at <= CURRENT_TIMESTAMP AS allowed
+           FROM oidc_records AS records
+           WHERE records.realm_name=$1 AND records.model='BackchannelAuthenticationRequest'
+             AND records.id=$2 AND records.payload->>'clientId'=$3
+             AND records.consumed_at IS NULL
+             AND records.expires_at > CURRENT_TIMESTAMP
+             AND (records.account_security_version IS NULL OR EXISTS (
+               SELECT 1 FROM users
+               WHERE users.realm_name=records.realm_name
+                 AND users.id=(records.payload->>'accountId')::uuid
+                 AND users.enabled
+                 AND users.security_version=records.account_security_version
+             ))
+           FOR UPDATE
+         ), updated AS (
+           UPDATE oidc_records AS records
+           SET ciba_poll_interval_seconds=CASE WHEN target.allowed
+                 THEN COALESCE(target.ciba_poll_interval_seconds, $4::integer)
+                 ELSE LEAST(COALESCE(target.ciba_poll_interval_seconds, $4::integer) + 5, 300)
+               END,
+               ciba_next_poll_at=CURRENT_TIMESTAMP + (CASE WHEN target.allowed
+                 THEN COALESCE(target.ciba_poll_interval_seconds, $4::integer)
+                 ELSE LEAST(COALESCE(target.ciba_poll_interval_seconds, $4::integer) + 5, 300)
+               END * INTERVAL '1 second'),
+               updated_at=CURRENT_TIMESTAMP
+           FROM target
+           WHERE records.realm_name=$1 AND records.model='BackchannelAuthenticationRequest'
+             AND records.id=target.id
+           RETURNING target.allowed, records.ciba_poll_interval_seconds
+         )
+         SELECT allowed, ciba_poll_interval_seconds FROM updated`,
+        [realmName, requiredIdentifier(id, 'id'), requiredIdentifier(clientId, 'clientId'), interval],
+      );
+      const row = result.rows[0];
+      if (!row) return { status: 'invalid' };
+      return {
+        status: row.allowed ? 'allowed' : 'slow_down',
+        interval: Number(row.ciba_poll_interval_seconds),
+      };
     }
 
     async destroy(id) {

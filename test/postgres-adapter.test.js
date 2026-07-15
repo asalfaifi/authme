@@ -210,6 +210,67 @@ test('replay-detection upsert is insert-only and rejects a conflicting claim', a
   assert.match(compactSql(pool.calls[0].text), /ON CONFLICT \(realm_name, model, id\) DO NOTHING RETURNING id$/);
 });
 
+test('backchannel request completion is a one-way atomic state transition', async () => {
+  const pool = createMockPool(
+    { rows: [{ id: 'request' }], rowCount: 1 },
+    { rows: [{ id: 'request' }], rowCount: 1 },
+    { rows: [], rowCount: 0 },
+  );
+  const Adapter = createPostgresAdapter({ pool, realm: 'master' });
+  const requests = new Adapter('BackchannelAuthenticationRequest');
+  const accountId = '00000000-0000-4000-8000-000000000001';
+
+  await requests.upsert('request', { accountId, clientId: 'client' }, 600);
+  await requests.upsert('request', { accountId, clientId: 'client', grantId: 'grant' }, 600);
+  await assert.rejects(
+    requests.upsert('request', { accountId, clientId: 'client', grantId: 'other-grant' }, 600),
+    /invalid_grant/,
+  );
+
+  const sql = compactSql(pool.calls[0].text);
+  assert.match(sql, /EXCLUDED\.grant_id IS NOT NULL OR EXCLUDED\.payload \? 'error'/);
+  assert.match(sql, /oidc_records\.grant_id IS NULL/);
+  assert.match(sql, /NOT \(oidc_records\.payload \? 'error'\)/);
+  assert.match(sql, /oidc_records\.consumed_at IS NULL/);
+});
+
+test('backchannel polling is client-bound, realm-bound, and atomically rate limited', async () => {
+  const pool = createMockPool(
+    { rows: [{ allowed: true, ciba_poll_interval_seconds: 2 }], rowCount: 1 },
+    { rows: [{ allowed: false, ciba_poll_interval_seconds: 7 }], rowCount: 1 },
+    { rows: [], rowCount: 0 },
+  );
+  const Adapter = createPostgresAdapter({ pool, realm: 'staff' });
+  const requests = new Adapter('BackchannelAuthenticationRequest');
+
+  assert.deepEqual(await requests.checkCibaPoll('request', 'client', 2), {
+    status: 'allowed', interval: 2,
+  });
+  assert.deepEqual(await requests.checkCibaPoll('request', 'client', 2), {
+    status: 'slow_down', interval: 7,
+  });
+  assert.deepEqual(await requests.checkCibaPoll('missing', 'client', 2), { status: 'invalid' });
+
+  assert.deepEqual(pool.calls[0].values, ['staff', 'request', 'client', 2]);
+  const sql = compactSql(pool.calls[0].text);
+  assert.match(sql, /realm_name=\$1 AND records\.model='BackchannelAuthenticationRequest'/);
+  assert.match(sql, /records\.id=\$2 AND records\.payload->>'clientId'=\$3/);
+  assert.match(sql, /records\.consumed_at IS NULL/);
+  assert.match(sql, /records\.expires_at > CURRENT_TIMESTAMP/);
+  assert.match(sql, /FOR UPDATE/);
+  assert.match(sql, /LEAST\(COALESCE\(target\.ciba_poll_interval_seconds, \$4::integer\) \+ 5, 300\)/);
+});
+
+test('backchannel lookup exposes expiry to the provider while other models filter it in SQL', async () => {
+  const pool = createMockPool({ rows: [] }, { rows: [] });
+  const Adapter = createPostgresAdapter({ pool, realm: 'master' });
+  await new Adapter('BackchannelAuthenticationRequest').find('request');
+  await new Adapter('AccessToken').find('token');
+
+  assert.doesNotMatch(compactSql(pool.calls[0].text), /records\.expires_at IS NULL/);
+  assert.match(compactSql(pool.calls[1].text), /records\.expires_at IS NULL/);
+});
+
 test('destroy and revokeByGrantId delete only records in the adapter realm and model', async () => {
   const pool = createMockPool();
   const Adapter = createPostgresAdapter({ pool, realm: 'partners' });

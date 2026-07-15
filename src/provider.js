@@ -1,6 +1,11 @@
 import { createHmac } from 'node:crypto';
 import { isIP } from 'node:net';
 import Provider, { errors } from 'oidc-provider';
+import {
+  grantType as cibaGrantType,
+  handler as cibaGrantHandler,
+  parameters as cibaGrantParameters,
+} from 'oidc-provider/lib/actions/grants/ciba.js';
 import { DEFAULTS as oidcClientMetadataDefaults } from 'oidc-provider/lib/consts/client_attributes.js';
 import { issuerFor } from './config.js';
 import {
@@ -46,6 +51,10 @@ const clientAuthSigningAlgorithms = Object.freeze([
 const privateJwkMembers = Object.freeze(['d', 'p', 'q', 'dp', 'dq', 'qi', 'oth', 'k', 'priv']);
 const clientAssertionClockSkew = 60;
 const clientAssertionMaxLifetime = 300;
+const cibaRequestTtl = 600;
+const cibaProductionPollInterval = 5;
+const cibaDevelopmentPollInterval = 1;
+const cibaGrant = 'urn:openid:params:grant-type:ciba';
 
 export const ADMIN_CONSOLE_CLIENT_ID = 'authme-admin-console';
 
@@ -280,6 +289,15 @@ function validateClientSecurity(metadata, { development = false } = {}) {
   if (metadata.subject_type !== undefined && !['public', 'pairwise'].includes(metadata.subject_type)) {
     throw new Error(`Unsupported subject type: ${metadata.subject_type}`);
   }
+  if (grantTypes.includes(cibaGrant)) {
+    if (method === 'none') throw new Error('CIBA requires confidential client authentication');
+    if (metadata.backchannel_token_delivery_mode !== 'poll') {
+      throw new Error('CIBA clients must use poll backchannel token delivery mode');
+    }
+    if (metadata.backchannel_user_code_parameter === true) {
+      throw new Error('CIBA user codes are not supported');
+    }
+  }
   if (metadata.request_object_signing_alg !== undefined
     && !REQUEST_OBJECT_SIGNING_ALGORITHMS.includes(metadata.request_object_signing_alg)) {
     throw new Error(`Unsupported request object signing algorithm: ${metadata.request_object_signing_alg}`);
@@ -310,9 +328,15 @@ function validateClientSecurity(metadata, { development = false } = {}) {
 
 export async function createRealmProvider({ realm, config, store, data, Adapter, jwks, logger, auditWriter }) {
   const issuer = issuerFor(config, realm);
-  const clientAssertionAudiences = new Set([issuer, `${issuer}${keycloakRoutes.token}`]);
+  const clientAssertionAudiences = new Set([
+    issuer,
+    `${issuer}${keycloakRoutes.token}`,
+  ]);
+  const cibaClientAssertionAudience = `${issuer}${keycloakRoutes.backchannel_authentication}`;
+  const cibaPollInterval = config.devMode ? cibaDevelopmentPollInterval : cibaProductionPollInterval;
   const resourceServers = config.resourceServersByRealm[realm];
   const clients = configuredClientsForRealm(config, realm);
+  let cibaAuthenticationDeviceHandler;
   for (const client of clients) validateClientSecurity(client, { development: config.devMode });
 
   async function secureRegistrationPolicy(ctx, properties) {
@@ -341,9 +365,12 @@ export async function createRealmProvider({ realm, config, store, data, Adapter,
       clientAuthSigningAlgValues: clientAuthSigningAlgorithms,
       requestObjectSigningAlgValues: [...REQUEST_OBJECT_SIGNING_ALGORITHMS],
     },
-    async assertJwtClientAuthClaimsAndHeader(_ctx, claims) {
-      if (typeof claims.aud !== 'string' || !clientAssertionAudiences.has(claims.aud)) {
-        throw new errors.InvalidClientAuth('audience (aud) must equal the issuer identifier or token endpoint url');
+    async assertJwtClientAuthClaimsAndHeader(ctx, claims) {
+      const validAudience = typeof claims.aud === 'string'
+        && (clientAssertionAudiences.has(claims.aud)
+          || (ctx.oidc.route === 'backchannel_authentication' && claims.aud === cibaClientAssertionAudience));
+      if (!validAudience) {
+        throw new errors.InvalidClientAuth('audience (aud) is not accepted for this endpoint');
       }
       if (typeof claims.iat !== 'number' || !Number.isFinite(claims.iat)) {
         throw new errors.InvalidClientAuth('issued at (iat) must be provided as a NumericDate');
@@ -393,6 +420,46 @@ export async function createRealmProvider({ realm, config, store, data, Adapter,
     },
     features: {
       backchannelLogout: { enabled: true },
+      ciba: {
+        enabled: true,
+        deliveryModes: ['poll'],
+        async processLoginHintToken() {
+          return undefined;
+        },
+        async processLoginHint(_ctx, loginHint) {
+          if (typeof loginHint !== 'string' || loginHint.length > 254 || loginHint.trim().length === 0) {
+            return undefined;
+          }
+          const user = await store.findUserByLogin(realm, loginHint);
+          const locked = user?.lockedUntil && new Date(user.lockedUntil).getTime() > Date.now();
+          return user?.enabled && !locked ? user.id : undefined;
+        },
+        async verifyUserCode(_ctx, _account, userCode) {
+          if (userCode !== undefined) throw new errors.InvalidUserCode('user codes are not supported');
+        },
+        async validateBindingMessage(_ctx, bindingMessage) {
+          if (bindingMessage !== undefined && !/^[a-zA-Z0-9-._+/!?#]{1,20}$/.test(bindingMessage)) {
+            throw new errors.InvalidBindingMessage('binding_message must be 1 to 20 basic display characters');
+          }
+        },
+        async validateRequestContext(_ctx, requestContext) {
+          if (requestContext !== undefined) throw new errors.InvalidRequest('request_context is not supported');
+        },
+        async triggerAuthenticationDevice(ctx, request, account, client) {
+          ctx.body.interval = cibaPollInterval;
+          if (cibaAuthenticationDeviceHandler) {
+            await cibaAuthenticationDeviceHandler(Object.freeze({
+              realm,
+              authReqId: request.jti,
+              accountId: account.accountId,
+              clientId: client.clientId,
+              bindingMessage: request.params.binding_message,
+              expiresAt: request.exp ?? Math.floor(Date.now() / 1000) + request.remainingTTL,
+              scopes: Object.freeze(request.scope.split(' ')),
+            }));
+          }
+        },
+      },
       claimsParameter: {
         enabled: true,
         async assertClaimsParameter(_ctx, requestedClaims) {
@@ -454,7 +521,27 @@ export async function createRealmProvider({ realm, config, store, data, Adapter,
         policies: config.enableDynamicRegistration ? { 'authme-secure-client': secureRegistrationPolicy } : undefined,
       },
       registrationManagement: { enabled: config.enableDynamicRegistration },
-      requestObjects: { enabled: true },
+      requestObjects: {
+        enabled: true,
+        async assertJwtClaimsAndHeader(ctx, claims, _header, client) {
+          if (ctx.oidc.route !== 'backchannel_authentication') return;
+          const required = ['exp', 'iat', 'nbf', 'jti'];
+          const now = Math.floor(Date.now() / 1000);
+          if (required.some((claim) => claims[claim] === undefined)
+            || typeof claims.jti !== 'string' || claims.jti.length === 0 || claims.jti.length > 256
+            || !Number.isFinite(claims.exp) || !Number.isFinite(claims.iat) || !Number.isFinite(claims.nbf)
+            || Math.abs(now - claims.iat) > clientAssertionClockSkew
+            || claims.exp <= claims.iat || claims.exp - claims.iat > cibaRequestTtl) {
+            throw new errors.InvalidRequestObject('CIBA Request Object claims are invalid');
+          }
+          const unique = await ctx.oidc.provider.ReplayDetection.unique(
+            `ciba-request:${client.clientId}\u0000`,
+            claims.jti,
+            claims.exp,
+          );
+          if (!unique) throw new errors.InvalidRequestObject('CIBA Request Object has already been used');
+        },
+      },
       resourceIndicators: {
         enabled: resourceServers.length > 0,
         async defaultResource(_ctx, _client, oneOf) {
@@ -509,6 +596,7 @@ export async function createRealmProvider({ realm, config, store, data, Adapter,
       AccessToken: config.accessTokenTtl,
       AuthorizationCode: config.authorizationCodeTtl,
       ClientCredentials: config.accessTokenTtl,
+      BackchannelAuthenticationRequest: cibaRequestTtl,
       DeviceCode: 600,
       Grant: 14 * 24 * 60 * 60,
       IdToken: config.accessTokenTtl,
@@ -576,6 +664,98 @@ export async function createRealmProvider({ realm, config, store, data, Adapter,
     },
   });
 
+  provider.registerGrantType(cibaGrantType, async (ctx) => {
+    const authReqId = ctx.oidc.params.auth_req_id;
+    if (typeof authReqId === 'string' && !/^[A-Za-z0-9._-]{20,256}$/.test(authReqId)) {
+      throw new errors.InvalidGrant('backchannel authentication request not found');
+    }
+    if (typeof authReqId === 'string' && authReqId.length > 0) {
+      const result = await provider.BackchannelAuthenticationRequest.adapter.checkCibaPoll(
+        authReqId,
+        ctx.oidc.client.clientId,
+        cibaPollInterval,
+      );
+      if (result.status === 'slow_down') {
+        ctx.set('Retry-After', String(result.interval));
+        throw new errors.SlowDown();
+      }
+    }
+    return cibaGrantHandler(ctx);
+  }, cibaGrantParameters);
+
+  async function completeCiba({ authReqId, accountId, approved, acr, amr, authTime }) {
+    if (typeof approved !== 'boolean') throw new TypeError('CIBA completion requires an explicit authorization decision');
+    const request = await provider.BackchannelAuthenticationRequest.find(authReqId, { ignoreExpiration: true });
+    if (!request || request.isExpired || request.consumed || request.grantId || request.error) {
+      throw new errors.InvalidGrant('backchannel authentication request is unavailable');
+    }
+    if (request.accountId !== accountId) throw new errors.InvalidGrant('backchannel authentication request account mismatch');
+    if (!approved) {
+      await provider.backchannelResult(request, new errors.AccessDenied('The end-user denied the authentication request'));
+      return;
+    }
+    if (typeof acr !== 'string' || acr.length === 0
+      || !Array.isArray(amr) || amr.length === 0 || amr.some((value) => typeof value !== 'string' || value.length === 0)
+      || !Number.isSafeInteger(authTime) || authTime < request.iat - clientAssertionClockSkew
+      || authTime > Math.floor(Date.now() / 1000) + clientAssertionClockSkew) {
+      throw new TypeError('approved CIBA results require valid acr, amr, and authTime authentication evidence');
+    }
+    const user = await store.findUserById(realm, accountId);
+    const locked = user?.lockedUntil && new Date(user.lockedUntil).getTime() > Date.now();
+    if (!user?.enabled || locked) throw new errors.AccessDenied('The account cannot authorize this request');
+
+    const grant = new provider.Grant({ accountId, clientId: request.clientId });
+    grant.addOIDCScope(request.scope);
+    const claimNames = new Set([
+      ...Object.keys(request.claims?.id_token ?? {}),
+      ...Object.keys(request.claims?.userinfo ?? {}),
+    ]);
+    if (claimNames.size) grant.addOIDCClaims([...claimNames]);
+    for (const audience of Array.isArray(request.resource) ? request.resource : [request.resource]) {
+      const resourceServer = audience && findConfiguredResourceServer(resourceServers, audience);
+      if (!resourceServer) continue;
+      const scopes = request.scope.split(' ').filter((scope) => resourceServer.scopes.includes(scope));
+      if (scopes.length) grant.addResourceScope(audience, scopes.join(' '));
+    }
+    const grantId = await grant.save();
+    try {
+      await provider.backchannelResult(request, grant, { acr, amr: [...amr], authTime });
+    } catch (error) {
+      await provider.Grant.adapter.destroy(grantId).catch(() => {});
+      throw error;
+    }
+  }
+
+  Object.defineProperty(provider, 'authmeCiba', {
+    value: Object.freeze({
+      complete: completeCiba,
+      setAuthenticationDeviceHandler(handler) {
+        if (typeof handler !== 'function') throw new TypeError('CIBA authentication-device handler must be a function');
+        if (cibaAuthenticationDeviceHandler) throw new Error('CIBA authentication-device handler is already configured');
+        cibaAuthenticationDeviceHandler = handler;
+      },
+      async approveForDevelopment(authReqId) {
+        if (!config.devMode) throw new Error('development CIBA approval is disabled');
+        const request = await provider.BackchannelAuthenticationRequest.find(authReqId);
+        if (!request) throw new errors.InvalidGrant('backchannel authentication request is unavailable');
+        await completeCiba({
+          authReqId,
+          accountId: request.accountId,
+          approved: true,
+          acr: 'urn:authme:loa:1',
+          amr: ['dev-ciba'],
+          authTime: Math.floor(Date.now() / 1000),
+        });
+      },
+    }),
+  });
+  provider.middleware.unshift(async (ctx, next) => {
+    await next();
+    if (ctx.oidc?.route === 'discovery' && ctx.body) {
+      ctx.body.backchannel_user_code_parameter_supported = false;
+    }
+  });
+
   provider.proxy = config.trustProxy;
   if (config.trustProxy) provider.maxIpsCount = 1;
   function writeProviderAudit(eventName, { artifact, ctx, error } = {}) {
@@ -604,6 +784,7 @@ export async function createRealmProvider({ realm, config, store, data, Adapter,
   for (const eventName of [
     'access_token.issued', 'access_token.saved', 'access_token.destroyed',
     'authorization_code.saved', 'authorization_code.consumed',
+    'backchannel_authentication_request.saved', 'backchannel_authentication_request.consumed', 'backchannel_authentication_request.destroyed',
     'client_credentials.issued', 'client_credentials.saved', 'client_credentials.destroyed',
     'device_code.saved', 'device_code.consumed', 'device_code.destroyed',
     'initial_access_token.saved', 'initial_access_token.destroyed',
