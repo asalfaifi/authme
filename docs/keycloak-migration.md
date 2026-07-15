@@ -78,6 +78,93 @@ Export this mapping, protect it as personal/security data, and retain it for rol
 
 Use an offline, repeatable migration program. Inputs and transformed outputs must be checksummed and access-controlled. The transform should be idempotent and produce a reconciliation report rather than silently skipping invalid records.
 
+### Realm-export transformation tool
+
+`scripts/kc-import.mjs` transforms one JSON realm representation produced by
+`kc.sh export` or Keycloak's partial-export API. It is an offline planning tool:
+it does not connect to Keycloak, modify AuthMe, import users into PostgreSQL, or
+copy signing keys. Supply the exact future AuthMe origin when the export does
+not contain a usable realm `frontendUrl`:
+
+```bash
+# Dry run (the default): combined config/report JSON on stdout and text report on stderr.
+node scripts/kc-import.mjs ./acme-realm.json \
+  --public-url https://login.example.com \
+  >./acme-review.json 2>./acme-review.txt
+
+# Write separate files. Existing files are never overwritten.
+node scripts/kc-import.mjs ./acme-realm.json \
+  --public-url https://login.example.com \
+  --write
+```
+
+The write form creates `acme-realm.authme.json`,
+`acme-realm.compatibility.json`, and `acme-realm.compatibility.txt` beside the
+input. Use `--config-out`, `--report-out`, and `--human-report-out` to choose
+other paths. `--issuer` can replace `--public-url`, but it must be the exact
+AuthMe issuer ending in `/realms/{realm}` with no path prefix. Run `--help` for
+the complete syntax.
+
+The AuthMe artifact contains:
+
+- realm name, display name, issuer, and the compatible token/session lifetimes;
+- static OIDC clients using the fields accepted by `AUTHME_CLIENTS_JSON`;
+- realm/client role inventories, flattened groups, users, and federated links;
+- raw LDAP, upstream OIDC, and upstream SAML provider entries matching the
+  corresponding `AUTHME_*_PROVIDERS_JSON` input shapes;
+- an `environment` object whose `*_JSON` values are structured JSON and must be
+  serialized when placed in environment variables.
+
+The artifact is deterministic for identical input and options. It has no
+generation timestamp, random identifier, or input-order-dependent report
+ordering. A missing/non-UUID Keycloak user ID is replaced with a deterministic
+realm-and-username UUID and reported as a subject-continuity warning. Prefer a
+full export with the original UUIDs.
+
+Treat both input and config output as restricted identity data. The transformer
+does not copy Keycloak client secrets, password hashes, OTP/passkey material,
+LDAP bind credentials, IdP client secrets, SMTP credentials, or private keys.
+It emits `__ROTATE__` where an otherwise mappable integration requires a new
+secret; this value is intentionally too short for AuthMe's production static
+client policy. Replace every placeholder through the approved secret channel
+before validation or deployment. Reports contain identifiers, source paths,
+classifications, and fixed reasons, never source values or secret/key material.
+
+Malformed structure, duplicate identifiers, invalid realm names, and invalid
+field types fail the whole transformation with a source path. Unsupported
+features are omitted or conservatively transformed and appear in both reports;
+an item absent from the report must still be reviewed under the migration
+release gates. Partial exports are accepted, but unresolved group paths and
+missing source user UUIDs are explicit warnings.
+
+### Transformer compatibility matrix
+
+| Keycloak export item | AuthMe transformation | Classification/required review |
+|---|---|---|
+| Realm and frontend URL | Lowercase AuthMe realm plus `/realms/{realm}` issuer | Direct when an origin is supplied/present; otherwise issuer warning |
+| Access-token/code lifetimes | `AUTHME_ACCESS_TOKEN_TTL_SECONDS` and `AUTHME_AUTHORIZATION_CODE_TTL_SECONDS` | Direct only inside AuthMe's configured ranges |
+| SSO idle timeout | `AUTHME_SESSION_TTL_SECONDS` | Warning: Keycloak idle/max/offline policies have different semantics |
+| Enabled OIDC public client | `none`, exact redirects/origins, Authorization Code, PKCE `S256` | Direct/warning; every code client must use `S256` |
+| Enabled confidential secret client | `client_secret_basic` or supported `client_secret_jwt` metadata | Warning; source secret omitted and rotation required |
+| `private_key_jwt` client | Supported algorithm plus exact HTTPS public `jwks_uri` | Direct only with RS256, PS256, or ES256 and usable public JWKS URI |
+| Service account | Client Credentials grant | Client grant maps; service-account user/policy needs reconciliation |
+| Device grant / CIBA poll | Corresponding AuthMe grant metadata | Direct where source metadata and client authentication are compatible |
+| Wildcard/relative redirect or web origin | Not emitted | Unsupported/skipped; replace with reviewed exact URI/origin |
+| Direct Access Grant / implicit flow | Not emitted | Unsupported |
+| Disabled, bearer-only, SAML, or reserved client | Not emitted as a static OIDC client | Unsupported/skipped; bearer APIs need explicit resource-server policy |
+| Realm and client roles | Separate role inventories and user namespaces | Direct for portable role names |
+| Composite role | Role name retained; no automatic expansion | Warning; materialize and reconcile effective entitlements |
+| Nested group | Canonical flattened path such as `/engineering/platform` | Direct path mapping |
+| Group role mapping | Retained on group and materialized onto affected users, including ancestors | Warning; AuthMe emits flat user entitlements |
+| User profile and assignments | AuthMe user fields, safe attributes, roles, group paths, client roles | Direct; email required and normalized lowercase |
+| Password/TOTP/WebAuthn/recovery credential | Transition status only; no credential material | Unsupported/skipped; reset or fresh enrollment required |
+| OIDC identity provider | Fixed endpoints, claim names, JIT policy | Warning; new upstream client secret required |
+| SAML identity provider | Entity ID, SSO URL, signing certificate, simple attribute mappings | Direct only when complete; advanced/encrypted/IdP-initiated behavior unsupported |
+| LDAP provider | TLS endpoint and direct profile attributes | Warning; bind credential rotation and no synchronization semantics |
+| Role/group and direct profile mapper | Built-in AuthMe claim/profile behavior | Direct where claim semantics match |
+| Script, hardcoded, audience, custom, or transform mapper | Not emitted | Unsupported; manual claim/resource policy review |
+| Sessions, tokens, initial-access tokens, authentication flows, required actions, organizations | Not emitted | Unsupported/runtime state skipped |
+
 Suggested order:
 
 1. realms and immutable identifiers;

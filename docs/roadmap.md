@@ -169,10 +169,18 @@ PAR and DPoP are already part of the v0.1 product contract. JAR, JARM, CIBA poll
 
 v1.0 means an organization can replace Keycloak for a documented set of OIDC, SAML, federation, lifecycle, administration, and operational use cases—not that every historical Keycloak extension is cloned.
 
+### Implemented product contract
+
+- Deterministic offline transformation of a Keycloak realm/partial export into
+  AuthMe realm, client, role, group, user, and supported federation
+  configuration, with structured JSON and human-readable compatibility reports.
+  The tool fails closed on malformed input, omits source credentials/keys, and
+  remains a reviewed planning artifact rather than an automatic database
+  cutover.
+
 ### Target scope
 
 - Stable, versioned administration and account APIs/UIs.
-- Documented Keycloak realm-import transformation and compatibility report.
 - Migration support for users, clients, groups, roles, selected credential formats, IdPs, and claim mappers.
 - OIDC, SAML, LDAP/AD, SCIM, organizations, strong authentication, brokering, delegated administration, auditing, and lifecycle workflows.
 - Production KMS/HSM, HA, backup/restore, rolling upgrades, and disaster-recovery runbooks.
