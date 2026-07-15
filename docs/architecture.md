@@ -137,15 +137,36 @@ provider's socket-level SSRF protection. The provider advertises public and
 pairwise subject types. Pairwise identifiers are realm- and sector-bound HMAC
 values derived with `AUTHME_SUBJECT_SALT`.
 
+### Resource indicators and API policy
+
+AuthMe implements [Resource Indicators for OAuth 2.0 (RFC 8707)](https://www.rfc-editor.org/rfc/rfc8707.html)
+for configured API audiences. `AUTHME_RESOURCE_SERVERS_JSON` defines each
+resource's exact audience, scopes, access-token format, claim policy, and
+`authorized_client_ids`. Those entries form the authoritative per-client
+resource allowlist. A client can request multiple distinct resources in one
+authorization request only when every member also lists that client in
+`multi_resource_client_ids`; omission denies all multi-resource combinations.
+Unknown resources, unauthorized resources, and disallowed combinations fail
+with `invalid_target`.
+
+AuthMe does not invent a default audience when the client omits `resource`.
+When a grant contains exactly one configured resource, `useGrantedResource`
+allows the token request to omit it and the sole granted resource is used. A
+grant covering an allowed multi-resource request requires the token request to
+select one of those granted resources; AuthMe does not choose among them. Each
+resulting access token therefore has exactly one selected audience, and its
+scope is the intersection of requested, granted, and resource-server scopes.
+Scopes belonging only to another resource are not copied into the token.
+
 An ordinary OIDC access token without a `resource` audience remains opaque and
-is usable at UserInfo. A configured RFC 8707 resource produces an
-audience-bound token in that resource's declared format. JWT resource tokens
-use `typ: at+jwt` and are validated locally using the realm JWKS, issuer,
-audience, signature, and time claims. The upstream provider intentionally
-rejects JWTs at introspection and revocation; configured opaque resource tokens
-can instead be introspected by confidential clients explicitly listed for that
-audience and checked online for security-state changes. Offline JWT validators
-accept a token until its short expiration unless they operate a denylist.
+is usable at UserInfo. A configured resource produces an audience-bound token
+in that resource's declared format. JWT resource tokens use `typ: at+jwt` and
+are validated locally using the realm JWKS, issuer, audience, signature, and
+time claims. The upstream provider intentionally rejects JWTs at introspection
+and revocation; configured opaque resource tokens can instead be introspected
+by confidential clients explicitly listed for that audience and checked online
+for security-state changes. Offline JWT validators accept a token until its
+short expiration unless they operate a denylist.
 
 ### JWT-Secured Authorization Requests
 

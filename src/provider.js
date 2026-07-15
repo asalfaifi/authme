@@ -136,6 +136,18 @@ export function findConfiguredResourceServer(resourceServers, audience) {
   return resourceServers.find((resourceServer) => resourceServer.audience === normalized);
 }
 
+function multiResourceRequestAllowed(ctx, resourceServers, clientId) {
+  const requested = ctx.oidc.params.resource;
+  if (!Array.isArray(requested)) return true;
+  const audiences = [...new Set(requested.map(normalizedAudience).filter(Boolean))];
+  if (audiences.length <= 1) return true;
+  return audiences.every((audience) => {
+    const resourceServer = findConfiguredResourceServer(resourceServers, audience);
+    return resourceServer?.authorizedClientIds.includes(clientId)
+      && resourceServer.multiResourceClientIds.includes(clientId);
+  });
+}
+
 export function resourceTokenClaims(resourceServer, user, scopes) {
   if (!resourceServer || !user) return undefined;
   const granted = scopes instanceof Set ? scopes : new Set(String(scopes ?? '').split(' ').filter(Boolean));
@@ -457,17 +469,22 @@ export async function createRealmProvider({ realm, config, store, data, Adapter,
       requestObjects: { enabled: true },
       resourceIndicators: {
         enabled: resourceServers.length > 0,
-        async defaultResource(_ctx, _client, oneOf) {
-          if (Array.isArray(oneOf) && oneOf.length === 1) return oneOf[0];
-          return oneOf;
+        async defaultResource(_ctx, _client, grantedResources) {
+          if (Array.isArray(grantedResources) && grantedResources.length === 1) {
+            return grantedResources[0];
+          }
+          return grantedResources;
         },
-        async useGrantedResource() {
-          return true;
+        async useGrantedResource(_ctx, token) {
+          return token.resource !== undefined;
         },
-        async getResourceServerInfo(_ctx, audience, client) {
+        async getResourceServerInfo(ctx, audience, client) {
           const resourceServer = findConfiguredResourceServer(resourceServers, audience);
           if (!resourceServer || !resourceServer.authorizedClientIds.includes(client.clientId)) {
             throw new errors.InvalidTarget('client is not authorized to use the requested resource');
+          }
+          if (!multiResourceRequestAllowed(ctx, resourceServers, client.clientId)) {
+            throw new errors.InvalidTarget('client is not authorized to combine the requested resources');
           }
           return {
             audience: resourceServer.audience,

@@ -37,7 +37,7 @@ Keycloak's current feature inventory includes OIDC/OAuth, SAML, identity brokeri
 | Administration API | Implemented, AuthMe-native | Separate root bearer for automation; not Keycloak Admin REST compatible |
 | Realm/client role claims | Implemented | Keycloak-shaped JSON claims |
 | Groups claim | Implemented baseline | Flat emitted paths; advanced mapping is staged |
-| API audiences/JWT access tokens | Implemented baseline | Exact configured RFC 8707 audiences; `typ: at+jwt`; audience-filtered role/group claims |
+| API audiences/JWT access tokens | Implemented | Exact configured RFC 8707 audiences; per-client and multi-resource policy; `typ: at+jwt`; audience-filtered scopes and role/group claims |
 | Pairwise subjects | Implemented | Realm- and client/sector-bound identifiers |
 | Direct Access Grants/password grant | Not supported | Deliberately omitted under current OAuth security guidance |
 | Implicit/hybrid flows | Not in v0.3 contract | Upstream capability does not mean enabled AuthMe behavior |
@@ -146,6 +146,13 @@ rejects structured JWTs at introspection and revocation. JWT validators observe
 account/security changes no later than token expiration unless they maintain an
 additional denylist. Configure an opaque resource token for APIs that require
 immediate online revocation or authorized introspection.
+
+During migration, `authorized_client_ids` defines which clients may request
+each API audience. Multi-resource authorization requests are denied by default;
+every resource in an allowed combination must also list the client in
+`multi_resource_client_ids`. A multi-resource grant does not produce a
+multi-audience access token: the token request selects one granted resource and
+the resulting token contains only that audience and that resource's scopes.
 
 ## Behavior that may require relying-party changes
 
