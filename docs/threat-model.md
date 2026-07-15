@@ -2,7 +2,7 @@
 
 ## Scope
 
-This threat model covers the AuthMe v0.3 standalone service, its browser interactions, OAuth/OIDC endpoints including device flow, PAR, DPoP, dynamic registration and logout, upstream OIDC and SAML federation, LDAP/AD authentication, SCIM Users/Groups provisioning, PostgreSQL adapter, password/TOTP/recovery/passkey credentials, optional Redis rate limiter, the OIDC-authenticated administration console, the separately bearer-protected root API, and deployment behind a TLS proxy.
+This threat model covers the AuthMe v0.3 standalone service, its browser interactions, OAuth/OIDC endpoints including device flow, PAR, DPoP, mTLS, dynamic registration and logout, upstream OIDC and SAML federation, LDAP/AD authentication, SCIM Users/Groups provisioning, PostgreSQL adapter, password/TOTP/recovery/passkey credentials, optional Redis rate limiter, the OIDC-authenticated administration console, the separately bearer-protected root API, and deployment behind a TLS proxy.
 
 It does not claim to cover Kerberos/SPNEGO, RADIUS, X.509 login, encrypted or IdP-initiated SAML, SAML IdP operation, inbound LDAP synchronization, SCIM Bulk/full filtering, imported U2F/WebAuthn credentials, authenticator attestation trust policy, KMS/HSM integration, approval-backed administrator-grant lifecycle, organization-level delegation, a self-service account console, passkey recovery, or multi-site operation. Those features require their own threat-model updates before release.
 
@@ -85,10 +85,10 @@ The administrator browser and root automation client cross different credential 
 | Federated account takeover by email/username collision | Identity key includes realm/provider/canonical issuer/immutable subject; collisions never auto-link; JIT is opt-in; explicit root-admin linking is audited | Root administrator can intentionally create a dangerous link and requires procedural controls |
 | SCIM cross-realm mutation, lost update, or bearer theft | Realm-bound independent tokens, constant-time comparison, UUID/realm constraints, weak ETags and CAS, bounded parser/filter/page sizes, account-state revocation | Broad token scope, sequential audit persistence, no delegated SCIM scopes, Bulk, or full filter grammar |
 | Authorization-code replay race | PostgreSQL-backed record with atomic consumption and uniqueness | Load testing under concurrent redemption |
-| Refresh-token theft/replay | Provider-managed rotation/revocation persisted in PostgreSQL; bounded lifetimes; DPoP binding for configured clients | Explicit family-wide reuse telemetry and mTLS are staged where not already provided by configured provider behavior |
-| Access-token replay | TLS, short expiry, audience/scope restriction, DPoP sender constraint for configured clients, persisted replay detection | mTLS certificate-bound tokens are staged |
+| Refresh-token theft/replay | Provider-managed rotation/revocation persisted in PostgreSQL; bounded lifetimes; DPoP binding and mTLS certificate/client binding for configured clients | Explicit family-wide reuse telemetry is staged |
+| Access-token replay | TLS, short expiry, audience/scope restriction, DPoP or mTLS sender constraint for configured clients, persisted DPoP replay detection | Resource servers must enforce `cnf` certificate matching; bearer tokens remain replayable |
 | JWT algorithm or token-kind confusion | Maintained JOSE stack; configured algorithm allowlist; issuer, audience, type, signature, and time validation | Independent configuration review and negative corpus tests |
-| Client impersonation | Confidential-client authentication and protected secret storage; constant-time verification through maintained libraries | `private_key_jwt` and mTLS profiles are staged unless explicitly enabled |
+| Client impersonation | Confidential-client authentication and protected secret storage; constant-time verification through maintained libraries; allowlisted JWT and mTLS authentication profiles | Client CA issuance policy and proxy compromise remain deployment risks |
 | Session fixation or cookie theft | Regenerate session context after authentication; Secure, HttpOnly, SameSite cookies; no tokens in URLs or local storage; user-verified passkey login is available | Password/TOTP paths remain phishable; no self-service passkey recovery |
 | Logout abuse | Validate ID-token hint and exact registered post-logout URI; signed back-channel logout tokens and registered client endpoint policy | Front-channel logout is staged unless explicitly enabled |
 | Device-code phishing or user-code guessing | Short-lived high-entropy device codes, rate-limited verification, explicit user confirmation displaying the requesting client | Device-flow conformance and usability review |
@@ -105,7 +105,7 @@ The administrator browser and root automation client cross different credential 
 | SQL injection | Parameterized database access; schema validation; no dynamic SQL from protocol parameters | Static analysis and database-role least privilege |
 | XSS and malicious branding content | Context-aware escaping, restrictive CSP, no arbitrary script in realm configuration | Custom themes require a new review before release |
 | Clickjacking | `frame-ancestors` CSP and compatible `X-Frame-Options` for interaction pages | Explicit exceptions require per-client security review |
-| Proxy-header/host poisoning | Fixed public origin; explicit trusted proxies; never derive issuer from arbitrary request headers | Deployment validation must exercise the real ingress |
+| Proxy certificate-header or host poisoning | Fixed public origin; explicit trusted proxies; never derive issuer from arbitrary request headers; mTLS disabled without a certificate-header setting; certificate headers require an allowlisted socket peer and one forwarded hop; duplicate/malformed headers and certificates fail closed | The proxy must overwrite external certificate/verification/forwarding headers, validate TLS proof of possession and PKI chains as applicable, and isolate the backend; proxy compromise permits mTLS client impersonation |
 | Token/credential leakage through logs | Structured redaction; denylist sensitive headers/fields; no request-body logging on protocol endpoints | Log pipeline and support-bundle review |
 | Signing-key theft | Keys supplied through protected deployment secrets; restrictive file/process access; public-only JWKS | Envelope encryption and KMS/HSM signing are staged |
 | Key rotation outage | Publish retiring public key longer than maximum token lifetime and cache/skew window | Automated rotation is staged |
@@ -153,6 +153,21 @@ The device verification page must clearly name the client and requested access b
 Dynamic client registration accepts only a valid, short-lived initial access token issued through the protected administration API. Distribute it like an administrator credential. Client metadata, especially redirect URIs, authentication methods, JWKS locations, and logout URIs, is validated before persistence. Initial-access-token issuance is audited.
 
 DPoP is a client policy, not a reason to accept an otherwise invalid token. AuthMe validates the proof's key, signature, `htm`, `htu`, `iat`, `jti`, access-token hash where applicable, and nonce behavior through the maintained provider implementation.
+
+### Mutual TLS
+
+RFC 8705 certificate headers cross a deployment trust boundary: an arbitrary
+HTTP client can send the same header names unless the edge removes them and the
+backend rejects non-proxy peers. The proxy must prove possession of the client
+certificate during TLS, forward exactly one leaf certificate, overwrite the
+configured certificate and verification headers, and supply a single
+`X-Forwarded-For` value. AuthMe additionally checks the socket peer against
+`AUTHME_MTLS_TRUSTED_PROXY_CIDRS`; enabling ordinary proxy handling alone is not
+enough. PKI `tls_client_auth` accepts the configured success value only after
+the proxy validates the chain against limited client trust anchors, while
+`self_signed_tls_client_auth` pins the leaf certificate to client `x5c`
+metadata. Resource servers remain responsible for matching
+`cnf["x5t#S256"]` to the certificate on their own mTLS connection.
 
 ### TOTP and recovery codes
 

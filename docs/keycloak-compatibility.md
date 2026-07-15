@@ -19,7 +19,7 @@ Keycloak's current feature inventory includes OIDC/OAuth, SAML, identity brokeri
 | Authorization Code | Implemented | PKCE `S256` supported/required by client policy |
 | Refresh token | Implemented | Subject to client and scope policy |
 | Client Credentials | Implemented | For confidential service clients |
-| Client authentication | Implemented | `client_secret_basic`, `client_secret_jwt` (HS256), `private_key_jwt` (RS256, PS256, or ES256), and `none` |
+| Client authentication | Implemented | `client_secret_basic`, `client_secret_jwt` (HS256), `private_key_jwt` (RS256, PS256, or ES256), `tls_client_auth`, `self_signed_tls_client_auth`, and `none` |
 | UserInfo | Implemented | Scope-limited JSON by default; optional realm-signed JWT per client |
 | Introspection | Implemented | JSON by default or optional realm-signed JWT; issuing clients and audience-authorized confidential clients for opaque tokens; JWT access tokens are validated locally |
 | Revocation | Implemented | Standard OAuth revocation endpoint |
@@ -30,6 +30,7 @@ Keycloak's current feature inventory includes OIDC/OAuth, SAML, identity brokeri
 | JAR | Implemented in v0.4 | Signed `request` objects using registered client public keys; remote client-hosted `request_uri` retrieval is not supported |
 | JARM | Implemented in v0.4 | Realm-key-signed `jwt`, `query.jwt`, `fragment.jwt`, and `form_post.jwt` authorization responses |
 | DPoP | Implemented | Enabled by client policy; proof validation and replay state are durable |
+| mTLS | Implemented in v0.4 | RFC 8705 PKI/self-signed client authentication and `cnf.x5t#S256` certificate-bound access tokens through an explicitly trusted proxy boundary |
 | Dynamic client registration | Implemented | Requires an AuthMe initial access token |
 | TOTP and recovery codes | Implemented | New AuthMe enrollment; existing Keycloak credential import is not guaranteed |
 | WebAuthn/passkeys | Implemented baseline | Fresh AuthMe registration and login; no Keycloak credential import or attestation policy |
@@ -41,7 +42,7 @@ Keycloak's current feature inventory includes OIDC/OAuth, SAML, identity brokeri
 | Pairwise subjects | Implemented | Realm- and client/sector-bound identifiers |
 | Direct Access Grants/password grant | Not supported | Deliberately omitted under current OAuth security guidance |
 | Implicit/hybrid flows | Not in v0.3 contract | Upstream capability does not mean enabled AuthMe behavior |
-| CIBA/mTLS/FAPI | Staged | Library capabilities require AuthMe configuration and conformance gates |
+| CIBA/FAPI | Staged | Library capabilities require AuthMe configuration and conformance gates |
 | Keycloak Admin REST API | Not supported | AuthMe administration is a separate API/model |
 | Upstream OIDC brokering | Implemented baseline | Fixed-provider Authorization Code + PKCE; collision-safe JIT/admin linking; no social presets |
 | SAML 2.0 federation | Implemented SP baseline | SP-initiated signed response/assertion; no encrypted assertions, SLO, IdP-initiated login, or SAML IdP |
@@ -71,7 +72,7 @@ The following public paths intentionally match Keycloak's OIDC layout, documente
 
 The legacy Keycloak direct-POST logout format used by old Keycloak adapters is not part of the compatibility promise. Keycloak itself describes that format as non-standard and recommends standards-based logout.
 
-Device Authorization, PAR, DPoP, dynamic registration, and back-channel logout are implemented v0.3 capabilities; JAR and JARM are implemented in v0.4. JAR clients register a public inline `jwks` and one of the advertised `RS256`, `PS256`, or `ES256` request-object algorithms. They may set `require_signed_request_object` when every authorization request for that client must use JAR. The table records AuthMe's configured compatibility routes and response modes, but clients must still use discovery metadata as the canonical source for endpoints, response modes, signing algorithms, and advertised authentication methods rather than constructing URLs or assuming algorithm support.
+Device Authorization, PAR, DPoP, dynamic registration, and back-channel logout are implemented v0.3 capabilities; JAR, JARM, and mTLS are implemented in v0.4. JAR clients register a public inline `jwks` and one of the advertised `RS256`, `PS256`, or `ES256` request-object algorithms. They may set `require_signed_request_object` when every authorization request for that client must use JAR. The table records AuthMe's configured compatibility routes and response modes, but clients must still use discovery metadata as the canonical source for endpoints, response modes, signing algorithms, and advertised authentication methods rather than constructing URLs or assuming algorithm support.
 
 An issuer is an exact security identifier, not a display URL. To migrate without changing client issuer configuration, AuthMe must assume the same external scheme, host, port, and realm path previously used by Keycloak. Reverse-proxy rewrites must not cause discovery and token `iss` values to diverge.
 
@@ -130,12 +131,25 @@ The ordinary Keycloak OIDC client concepts map as follows:
 Do not copy a Keycloak client secret into logs, command history, tickets, or migration files. Prefer rotating the secret during migration.
 
 The authentication-method profile supports `client_secret_basic`,
-`client_secret_jwt`, `private_key_jwt`, and `none` at the token, introspection,
-and revocation endpoints. JWT client assertions use the exact realm issuer or
+`client_secret_jwt`, `private_key_jwt`, `tls_client_auth`,
+`self_signed_tls_client_auth`, and `none` at the token, introspection, and
+revocation endpoints. The mTLS methods are advertised only when their trusted
+proxy certificate-header boundary is configured. JWT client assertions use the exact realm issuer or
 token endpoint as their audience and a durable one-use `jti`. Asymmetric clients
 can register public keys inline with `jwks` or at a constrained HTTPS
 `jwks_uri`. Keycloak deployments using another method, including
 `client_secret_post`, must change the client authentication configuration.
+
+An RFC 8705 client using `tls_client_auth` registers exactly one expected
+certificate subject DN or SAN. A `self_signed_tls_client_auth` client registers
+the certificate in public `jwks`/`jwks_uri` `x5c` metadata. Setting
+`tls_client_certificate_bound_access_tokens: true` binds issued access tokens
+to the presented certificate; JWT tokens carry `cnf.x5t#S256`, and opaque-token
+introspection returns the same value. This requires an ingress that performs
+mutual TLS, overwrites the configured certificate/verification/forwarding
+headers, and connects from an explicitly allowlisted proxy CIDR. It is not
+compatible with forwarding an end-user-supplied certificate header through an
+ordinary Keycloak-style HTTP proxy configuration.
 
 AuthMe v0.4 clients can register `userinfo_signed_response_alg: RS256` to receive a signed `application/jwt` UserInfo response, as defined by [OpenID Connect Core](https://openid.net/specs/openid-connect-core-1_0-errata2.html#UserInfoResponse). An authorized resource client can register `introspection_signed_response_alg: RS256` and send `Accept: application/token-introspection+jwt` to receive the signed response defined by [RFC 9701](https://www.rfc-editor.org/rfc/rfc9701.html). Both response types use the realm signing key and are verified with its public JWKS; `none` is rejected. Clients without these opt-ins keep the existing JSON behavior. Signed introspection is a response-format option, not an authorization bypass: the configured opaque-token audience and `introspection_client_ids` policy remains in force.
 
@@ -173,7 +187,7 @@ The following require staged implementations and separate compatibility specific
 - curated social identity-provider presets and arbitrary broker plugins; upstream OIDC and SAML federation are implemented baselines;
 - Keycloak Admin REST and `kcadm` compatibility;
 - a self-service account console, complete Keycloak-equivalent policy administration, and Keycloak theme/SPI packages; AuthMe's native administration console is implemented;
-- configurable authentication flows, arbitrary required actions, imported WebAuthn/U2F credentials, attestation policy, and X.509; fresh AuthMe passkey, TOTP, and one-use recovery-code enrollment is implemented;
+- configurable authentication flows, arbitrary required actions, imported WebAuthn/U2F credentials, attestation policy, and X.509 end-user login; fresh AuthMe passkey, TOTP, and one-use recovery-code enrollment is implemented;
 - organizations and invitations;
 - SCIM Bulk, sorting, arbitrary extension schemas, and the complete filter grammar; core Users/Groups provisioning is implemented;
 - Authorization Services/UMA 2 policy evaluation;
