@@ -147,7 +147,13 @@ can instead be introspected by confidential clients explicitly listed for that
 audience and checked online for security-state changes. Offline JWT validators
 accept a token until its short expiration unless they operate a denylist.
 
-Implicit flow, Resource Owner Password Credentials, CIBA, JAR, mTLS, and FAPI profiles are not part of the v0.3 product contract unless a release explicitly enables and tests them. The OAuth Security Best Current Practice requires authorization servers to support PKCE, requires it for public clients, recommends it for confidential clients, and requires exact redirect URI matching; see [RFC 9700](https://www.rfc-editor.org/rfc/rfc9700.html). PAR is defined by [RFC 9126](https://www.rfc-editor.org/rfc/rfc9126.html), DPoP by [RFC 9449](https://www.rfc-editor.org/rfc/rfc9449.html), and Device Authorization by [RFC 8628](https://www.rfc-editor.org/rfc/rfc8628.html).
+Implicit flow, Resource Owner Password Credentials, CIBA, mTLS, and FAPI profiles are not part of the v0.3 product contract unless a release explicitly enables and tests them. The OAuth Security Best Current Practice requires authorization servers to support PKCE, requires it for public clients, recommends it for confidential clients, and requires exact redirect URI matching; see [RFC 9700](https://www.rfc-editor.org/rfc/rfc9700.html). PAR is defined by [RFC 9126](https://www.rfc-editor.org/rfc/rfc9126.html), DPoP by [RFC 9449](https://www.rfc-editor.org/rfc/rfc9449.html), and Device Authorization by [RFC 8628](https://www.rfc-editor.org/rfc/rfc8628.html).
+
+### JWT-Secured Authorization Requests
+
+AuthMe v0.4 supports signed [JWT-Secured Authorization Requests (JAR, RFC 9101)](https://www.rfc-editor.org/rfc/rfc9101.html) through the authorization endpoint's `request` parameter. Clients register `request_object_signing_alg` as `RS256`, `PS256`, or `ES256` and provide verification keys through public inline `jwks` metadata; inline private and symmetric key material is rejected. A client can set `require_signed_request_object` to prevent downgrade to a plain authorization request. Server-wide mandatory JAR remains off so clients that have not opted into JAR continue to use ordinary Authorization Code requests.
+
+AuthMe does not retrieve client-hosted `request_uri` values. Discovery advertises `request_uri_parameter_supported` as false, avoiding a new outbound-fetch and SSRF surface; provider-issued, short-lived PAR request URNs remain supported through the implemented PAR endpoint. Whether parameters arrive in a signed Request Object or a plain request, PKCE `S256`, client binding, scope validation, and registered redirect URI validation run in the same authorization pipeline.
 
 ### JWT Secured Authorization Response Mode
 
