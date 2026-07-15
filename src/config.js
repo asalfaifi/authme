@@ -187,7 +187,16 @@ function clientsByRealm(value, realms) {
   for (const realm of realms) {
     const clients = parsed[realm] ?? [];
     if (!Array.isArray(clients)) throw new Error(`AUTHME_CLIENTS_JSON.${realm} must be an array`);
-    result[realm] = deepFreeze(structuredClone(clients));
+    result[realm] = deepFreeze(structuredClone(clients).map((client, index) => {
+      const name = `AUTHME_CLIENTS_JSON.${realm}[${index}]`;
+      if (!client || Array.isArray(client) || typeof client !== 'object') {
+        throw new Error(`${name} must be an object`);
+      }
+      if (client.fapi_profile !== undefined && client.fapi_profile !== '2.0') {
+        throw new Error(`${name}.fapi_profile must be 2.0 when provided`);
+      }
+      return client;
+    }));
   }
   return deepFreeze(result);
 }
