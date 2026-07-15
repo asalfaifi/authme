@@ -84,6 +84,16 @@ function sameOrigin(req, config) {
   return origin === config.publicUrl;
 }
 
+function sameOriginLoginNavigation(req, config) {
+  const origin = req.get('origin');
+  if (origin === config.publicUrl) return true;
+  if (origin !== undefined && origin !== 'null') return false;
+  return requestOrigin(req) === config.publicUrl
+    && req.get('sec-fetch-site') === 'same-origin'
+    && req.get('sec-fetch-mode') === 'navigate'
+    && req.get('sec-fetch-dest') === 'document';
+}
+
 function requestOrigin(req) {
   try {
     return new URL(`${req.protocol}://${req.get('host')}`).origin;
@@ -238,7 +248,7 @@ export function createAdminConsole({ config, store, rateLimits, jwksByRealm, fet
   }
 
   async function beginLogin(req, res, realm, { jsonResponse = false, rateLimited = false } = {}) {
-    if (!sameOrigin(req, config)) {
+    if (!sameOriginLoginNavigation(req, config)) {
       consoleHeaders(res);
       if (config.devMode && isLoopbackOrigin(req.get('origin')) && isLoopbackOrigin(config.publicUrl)) {
         return res.redirect(303, new URL('/admin/', config.publicUrl).toString());

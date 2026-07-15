@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { createHmac } from 'node:crypto';
 import { createServer } from 'node:http';
 import test from 'node:test';
+import request from 'supertest';
 
 import { createAuthMeApp } from '../src/app.js';
 import { loadConfig } from '../src/config.js';
@@ -291,7 +292,7 @@ test('administrator console uses its real OIDC flow and enforces session boundar
     assert.doesNotMatch(loginHtml, new RegExp(ROOT_TOKEN, 'u'));
 
     const loginBody = new URLSearchParams({ realm: 'master' });
-    for (const origin of [undefined, 'http://attacker.example.test']) {
+    for (const origin of [undefined, 'null', 'http://attacker.example.test']) {
       const headers = { 'content-type': 'application/x-www-form-urlencoded;charset=UTF-8' };
       if (origin) headers.origin = origin;
       const originResponse = await anonymous.request('/admin/ui/login', {
@@ -307,6 +308,17 @@ test('administrator console uses its real OIDC flow and enforces session boundar
       assert(originBody.length <= 512, 'Invalid-origin response was not bounded');
       assert.equal(JSON.parse(originBody).title, 'Invalid request origin');
     }
+    const metadataFallback = await request(runtime.app)
+      .post('/admin/ui/login')
+      .set('host', `127.0.0.1:${address.port}`)
+      .set('origin', 'null')
+      .set('sec-fetch-site', 'same-origin')
+      .set('sec-fetch-mode', 'navigate')
+      .set('sec-fetch-dest', 'document')
+      .type('form')
+      .send(loginBody.toString());
+    assert.equal(metadataFallback.status, 303);
+    assert.match(metadataFallback.headers.location ?? '', /\/realms\/master\/protocol\/openid-connect\/auth\?/u);
     response = await anonymous.request('/admin/ui/login', {
       method: 'POST',
       headers: {
