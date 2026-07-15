@@ -61,10 +61,83 @@ const cibaRequestTtl = 600;
 const cibaProductionPollInterval = 5;
 const cibaDevelopmentPollInterval = 1;
 const cibaGrant = 'urn:openid:params:grant-type:ciba';
+const fapiProfile = '2.0';
+const fapiClientAuthMethods = Object.freeze([
+  'private_key_jwt',
+  'tls_client_auth',
+  'self_signed_tls_client_auth',
+]);
+const fapiSigningAlgorithms = Object.freeze(['PS256', 'ES256']);
+const fapiAuthorizationCodeTtl = 60;
 
 export const ADMIN_CONSOLE_CLIENT_ID = 'authme-admin-console';
 
 const REQUEST_OBJECT_SIGNING_ALGORITHMS = Object.freeze(['RS256', 'PS256', 'ES256']);
+
+function applyFapiClientProfile(metadata) {
+  if (metadata.fapi_profile === undefined) return;
+  if (metadata.fapi_profile !== fapiProfile) {
+    throw new Error(`fapi_profile must be ${fapiProfile} when provided`);
+  }
+
+  if (metadata.token_endpoint_auth_method === 'private_key_jwt') {
+    metadata.token_endpoint_auth_signing_alg ??= metadata.request_object_signing_alg ?? 'PS256';
+  }
+
+  const grantTypes = metadata.grant_types ?? ['authorization_code'];
+  if (grantTypes.includes('authorization_code')) {
+    metadata.request_object_signing_alg ??= metadata.token_endpoint_auth_signing_alg ?? 'PS256';
+    metadata.authorization_signed_response_alg ??= 'PS256';
+    metadata.id_token_signed_response_alg ??= 'PS256';
+    metadata.require_pushed_authorization_requests = true;
+    metadata.require_signed_request_object = true;
+    metadata.response_modes ??= ['jwt'];
+  }
+}
+
+function validateFapiClientSecurity(metadata, { mtlsEnabled = true } = {}) {
+  if (metadata.fapi_profile === undefined) return;
+  if (metadata.fapi_profile !== fapiProfile) {
+    throw new Error(`fapi_profile must be ${fapiProfile} when provided`);
+  }
+
+  const method = metadata.token_endpoint_auth_method ?? 'client_secret_basic';
+  if (!fapiClientAuthMethods.includes(method)) {
+    throw new Error('FAPI 2.0 clients must use private_key_jwt or mutual-TLS client authentication');
+  }
+  if (method === 'private_key_jwt'
+    && !fapiSigningAlgorithms.includes(metadata.token_endpoint_auth_signing_alg)) {
+    throw new Error('FAPI 2.0 private_key_jwt clients must use PS256 or ES256');
+  }
+
+  const dpopBound = metadata.dpop_bound_access_tokens === true;
+  const mtlsBound = metadata.tls_client_certificate_bound_access_tokens === true;
+  if (dpopBound === mtlsBound) {
+    throw new Error('FAPI 2.0 clients must require exactly one DPoP or mutual-TLS sender-constrained access-token mechanism');
+  }
+  if (mtlsBound && !mtlsEnabled) {
+    throw new Error('FAPI 2.0 mutual-TLS sender-constrained access tokens require mTLS proxy configuration');
+  }
+
+  const grantTypes = metadata.grant_types ?? ['authorization_code'];
+  if (grantTypes.length !== 1 || grantTypes[0] !== 'authorization_code') {
+    throw new Error('AuthMe FAPI 2.0 clients must use only the authorization_code grant');
+  }
+  if (!fapiSigningAlgorithms.includes(metadata.request_object_signing_alg)) {
+    throw new Error('FAPI 2.0 authorization-code clients must sign Request Objects with PS256 or ES256');
+  }
+  if (!fapiSigningAlgorithms.includes(metadata.authorization_signed_response_alg)) {
+    throw new Error('FAPI 2.0 authorization-code clients must use PS256 or ES256 JARM responses');
+  }
+  if (!fapiSigningAlgorithms.includes(metadata.id_token_signed_response_alg)) {
+    throw new Error('FAPI 2.0 authorization-code clients must sign ID Tokens with PS256 or ES256');
+  }
+  if (!Array.isArray(metadata.response_modes)
+    || metadata.response_modes.length === 0
+    || metadata.response_modes.some((mode) => mode !== 'jwt')) {
+    throw new Error('FAPI 2.0 authorization-code clients must use response_mode jwt');
+  }
+}
 
 function adminConsoleClient(config) {
   return {
@@ -288,6 +361,7 @@ function validateInlineClientJwks(metadata) {
 }
 
 function validateClientSecurity(metadata, { development = false, mtlsEnabled = true } = {}) {
+  applyFapiClientProfile(metadata);
   const grantTypes = metadata.grant_types ?? ['authorization_code'];
   if (grantTypes.some((type) => type === 'implicit' || type === 'password')) {
     throw new Error('Implicit and password grants are not supported');
@@ -345,6 +419,7 @@ function validateClientSecurity(metadata, { development = false, mtlsEnabled = t
       throw new Error('Confidential client secrets must contain at least 32 bytes');
     }
   }
+  validateFapiClientSecurity(metadata, { mtlsEnabled });
 }
 
 export async function createRealmProvider({ realm, config, store, data, Adapter, jwks, logger, auditWriter }) {
@@ -365,6 +440,10 @@ export async function createRealmProvider({ realm, config, store, data, Adapter,
   }
 
   async function secureRegistrationPolicy(ctx, properties) {
+    if (ctx.oidc.client?.fapi_profile === fapiProfile
+      && properties.fapi_profile !== fapiProfile) {
+      throw new errors.InvalidClientMetadata('FAPI 2.0 clients cannot remove their fapi_profile');
+    }
     try {
       validateClientSecurity(properties, { development: config.devMode, mtlsEnabled: config.mtls.enabled });
     } catch (error) {
@@ -390,10 +469,12 @@ export async function createRealmProvider({ realm, config, store, data, Adapter,
       clientAuthSigningAlgValues: clientAuthSigningAlgorithms,
       requestObjectSigningAlgValues: [...REQUEST_OBJECT_SIGNING_ALGORITHMS],
     },
-    async assertJwtClientAuthClaimsAndHeader(ctx, claims) {
-      const validAudience = typeof claims.aud === 'string'
-        && (clientAssertionAudiences.has(claims.aud)
-          || (ctx.oidc.route === 'backchannel_authentication' && claims.aud === cibaClientAssertionAudience));
+    async assertJwtClientAuthClaimsAndHeader(ctx, claims, _header, client) {
+      const validAudience = client?.fapi_profile === fapiProfile
+        ? claims.aud === issuer
+        : typeof claims.aud === 'string'
+          && (clientAssertionAudiences.has(claims.aud)
+            || (ctx.oidc.route === 'backchannel_authentication' && claims.aud === cibaClientAssertionAudience));
       if (!validAudience) {
         throw new errors.InvalidClientAuth('audience (aud) is not accepted for this endpoint');
       }
@@ -411,10 +492,14 @@ export async function createRealmProvider({ realm, config, store, data, Adapter,
     },
     subjectTypes: ['public', 'pairwise'],
     extraClientMetadata: {
-      properties: ['web_origins'],
-      validator(_ctx, _key, _value, metadata) {
+      properties: ['web_origins', 'fapi_profile'],
+      validator(_ctx, key, _value, metadata) {
         try {
-          validateWebOrigins(metadata, { development: config.devMode });
+          if (key === 'web_origins') validateWebOrigins(metadata, { development: config.devMode });
+          if (key === 'fapi_profile') {
+            applyFapiClientProfile(metadata);
+            validateFapiClientSecurity(metadata, { mtlsEnabled: config.mtls.enabled });
+          }
         } catch (error) {
           metadata.invalidate(error.message);
         }
@@ -531,6 +616,12 @@ export async function createRealmProvider({ realm, config, store, data, Adapter,
         },
       },
       dPoP: { enabled: true },
+      fapi: {
+        enabled: true,
+        profile(_ctx, client) {
+          return client?.fapi_profile === fapiProfile ? fapiProfile : undefined;
+        },
+      },
       introspection: {
         enabled: true,
         async allowedPolicy(_ctx, client, token) {
@@ -550,16 +641,30 @@ export async function createRealmProvider({ realm, config, store, data, Adapter,
       requestObjects: {
         enabled: true,
         async assertJwtClaimsAndHeader(ctx, claims, _header, client) {
-          if (ctx.oidc.route !== 'backchannel_authentication') return;
-          const required = ['exp', 'iat', 'nbf', 'jti'];
+          const isFapi = client?.fapi_profile === fapiProfile;
+          const isCiba = ctx.oidc.route === 'backchannel_authentication';
+          if (!isFapi && !isCiba) return;
+          const required = new Set([
+            ...(isFapi ? ['exp', 'aud', 'nbf'] : []),
+            ...(isCiba ? ['exp', 'iat', 'nbf', 'jti'] : []),
+          ]);
           const now = Math.floor(Date.now() / 1000);
-          if (required.some((claim) => claims[claim] === undefined)
-            || typeof claims.jti !== 'string' || claims.jti.length === 0 || claims.jti.length > 256
-            || !Number.isFinite(claims.exp) || !Number.isFinite(claims.iat) || !Number.isFinite(claims.nbf)
+          if ([...required].some((claim) => claims[claim] === undefined)
+            || !Number.isFinite(claims.exp) || !Number.isFinite(claims.nbf)) {
+            throw new errors.InvalidRequestObject('Request Object claims are invalid');
+          }
+          if (isFapi && (claims.exp <= claims.nbf
+            || claims.exp - claims.nbf > 3600
+            || now - claims.nbf > 3600 + clientAssertionClockSkew)) {
+            throw new errors.InvalidRequestObject('FAPI 2.0 Request Object lifetime is invalid');
+          }
+          if (isCiba && (typeof claims.jti !== 'string' || claims.jti.length === 0 || claims.jti.length > 256
+            || !Number.isFinite(claims.iat)
             || Math.abs(now - claims.iat) > clientAssertionClockSkew
-            || claims.exp <= claims.iat || claims.exp - claims.iat > cibaRequestTtl) {
+            || claims.exp <= claims.iat || claims.exp - claims.iat > cibaRequestTtl)) {
             throw new errors.InvalidRequestObject('CIBA Request Object claims are invalid');
           }
+          if (!isCiba) return;
           const unique = await ctx.oidc.provider.ReplayDetection.unique(
             `ciba-request:${client.clientId}\u0000`,
             claims.jti,
@@ -625,7 +730,11 @@ export async function createRealmProvider({ realm, config, store, data, Adapter,
     },
     ttl: {
       AccessToken: config.accessTokenTtl,
-      AuthorizationCode: config.authorizationCodeTtl,
+      AuthorizationCode(_ctx, _code, client) {
+        return client?.fapi_profile === fapiProfile
+          ? Math.min(config.authorizationCodeTtl, fapiAuthorizationCodeTtl)
+          : config.authorizationCodeTtl;
+      },
       ClientCredentials: config.accessTokenTtl,
       BackchannelAuthenticationRequest: cibaRequestTtl,
       DeviceCode: 600,
@@ -779,6 +888,16 @@ export async function createRealmProvider({ realm, config, store, data, Adapter,
         });
       },
     }),
+  });
+  provider.middleware.unshift(async (ctx, next) => {
+    if (ctx.method === 'GET' && ctx.path === keycloakRoutes.authorization) {
+      const clientId = ctx.query.client_id;
+      if (typeof clientId === 'string') {
+        const client = await provider.Client.find(clientId).catch(() => undefined);
+        if (client?.fapi_profile === fapiProfile) ctx.query.response_mode = 'jwt';
+      }
+    }
+    await next();
   });
   provider.middleware.unshift(async (ctx, next) => {
     await next();

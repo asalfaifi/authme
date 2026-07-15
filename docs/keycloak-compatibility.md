@@ -45,7 +45,7 @@ Keycloak's current feature inventory includes OIDC/OAuth, SAML, identity brokeri
 | Implicit/hybrid flows | Not in v0.3 contract | Upstream capability does not mean enabled AuthMe behavior |
 | mTLS | Implemented in v0.4 | `tls_client_auth` + `self_signed_tls_client_auth` via trusted proxy; `cnf.x5t#S256` certificate-bound tokens |
 | CIBA | Implemented in v0.4 | Poll mode, confidential clients only; ping/push staged |
-| FAPI | Staged | Library capability requires AuthMe configuration and conformance gates |
+| FAPI 2.0 | Implemented in v0.4, opt-in | AuthMe `fapi_profile: "2.0"` authorization-code clients require PAR, PKCE `S256`, PS256/ES256 JAR/JARM, DPoP or mTLS token binding, and private-key or mTLS client authentication; AuthMe is not certified |
 | Keycloak Admin REST API | Not supported | AuthMe administration is a separate API/model |
 | Upstream OIDC brokering | Implemented baseline | Fixed-provider Authorization Code + PKCE; collision-safe JIT/admin linking; no social presets |
 | SAML 2.0 federation | Implemented SP baseline | SP-initiated signed response/assertion; no encrypted assertions, SLO, IdP-initiated login, or SAML IdP |
@@ -143,6 +143,28 @@ token endpoint as their audience and a durable one-use `jti`. Asymmetric clients
 can register public keys inline with `jwks` or at a constrained HTTPS
 `jwks_uri`. Keycloak deployments using another method, including
 `client_secret_post`, must change the client authentication configuration.
+
+There is no automatic Keycloak-client switch equivalent to AuthMe's FAPI
+marker. A migrated client opts in explicitly with `fapi_profile: "2.0"` and
+must be reconfigured as a confidential authorization-code client with
+`private_key_jwt`, `tls_client_auth`, or `self_signed_tls_client_auth`. It must
+also select exactly one required sender constraint through
+`dpop_bound_access_tokens` or
+`tls_client_certificate_bound_access_tokens`, register PS256/ES256 verification
+keys, use client-authenticated PAR with PKCE `S256` and a signed Request Object,
+and verify PS256/ES256 JARM responses. AuthMe forces the PAR, signed Request
+Object, and `response_mode=jwt` client policy when the marker is present and
+rejects unsupported grants or weak combinations at startup/registration. The
+realm must have a matching PS256/ES256 response-signing key. Clients without the
+marker retain their existing Keycloak-compatible authorization behavior.
+
+The applicable OpenID Foundation plans are the enabled FAPI2SP OP private key
+or MTLS client-authentication combinations crossed with DPoP or MTLS sender
+constraining, FAPI2SP OP OpenID Connect, FAPI2MS OP JAR, and FAPI2MS OP JARM.
+AuthMe makes no certification claim until those plans pass and the exact build
+and deployment are certified. The upstream protocol library's certification is
+not AuthMe certification; FAPI-CIBA, client-credentials, and ecosystem-specific
+profiles remain outside this compatibility contract.
 
 An RFC 8705 client using `tls_client_auth` registers exactly one expected
 certificate subject DN or SAN. A `self_signed_tls_client_auth` client registers

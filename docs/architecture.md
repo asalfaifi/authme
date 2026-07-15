@@ -231,13 +231,66 @@ An authorized resource client that registers `introspection_signed_response_alg:
 
 Only asymmetric algorithms backed by the realm's validated private JWKS are advertised and accepted; `none` is rejected as client metadata. The public JWKS endpoint never returns private parameters. Consumers validate the signature against that realm's JWKS and require the exact issuer, their own client ID as audience, and the expected response type before using claims. Response signing provides integrity and origin authentication; TLS, bearer-token protection, scope/claim filtering, and introspection caller authorization remain mandatory.
 
-Implicit flow, Resource Owner Password Credentials, FAPI profiles, and CIBA ping/push delivery are not part of the v0.3 product contract unless a release explicitly enables and tests them. The OAuth Security Best Current Practice requires authorization servers to support PKCE, requires it for public clients, recommends it for confidential clients, and requires exact redirect URI matching; see [RFC 9700](https://www.rfc-editor.org/rfc/rfc9700.html). PAR is defined by [RFC 9126](https://www.rfc-editor.org/rfc/rfc9126.html), DPoP by [RFC 9449](https://www.rfc-editor.org/rfc/rfc9449.html), and Device Authorization by [RFC 8628](https://www.rfc-editor.org/rfc/rfc8628.html).
+Implicit flow, Resource Owner Password Credentials, and CIBA ping/push delivery are not part of the v0.3 product contract unless a release explicitly enables and tests them. The OAuth Security Best Current Practice requires authorization servers to support PKCE, requires it for public clients, recommends it for confidential clients, and requires exact redirect URI matching; see [RFC 9700](https://www.rfc-editor.org/rfc/rfc9700.html). PAR is defined by [RFC 9126](https://www.rfc-editor.org/rfc/rfc9126.html), DPoP by [RFC 9449](https://www.rfc-editor.org/rfc/rfc9449.html), and Device Authorization by [RFC 8628](https://www.rfc-editor.org/rfc/rfc8628.html).
 
 ### JWT Secured Authorization Response Mode
 
 AuthMe v0.4 supports [JWT Secured Authorization Response Mode (JARM)](https://openid.net/specs/oauth-v2-jarm.html). A client can request `jwt`, `query.jwt`, `fragment.jwt`, or `form_post.jwt`; the authorization endpoint returns the response parameters inside a `response` JWT signed by the realm's provider key. The client's optional `authorization_signed_response_alg` defaults to `RS256` and must be an asymmetric algorithm advertised by the realm; `none` is neither advertised nor accepted. Existing non-JWT response modes remain available.
 
 Clients validate the JARM signature against the realm JWKS and require the exact issuer, their own client ID as audience, and a valid expiration before consuming `code`, `state`, or error claims. JARM protects authorization-response integrity; it does not replace PKCE, exact redirect URI validation, state handling, or TLS.
+
+### FAPI 2.0 Security Profile
+
+AuthMe v0.4 composes its existing protocol controls into an opt-in
+[FAPI 2.0 Security Profile](https://openid.net/specs/fapi-security-profile-2_0.html)
+authorization-code policy. A static or dynamically registered client selects it
+with `fapi_profile: "2.0"`; omission is the safe default and leaves the client on
+the ordinary AuthMe policy. The marker is AuthMe client metadata, not a claim
+that the client or deployment is certified. AuthMe currently rejects the marker
+when the client enables grants other than `authorization_code`; FAPI CIBA,
+client-credentials, and refresh-grant profiles are outside this composed policy.
+
+For a marked client, startup or registration fails unless the client uses
+`private_key_jwt`, `tls_client_auth`, or `self_signed_tls_client_auth` and
+requires exactly one access-token sender constraint:
+`dpop_bound_access_tokens: true` or
+`tls_client_certificate_bound_access_tokens: true`. The mTLS choice additionally
+requires the trusted proxy certificate boundary. Shared-secret and public-client
+authentication are rejected. FAPI `private_key_jwt` assertions use PS256 or
+ES256 and accept only the exact realm issuer as the string `aud` value.
+
+Marked authorization flows require client-authenticated PAR, PKCE `S256`, an
+explicit redirect URI, a PS256/ES256 signed Request Object at PAR, and
+`response_mode=jwt`. Both successful and error authorization responses are
+PS256/ES256 JARM responses. AuthMe forces the per-client PAR and signed-Request-
+Object metadata flags, limits authorization codes to 60 seconds, and relies on
+the provider's durable replay and code-consumption controls. The JAR/JARM
+requirements are the authorization-request and authorization-response portions
+of the [FAPI 2.0 Message Signing Final specification](https://openid.net/specs/fapi-message-signing-2_0-final.html), layered on the Security Profile. A realm serving marked clients must provision a compatible PS256 or ES256 signing key in addition to any key needed by ordinary clients; missing key or client metadata fails provider startup.
+
+Discovery advertises the shared server capabilities—PAR, `S256`, Request Object
+algorithms, JARM response modes and algorithms, DPoP, and the enabled client
+authentication methods. It deliberately does not advertise
+`require_pushed_authorization_requests: true` globally because that would change
+non-FAPI clients; the mandatory policy is stored and enforced on each marked
+client. Non-FAPI client metadata, authorization response modes, authentication,
+and token behavior are unchanged.
+
+The applicable OpenID Foundation authorization-server conformance plans are
+FAPI2SP OP private key + DPoP, FAPI2SP OP private key + MTLS, FAPI2SP OP MTLS +
+DPoP, and FAPI2SP OP MTLS + MTLS for the combinations a deployment enables,
+plus FAPI2SP OP OpenID Connect. Because AuthMe also requires the Message Signing
+extensions, FAPI2MS OP JAR and FAPI2MS OP JARM apply. The Foundation publishes
+these as separate [FAPI 2.0 OP Security Profile Final and Message Signing Final
+profiles](https://openid.net/certification/certified-fapi-2-0-op-security-profile-final-message-signing-final/).
+FAPI-CIBA and client-credentials plans do not apply to this authorization-code
+policy.
+
+AuthMe makes **no FAPI or OpenID certification claim**. Certification requires
+the applicable plans to pass against the exact AuthMe build, routes,
+configuration, keys, proxy, storage adapter, and deployed security boundary,
+followed by the Foundation's certification process. Upstream `oidc-provider`
+certification does not transfer to AuthMe or to an AuthMe deployment.
 
 ## Persistence
 
