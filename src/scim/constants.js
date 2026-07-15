@@ -6,6 +6,8 @@ export const SCIM_URNS = Object.freeze({
   schema: 'urn:ietf:params:scim:schemas:core:2.0:Schema',
   listResponse: 'urn:ietf:params:scim:api:messages:2.0:ListResponse',
   patchOp: 'urn:ietf:params:scim:api:messages:2.0:PatchOp',
+  bulkRequest: 'urn:ietf:params:scim:api:messages:2.0:BulkRequest',
+  bulkResponse: 'urn:ietf:params:scim:api:messages:2.0:BulkResponse',
   error: 'urn:ietf:params:scim:api:messages:2.0:Error',
 });
 
@@ -83,15 +85,15 @@ export const GROUP_SCHEMA = Object.freeze({
   ],
 });
 
-export function serviceProviderConfig(baseUrl, maxResults) {
+export function serviceProviderConfig(baseUrl, { maxResults, maxOperations, maxPayloadSize }) {
   return {
     schemas: [SCIM_URNS.serviceProviderConfig],
     documentationUri: 'https://www.rfc-editor.org/rfc/rfc7644',
     patch: { supported: true },
-    bulk: { supported: false, maxOperations: 0, maxPayloadSize: 0 },
+    bulk: { supported: true, maxOperations, maxPayloadSize },
     filter: { supported: true, maxResults },
     changePassword: { supported: false },
-    sort: { supported: false },
+    sort: { supported: true },
     etag: { supported: true },
     authenticationSchemes: [{
       type: 'oauthbearertoken',

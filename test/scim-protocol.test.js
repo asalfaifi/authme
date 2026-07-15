@@ -254,7 +254,7 @@ test('Groups validate same-realm users and PATCH membership without re-enabling 
 test('invalid filters, bodies, pagination, PATCH paths, and readOnly fields use SCIM errors', async () => {
   const { app } = fixture();
   const scim = client(app);
-  let response = await scim.get('/Users').query({ filter: 'userName co "a"' });
+  let response = await scim.get('/Users').query({ filter: 'userName regex "a"' });
   assert.equal(response.status, 400);
   assert.equal(response.body.scimType, 'invalidFilter');
 

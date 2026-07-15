@@ -8,6 +8,10 @@
  * VERSION_MISMATCH when it loses a race.
  *
  * @typedef {object} ScimRepository
+ * List options contain a validated filter AST, a validated sort descriptor,
+ * and pagination. Repositories MUST apply filtering and sorting before
+ * pagination, use a deterministic id tie-breaker, and preserve realm scope.
+ *
  * @property {(realm:string, options:object) => Promise<{totalResults:number, resources:object[]}>} listUsers
  * @property {(realm:string, id:string) => Promise<object|undefined>} getUser
  * @property {(realm:string, attributes:object) => Promise<object>} createUser
@@ -29,4 +33,4 @@
  * persisted in this record shape.
  */
 
-export const SCIM_REPOSITORY_CONTRACT_VERSION = 1;
+export const SCIM_REPOSITORY_CONTRACT_VERSION = 2;
