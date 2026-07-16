@@ -1,0 +1,7 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Documented non-secret checksum example"
+regexTarget = "match"
+regexes = ['''rotation-\d{4}-\d{2}-\d{2}''']

@@ -270,7 +270,7 @@ The same applies to `runtimeSecret.checksum` and `jwks.checksum`:
 
 ```bash
 helm upgrade authme charts/authme -n authme -f authme-production.yaml \
-  --set-string runtimeSecret.checksum='rotation-2026-07-13'
+  --set-string runtimeSecret.checksum='rotation-v2'
 ```
 
 JWKS rotation needs an overlap window: publish the old and new public keys,
