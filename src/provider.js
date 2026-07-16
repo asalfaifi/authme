@@ -17,6 +17,7 @@ import {
   renderLogoutConfirmation,
   renderLogoutSuccess,
 } from './ui/render.js';
+import { SAML_IDP_BRIDGE_CLIENT_ID } from './federation/saml-idp.js';
 
 // oidc-provider 9.9.1 otherwise defaults every client to signed JWT introspection responses.
 delete oidcClientMetadataDefaults.introspection_signed_response_alg;
@@ -82,6 +83,22 @@ function adminConsoleClient(config) {
   };
 }
 
+function samlIdpBridgeClient(config, realm) {
+  const endpoint = `${config.publicUrl}/realms/${realm}/protocol/saml`;
+  return {
+    client_id: SAML_IDP_BRIDGE_CLIENT_ID,
+    client_name: 'AuthMe SAML identity provider',
+    token_endpoint_auth_method: 'none',
+    redirect_uris: [`${endpoint}/continue`],
+    post_logout_redirect_uris: [`${endpoint}/logout/continue`],
+    response_types: ['code'],
+    grant_types: ['authorization_code'],
+    application_type: 'web',
+    subject_type: 'public',
+    scope: 'openid',
+  };
+}
+
 function developmentClients(realm) {
   return [{
     client_id: 'authme-dev',
@@ -108,11 +125,14 @@ function developmentClients(realm) {
 
 export function configuredClientsForRealm(config, realm) {
   const clients = structuredClone(config.clientsByRealm[realm] ?? []);
-  if (clients.some((client) => client.client_id === ADMIN_CONSOLE_CLIENT_ID)) {
-    throw new Error(`${ADMIN_CONSOLE_CLIENT_ID} is reserved for the built-in administration console`);
+  const reserved = [ADMIN_CONSOLE_CLIENT_ID, SAML_IDP_BRIDGE_CLIENT_ID];
+  const conflict = clients.find((client) => reserved.includes(client.client_id));
+  if (conflict) {
+    throw new Error(`${conflict.client_id} is reserved for a built-in AuthMe client`);
   }
   if (config.devMode && clients.length === 0) clients.push(...developmentClients(realm));
   clients.push(adminConsoleClient(config));
+  if (config.samlIdentityProvidersByRealm?.[realm]) clients.push(samlIdpBridgeClient(config, realm));
   return clients;
 }
 
@@ -389,6 +409,21 @@ export async function createRealmProvider({ realm, config, store, data, Adapter,
     enabledJWA: {
       clientAuthSigningAlgValues: clientAuthSigningAlgorithms,
       requestObjectSigningAlgValues: [...REQUEST_OBJECT_SIGNING_ALGORITHMS],
+    },
+    async loadExistingGrant(ctx) {
+      const grantId = ctx.oidc.result?.consent?.grantId
+        || ctx.oidc.session.grantIdFor(ctx.oidc.client.clientId);
+      if (grantId) return ctx.oidc.provider.Grant.find(grantId);
+      if (ctx.oidc.client.clientId !== SAML_IDP_BRIDGE_CLIENT_ID || !ctx.oidc.session.accountId) {
+        return undefined;
+      }
+      const grant = new ctx.oidc.provider.Grant({
+        accountId: ctx.oidc.session.accountId,
+        clientId: SAML_IDP_BRIDGE_CLIENT_ID,
+      });
+      grant.addOIDCScope('openid');
+      await grant.save();
+      return grant;
     },
     async assertJwtClientAuthClaimsAndHeader(ctx, claims) {
       const validAudience = typeof claims.aud === 'string'

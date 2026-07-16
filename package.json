@@ -32,6 +32,7 @@
     "@node-saml/node-saml": "~5.1.0",
     "@peculiar/x509": "^1.14.3",
     "@simplewebauthn/server": "^13.3.2",
+    "@xmldom/xmldom": "^0.8.13",
     "argon2": "^0.44.0",
     "express": "^5.2.1",
     "helmet": "^8.3.0",
@@ -45,10 +46,11 @@
     "pino-http": "^11.0.0",
     "prom-client": "^15.1.3",
     "rate-limiter-flexible": "^11.2.0",
+    "xml-crypto": "6.1.2",
+    "xml-encryption": "^3.1.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {
-    "supertest": "^7.2.2",
-    "xml-crypto": "~6.1.2"
+    "supertest": "^7.2.2"
   }
 }

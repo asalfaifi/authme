@@ -16,6 +16,7 @@ import { createRealmProvider } from './provider.js';
 import { createAdminRouter } from './routes/admin.js';
 import { createFederationRouter } from './routes/federation.js';
 import { createInteractionRouter } from './routes/interactions.js';
+import { createSamlIdentityProviderRouter } from './routes/saml-idp.js';
 import { createRateLimits } from './security/rate-limit.js';
 import { createWebAuthn } from './security/webauthn.js';
 import { renderError } from './ui/render.js';
@@ -256,6 +257,16 @@ export async function createAuthMeApp(config, overrides = {}) {
     }));
 
     for (const [realm, provider] of providers) {
+      const samlIdentityProvider = identityRuntime.samlIdentityProviderFor?.(realm);
+      if (samlIdentityProvider) {
+        app.use(createSamlIdentityProviderRouter({
+          realm,
+          identityProvider: samlIdentityProvider,
+          provider,
+          store,
+          audit: (event) => store.writeAudit(event),
+        }));
+      }
       app.use(createFederationRouter({
         realm,
         provider,

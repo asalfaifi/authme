@@ -3,7 +3,7 @@ import { isIP } from 'node:net';
 import { z } from 'zod';
 import { parseLdapProviders } from './federation/ldap.js';
 import { parseOidcProviders } from './federation/oidc.js';
-import { parseSamlProviders } from './federation/saml-config.js';
+import { parseSamlIdentityProviders, parseSamlProviders } from './federation/saml-config.js';
 import { parseScimTokens } from './scim/config.js';
 
 const booleanValue = z
@@ -38,6 +38,7 @@ const rawSchema = z.object({
   AUTHME_LDAP_PROVIDERS_JSON: z.string().optional(),
   AUTHME_OIDC_PROVIDERS_JSON: z.string().optional(),
   AUTHME_SAML_PROVIDERS_JSON: z.string().optional(),
+  AUTHME_SAML_IDP_JSON: z.string().optional(),
   AUTHME_SCIM_TOKENS_JSON: z.string().optional(),
   AUTHME_ENABLE_DYNAMIC_REGISTRATION: booleanValue,
   AUTHME_DEV_ADMIN_PASSWORD: z.string().optional(),
@@ -334,6 +335,9 @@ export function loadConfig(environment = process.env) {
     ldapProvidersByRealm: parseLdapProviders(raw.AUTHME_LDAP_PROVIDERS_JSON, { realms, devMode }),
     oidcProvidersByRealm: parseOidcProviders(raw.AUTHME_OIDC_PROVIDERS_JSON, { realms, devMode }),
     samlProvidersByRealm: parseSamlProviders(raw.AUTHME_SAML_PROVIDERS_JSON, { realms, publicUrl: normalizedPublicUrl }),
+    samlIdentityProvidersByRealm: parseSamlIdentityProviders(raw.AUTHME_SAML_IDP_JSON, {
+      realms, publicUrl: normalizedPublicUrl,
+    }),
     scimTokensByRealm: parseScimTokens(raw.AUTHME_SCIM_TOKENS_JSON, { realms, devMode }),
     enableDynamicRegistration: raw.AUTHME_ENABLE_DYNAMIC_REGISTRATION,
     devAdminPassword: raw.AUTHME_DEV_ADMIN_PASSWORD ?? 'AuthMe-Change-Me-Now-2026!',

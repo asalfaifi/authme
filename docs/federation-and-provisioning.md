@@ -1,12 +1,13 @@
 # Federation, directory authentication, and provisioning
 
-AuthMe supports realm-scoped LDAP/Active Directory authentication, upstream OpenID Connect federation, SAML 2.0 service-provider federation, and SCIM 2.0 Users/Groups provisioning. These integrations are disabled until their corresponding JSON configuration contains a provider or token for a realm.
+AuthMe supports realm-scoped LDAP/Active Directory authentication, upstream OpenID Connect federation, SAML 2.0 service-provider federation, SAML 2.0 identity-provider operation, and SCIM 2.0 Users/Groups provisioning. These integrations are disabled until their corresponding JSON configuration contains a provider, IdP registration, or token for a realm.
 
-All four JSON values contain credentials or trust material and belong in the runtime Secret, not the Helm ConfigMap, source control, image, or command-line history:
+All five JSON values contain credentials or trust material and belong in the runtime Secret, not the Helm ConfigMap, source control, image, or command-line history:
 
 - `AUTHME_LDAP_PROVIDERS_JSON`
 - `AUTHME_OIDC_PROVIDERS_JSON`
 - `AUTHME_SAML_PROVIDERS_JSON`
+- `AUTHME_SAML_IDP_JSON`
 - `AUTHME_SCIM_TOKENS_JSON`
 
 Provider IDs are stable identifiers. Do not reuse an ID for a different authority. AuthMe keys external identities by realm, provider ID, canonical issuer, and immutable upstream subject. Matching email addresses or usernames never auto-link accounts; an administrator must explicitly link a collision.
@@ -113,7 +114,62 @@ The ACS is:
 https://auth.example.com/realms/master/federation/builtin.saml-federation/corporate-saml/acs
 ```
 
-SP request/metadata signing can be enabled with `sp_signing_private_key` plus `sp_signing_certificates`. AuthMe currently supports signed SAML responses/assertions, not encrypted assertions, IdP-initiated login, single logout, artifact binding, or operating as a SAML IdP.
+SP request/metadata signing can be enabled with `sp_signing_private_key` plus `sp_signing_certificates`. This upstream-broker role currently does not decrypt assertions or implement IdP-initiated broker login, SLO, or artifact binding. Those limits are distinct from AuthMe's downstream SAML IdP role.
+
+## SAML 2.0 identity provider
+
+Set `AUTHME_SAML_IDP_JSON` to enable AuthMe as an IdP for selected realms. Omission, `{}`, or a missing realm entry disables the IdP. Signing material and every SP registration are validated and frozen at startup. The current signing certificate is the first certificate and must match the private key; additional certificates are published for rollover.
+
+```json
+{
+  "master": {
+    "entity_id": "https://auth.example.com/realms/master/protocol/saml",
+    "signing_private_key": "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----",
+    "signing_certificates": [
+      "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----"
+    ],
+    "service_providers": [{
+      "id": "analytics",
+      "entity_id": "https://analytics.example.com/saml/metadata",
+      "acs_urls": ["https://analytics.example.com/saml/acs"],
+      "slo_url": "https://analytics.example.com/saml/slo",
+      "signing_certificates": [
+        "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----"
+      ],
+      "require_signed_authn_requests": true,
+      "encryption_certificate": "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----",
+      "encrypt_assertions": true,
+      "allow_idp_initiated": false,
+      "name_id_format": "urn:oasis:names:tc:SAML:2.0:nameid-format:persistent",
+      "name_id_source": "persistent",
+      "attribute_mapping": {
+        "uid": "username",
+        "mail": "email",
+        "memberOf": "groups",
+        "roles": "roles"
+      },
+      "authn_context_mapping": {
+        "password": "urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport",
+        "passkey": "urn:authme:ac:classes:WebAuthn",
+        "mfa": "https://refeds.org/profile/mfa"
+      },
+      "authn_context_order": [
+        "urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport",
+        "urn:authme:ac:classes:WebAuthn",
+        "https://refeds.org/profile/mfa"
+      ]
+    }]
+  }
+}
+```
+
+The realm publishes metadata at `/realms/{realm}/protocol/saml/descriptor`; Redirect and POST AuthnRequests use `/realms/{realm}/protocol/saml`. AuthMe requires an explicit `AssertionConsumerServiceURL` and compares it byte-for-byte with `acs_urls`; indexes, wildcard/suffix matching, and request-selected destinations are rejected. `signing_certificates` pins SP request keys. `require_signed_authn_requests` defaults to true when a signing certificate is present. Redirect SLO requires `slo_url` and an SP signing certificate.
+
+Each successful response contains a signed Response and signed Assertion, bearer subject confirmation, exact audience, `NotBefore`/`NotOnOrAfter`, `OneTimeUse`, and `InResponseTo` for SP-initiated requests. `encrypt_assertions` encrypts the already-signed Assertion with AES-256-GCM and RSA-OAEP to the SP certificate. Persistent NameIDs are realm- and SP-pairwise by default; `email` and `username` sources are explicit privacy-sensitive alternatives. Attribute-map keys are outgoing SAML attribute names and values select an allowlisted AuthMe account field.
+
+AuthMe derives `AuthnContextClassRef` from the completed login evidence. Defaults distinguish password, WebAuthn/passkey, MFA, and federated authentication; `authn_context_mapping` overrides those class refs per SP. `authn_context_order` lists contexts from weakest to strongest for `minimum` and `better` comparisons. An exact or ordered `RequestedAuthnContext` that the completed login cannot satisfy is rejected with `no_authn_context`.
+
+IdP-initiated login is available only when `allow_idp_initiated` is true, at `/realms/{realm}/protocol/saml/clients/{id}/login`, and always uses the first registered ACS. Artifact binding, encrypted assertions received by the upstream broker, and POST/SOAP or multi-party SLO are not implemented.
 
 ## Explicit account linking
 
@@ -154,4 +210,4 @@ The current SCIM profile does not implement Bulk, sorting, `/Me`, arbitrary exte
 
 Built-in mechanisms register through the versioned `authme.identity/v1` extension contract as authenticator, federation, or provisioning modules. The registry exposes realm capability discovery and keeps protocol-specific code outside the OIDC core. It is a compile-time trusted-code boundary, not a facility for loading unreviewed JavaScript at runtime.
 
-There is no finite, safe interpretation of “every authentication mechanism.” This release covers passwords, TOTP, recovery codes, WebAuthn/passkeys, LDAP/Active Directory credential validation, OIDC/OAuth federation, SAML federation, and SCIM provisioning. Kerberos/SPNEGO, RADIUS, X.509 authentication, email/SMS OTP and magic links, proprietary social-provider presets, SAML IdP operation, inbound LDAP synchronization, encrypted SAML assertions, and arbitrary runtime plugins remain outside the implemented contract until each receives storage, interaction, threat-model, interoperability, and operational release gates.
+There is no finite, safe interpretation of “every authentication mechanism.” This release covers passwords, TOTP, recovery codes, WebAuthn/passkeys, LDAP/Active Directory credential validation, OIDC/OAuth federation, SAML federation and IdP operation, and SCIM provisioning. Kerberos/SPNEGO, RADIUS, X.509 authentication, email/SMS OTP and magic links, proprietary social-provider presets, inbound LDAP synchronization, upstream-broker assertion decryption, SAML artifact binding, and arbitrary runtime plugins remain outside the implemented contract until each receives storage, interaction, threat-model, interoperability, and operational release gates.
