@@ -9,11 +9,12 @@ import { createIdentityRuntime } from './authentication/runtime.js';
 import { loadRealmJwks } from './crypto/jwks.js';
 import { hashPassword } from './crypto/password.js';
 import { randomToken } from './crypto/secrets.js';
-import { createLogger } from './logging.js';
+import { createLogger, loggableError } from './logging.js';
 import { createMetrics } from './observability/metrics.js';
 import { createAuditWriter } from './observability/audit-writer.js';
 import { createRealmProvider } from './provider.js';
 import { createAdminRouter } from './routes/admin.js';
+import { createAccountConsole } from './routes/account-console.js';
 import { createFederationRouter } from './routes/federation.js';
 import { createInteractionRouter } from './routes/interactions.js';
 import { createSamlIdentityProviderRouter } from './routes/saml-idp.js';
@@ -78,6 +79,19 @@ async function bootstrapDevelopmentUsers(config, store, logger) {
       await store.writeAudit({ realm, type: 'system.development_admin_grant.created', subjectId: user.id });
     }
   }
+}
+
+function developmentAccountEmailSender(config, logger) {
+  if (!config.devMode) return undefined;
+  const log = (kind, message) => logger.warn({
+    realm: message.realm,
+    email: message.email,
+    url: message.url,
+  }, `DEVELOPMENT MODE ONLY: raw ${kind} action link; never expose this log or use this delivery hook in production`);
+  return {
+    sendEmailVerification: (message) => log('email-verification', message),
+    sendPasswordReset: (message) => log('password-reset', message),
+  };
 }
 
 export async function createAuthMeApp(config, overrides = {}) {
@@ -267,6 +281,22 @@ export async function createAuthMeApp(config, overrides = {}) {
           audit: (event) => store.writeAudit(event),
         }));
       }
+      const accountPath = `/realms/${realm}/account`;
+      app.use(accountPath, createAccountConsole({
+        realm,
+        config,
+        store,
+        data,
+        rateLimits,
+        jwks: jwksByRealm.get(realm),
+        webauthn,
+        logger,
+        delivery: overrides.accountEmailSender ?? developmentAccountEmailSender(config, logger),
+        fetch: overrides.fetch,
+      }).router);
+      app.use(accountPath, (_req, res) => res.status(404).type('application/problem+json').json({
+        type: 'about:blank', title: 'Not found', status: 404,
+      }));
       app.use(createFederationRouter({
         realm,
         provider,
@@ -360,7 +390,7 @@ export async function createAuthMeApp(config, overrides = {}) {
     });
     app.use((error, req, res, _next) => {
       const status = Number.isInteger(error.status) && error.status >= 400 && error.status < 600 ? error.status : 500;
-      req.log?.[status >= 500 ? 'error' : 'warn']({ err: error }, 'Request failed');
+      req.log?.[status >= 500 ? 'error' : 'warn']({ error: loggableError(error) }, 'Request failed');
       if (res.headersSent) return res.end();
       if (req.originalUrl.startsWith('/admin/')) {
         return res.status(status).type('application/problem+json').json({

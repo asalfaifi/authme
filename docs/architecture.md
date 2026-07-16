@@ -10,7 +10,7 @@ This document describes the AuthMe v0.3 architecture. In this document:
 
 AuthMe is a standalone, multi-realm OpenID Provider for Node.js 22. It uses [`oidc-provider` 9.9.1](https://oidc-provider.dev/changelog/#_9-9-1-2026-07-07) for standards-sensitive OAuth 2.0 and OpenID Connect behavior rather than implementing those protocols independently. The upstream project is OpenID and FAPI certified and documents its supported specifications in its [official repository](https://github.com/panva/node-oidc-provider#implemented-specs--features). AuthMe still owns its configuration, interaction UI, storage adapter, tenant isolation, operational controls, and conformance testing.
 
-v0.3 is a secure identity foundation with downstream OAuth/OIDC and SAML IdP operation, upstream OIDC and SAML federation, LDAP/AD authentication and synchronization, SCIM provisioning, password/TOTP/passkey credentials, and a realm-scoped administration console. It is not yet a complete replacement for every Keycloak feature. The exact boundary is documented in [keycloak-compatibility.md](keycloak-compatibility.md), [federation-and-provisioning.md](federation-and-provisioning.md), and [roadmap.md](roadmap.md).
+v0.3 is a secure identity foundation with downstream OAuth/OIDC and SAML IdP operation, upstream OIDC and SAML federation, LDAP/AD authentication and synchronization, SCIM provisioning, password/TOTP/passkey credentials, a realm-scoped end-user account console, and a realm-scoped administration console. It is not yet a complete replacement for every Keycloak feature. The exact boundary is documented in [keycloak-compatibility.md](keycloak-compatibility.md), [federation-and-provisioning.md](federation-and-provisioning.md), and [roadmap.md](roadmap.md).
 
 ## Design goals
 
@@ -24,7 +24,7 @@ v0.3 is a secure identity foundation with downstream OAuth/OIDC and SAML IdP ope
 
 ## Explicit non-goals for v0.3
 
-v0.3 does not claim Kerberos/SPNEGO, RADIUS, X.509 login, SAML artifact binding, encrypted assertions at the upstream-SP broker, POST/SOAP or multi-party SAML logout, LDAP server-side change-log controls, configurable authentication flows, Keycloak Admin REST compatibility, a self-service account console, complete mutable realm/client/group/role administration, UMA authorization services, multi-site active/active operation, WebAuthn attestation assurance, imported U2F credentials, or OpenID certification of the AuthMe product. These are staged capabilities.
+v0.3 does not claim Kerberos/SPNEGO, RADIUS, X.509 login, SAML artifact binding, encrypted assertions at the upstream-SP broker, POST/SOAP or multi-party SAML logout, LDAP server-side change-log controls, configurable authentication flows, Keycloak Admin REST compatibility, complete mutable realm/client/group/role administration, generalized required actions/self-registration, passkey loss recovery, WebAuthn attestation assurance, imported U2F credentials, UMA authorization services, multi-site active/active operation, or OpenID certification of the AuthMe product. These are staged capabilities.
 
 ## Runtime topology
 
@@ -94,6 +94,7 @@ The v0.3 compatibility facade exposes these Keycloak-shaped paths:
 /realms/{realm}/protocol/openid-connect/ext/par/request
 /realms/{realm}/protocol/openid-connect/ext/ciba/auth
 /realms/{realm}/clients-registrations/openid-connect
+/realms/{realm}/account/
 ```
 
 The route facade translates public paths to the provider without changing the advertised issuer. The issuer in discovery, ID tokens, access tokens, authorization responses, and introspection data must be identical. OAuth authorization-server metadata and issuer matching are defined by [RFC 8414](https://www.rfc-editor.org/rfc/rfc8414.html); Keycloak's endpoint surface is documented in its [OIDC endpoint guide](https://www.keycloak.org/securing-apps/oidc-layers).
@@ -303,7 +304,8 @@ PostgreSQL is the canonical store for AuthMe configuration and for all `oidc-pro
 - replay-detection records;
 - device codes, CIBA backchannel authentication requests and poll state, pushed authorization requests, DPoP replay records, and dynamic-registration artifacts;
 - client and user data;
-- realm-scoped administrator grants and opaque administration-console sessions;
+- realm-scoped administrator grants plus opaque administration- and account-console sessions;
+- expiring keyed-digest account action tokens for email verification and password reset;
 - realm configuration and signing material metadata;
 - audit and operational events.
 
@@ -367,6 +369,53 @@ client IDs for that audience, so unrelated client assignments are not leaked.
 Possession of a role in the database does not imply that every token receives
 it. Composite roles and configurable protocol mappers are staged.
 
+## End-user account console
+
+Each realm exposes an account console at `/realms/{realm}/account/`. It is a
+separate relying party identified by the reserved `authme-account-console`
+client. The console starts the realm's ordinary AuthMe interaction rather than
+copying password, federation, MFA, or passkey authentication logic. Its
+Authorization Code request uses PKCE `S256`, exact redirect matching, `state`,
+`nonce`, and `max_age`; the server exchanges the code and validates the ID
+token before binding the verified `sub` to an account-console session.
+
+The browser receives a realm-path-scoped random opaque cookie. PostgreSQL
+stores only a domain-separated HMAC digest, the realm/account identifiers,
+authentication methods, account security-version snapshot, source metadata,
+and idle/absolute expiry. The session is unusable if the account is disabled,
+the realm differs, its expiry passes, or a credential/security mutation
+advances the account version. Unsafe account APIs accept JSON only and require
+the exact configured Origin, a session-derived CSRF value, and authentication
+no more than 15 minutes old. Routes never accept a target user identifier:
+profile, credential, and session repositories are called only with the
+authenticated realm and subject. Passkey and session identifiers are resolved
+only within that subject's records; public session references are keyed
+digests rather than provider session IDs.
+
+Safe profile fields can be updated directly. A requested email is not assigned
+until its one-use verification capability is consumed. Email-verification and
+password-reset values contain 256 bits of randomness, expire after 30 minutes,
+and are stored only as realm/type-bound keyed digests. Issuing a new token
+replaces the previous token of that type for the account. Production mail is a
+pluggable injected sender; AuthMe does not embed SMTP or another transport.
+Development mode deliberately logs and returns test capabilities. Forgot-
+password responses retain the same status, fields, and message for present,
+absent, disabled, and malformed account names; the development response also
+returns a same-shaped random token for nonexistent accounts, but only an
+eligible account's digest is stored or delivered. Per-source and opaque
+per-input rate limits bound request and confirmation abuse.
+
+Current-password changes use the existing Argon2id verifier and compare-and-
+set update. TOTP uses the existing encrypted enrollment/confirmation flow;
+recovery codes are regenerated as one-time disclosures and stored only as
+keyed digests. Passkeys reuse the realm WebAuthn policy and durable,
+atomically-consumed challenges. Security changes and their audit record run in
+the account-security mutation boundary, advance the security version, and
+revoke OIDC account artifacts. The console lists only the subject's live OIDC
+and account-console sessions. Revoking an OIDC session also removes grants and
+grant-linked artifacts associated with that provider session; revoking the
+current account-console session clears its cookie.
+
 ## Administration and audit
 
 v0.3 has two deliberately separate administration credentials. Non-browser automation uses the independent, deployment-wide `AUTHME_ADMIN_TOKEN`, which remains root-equivalent for the operator API. The browser console at `/admin/` never receives that token. It authenticates through the reserved `authme-admin-console` OIDC client using Authorization Code, PKCE `S256`, state, nonce, and an exact same-origin callback.
@@ -375,7 +424,7 @@ An OIDC identity is not sufficient by itself: the user must have an enabled dura
 
 The console cookie is a random opaque bearer scoped to `/admin`; only its HMAC digest is stored in PostgreSQL. Its durable record has idle and absolute expiry plus snapshots of the user security version and administrator-grant version. Nodes can therefore authenticate and revoke console sessions without process affinity. Logout deletes the durable record, and account/grant changes make stale records unusable. Unsafe cookie-authenticated calls require the exact public Origin, JSON content type, a session-bound CSRF header, the session realm, the operation's grant permission, and authentication no more than 15 minutes old. Mutating an account that has an administrator grant additionally requires `administrators.manage`.
 
-The console and root bearer share the audited service operations below `/admin/v1`, but root automation is not silently converted into a browser session. The read-only realm configuration catalog returns only explicitly selected client, resource-server, federation, SCIM identifier, extension, storage, and TTL fields; it excludes credentials, tokens, private keys, and deployment secrets. Client configuration remains primarily deployment-owned, and grant CRUD/approvals, complete client/group/role policy editing, organization delegation, and a self-service account console are staged.
+The console and root bearer share the audited service operations below `/admin/v1`, but root automation is not silently converted into a browser session. The read-only realm configuration catalog returns only explicitly selected client, resource-server, federation, SCIM identifier, extension, storage, and TTL fields; it excludes credentials, tokens, private keys, and deployment secrets. Client configuration remains primarily deployment-owned, and grant CRUD/approvals, complete client/group/role policy editing, and organization delegation are staged.
 
 Administrative mutations synchronously write realm-scoped JSON audit records. Account-security changes, session revocation, and deletion commit their audit with the PostgreSQL mutation; user creation, unlock, and TOTP-enrollment start currently audit immediately after mutation, so an audit-storage failure can produce an ambiguous `5xx` that operators must reconcile. High-volume protocol events use a bounded, sampled writer so unauthenticated traffic cannot create an unbounded database waiter queue; dropped/sampled/write-failure outcomes are metrics. PostgreSQL retention cleanup removes audit rows older than the configured window.
 
@@ -401,6 +450,7 @@ The source tree is organized around these responsibilities:
 - **adapter**: map provider models to durable PostgreSQL records;
 - **repositories**: realm, client, user, role, and group persistence;
 - **interactions/UI**: authentication, consent, and user-facing error pages;
+- **account console**: subject-bound OIDC login, profile/credential actions, verified recovery tokens, and self-service session revocation;
 - **administration**: OIDC console login, durable realm grants/sessions, permission checks, safe configuration views, and the root automation API;
 - **routes**: compatibility paths plus health and operational endpoints;
 - **crypto**: key loading and secret handling, never custom primitives;

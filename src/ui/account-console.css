@@ -1,0 +1,45 @@
+:root { font-family: Inter, ui-sans-serif, system-ui, sans-serif; color: #172033; background: #f4f6fb; }
+* { box-sizing: border-box; }
+body { margin: 0; min-height: 100vh; }
+button, input, textarea { font: inherit; }
+a { color: inherit; }
+.account-shell { width: min(1120px, calc(100% - 32px)); margin: 0 auto; padding: 24px 0 64px; }
+.account-brand { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; }
+.account-brand a { text-decoration: none; font-weight: 750; font-size: 1.1rem; }
+.account-brand a span { display: inline-grid; place-items: center; width: 34px; height: 34px; margin-right: 8px; border-radius: 10px; color: white; background: #3157d5; }
+.account-brand small, .fine-print { color: #667085; }
+.account-layout { display: grid; grid-template-columns: 210px minmax(0, 1fr); gap: 28px; align-items: start; }
+.account-nav { position: sticky; top: 20px; display: grid; gap: 5px; }
+.account-nav a, .link-button { padding: 10px 12px; border: 0; border-radius: 8px; background: transparent; text-align: left; text-decoration: none; color: #344054; cursor: pointer; }
+.account-nav a:hover, .link-button:hover { background: #e8ecf8; }
+.account-content { display: grid; gap: 20px; }
+.account-card { padding: 24px; border: 1px solid #d9dfeb; border-radius: 16px; background: white; box-shadow: 0 12px 32px rgb(25 39 77 / 6%); }
+.account-login { width: min(520px, 100%); margin: 8vh auto 0; }
+h1 { margin: 6px 0 10px; font-size: clamp(1.8rem, 4vw, 2.5rem); }
+h2 { margin: 0 0 16px; }
+.eyebrow { margin: 0; color: #3157d5; text-transform: uppercase; letter-spacing: .1em; font-size: .75rem; font-weight: 800; }
+.stack, .form-grid { display: grid; gap: 14px; }
+.form-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.form-grid button, .form-grid .status { grid-column: 1 / -1; }
+label { display: grid; gap: 6px; font-weight: 650; color: #344054; }
+input, textarea { width: 100%; padding: 10px 12px; border: 1px solid #b8c2d5; border-radius: 8px; color: inherit; background: white; }
+textarea { min-height: 72px; resize: vertical; }
+button { border-radius: 8px; border: 1px solid transparent; padding: 10px 14px; font-weight: 700; cursor: pointer; }
+button:disabled { opacity: .55; cursor: wait; }
+.primary { color: white; background: #3157d5; }
+.secondary { color: #263b78; border-color: #b7c3e5; background: #f5f7ff; }
+.danger { color: #9d1c28; border-color: #efb4ba; background: #fff5f5; }
+.button-row, .inline-form { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; margin: 12px 0; }
+.inline-form label { flex: 1 1 220px; }
+.alert { padding: 12px; margin: 12px 0; border-radius: 8px; color: #8a1c25; background: #fff0f1; }
+.status { min-height: 1.4em; color: #526078; overflow-wrap: anywhere; }
+.secret-panel { padding: 14px; margin: 14px 0; border-radius: 10px; background: #f5f7fb; }
+.secret-panel code { display: block; padding: 10px 0; overflow-wrap: anywhere; }
+.recovery-codes { padding: 14px; border-radius: 10px; white-space: pre-wrap; background: #172033; color: #f8fafc; }
+.item-list { display: grid; gap: 10px; padding: 0; list-style: none; }
+.item-list li { display: flex; justify-content: space-between; gap: 14px; align-items: center; padding: 12px; border: 1px solid #e1e6ef; border-radius: 10px; }
+.item-list small { display: block; margin-top: 3px; color: #667085; }
+details { margin-top: 24px; }
+details form { margin-top: 14px; }
+@media (max-width: 760px) { .account-layout { grid-template-columns: 1fr; } .account-nav { position: static; grid-template-columns: repeat(3, 1fr); } .form-grid { grid-template-columns: 1fr; } }
+@media (prefers-color-scheme: dark) { :root { color: #edf2ff; background: #111727; } .account-card { border-color: #34405a; background: #1b2437; } input, textarea { color: #edf2ff; border-color: #53617b; background: #111827; } .account-brand small, .fine-print, .status, .item-list small { color: #aeb9ce; } .account-nav a, .link-button, label { color: #d8e0f0; } .account-nav a:hover, .link-button:hover, .secret-panel { background: #263149; } }

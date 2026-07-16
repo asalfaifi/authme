@@ -102,6 +102,54 @@ function normalizeAdminSession(input) {
   };
 }
 
+function normalizeAccountSession(input) {
+  if (!/^[A-Za-z0-9_-]{43}$/.test(input.idDigest ?? '')) throw new TypeError('Account session digest is invalid');
+  const securityVersion = Number(input.securityVersion);
+  if (!Number.isSafeInteger(securityVersion) || securityVersion < 0) {
+    throw new TypeError('Account session version snapshot is invalid');
+  }
+  const expiresAt = new Date(input.expiresAt);
+  const idleExpiresAt = new Date(input.idleExpiresAt);
+  if (!Number.isFinite(expiresAt.getTime()) || !Number.isFinite(idleExpiresAt.getTime())) {
+    throw new TypeError('Account session expiry is invalid');
+  }
+  return {
+    idDigest: input.idDigest,
+    realm: input.realm,
+    userId: input.userId,
+    securityVersion,
+    authenticationMethods: [...new Set(input.authenticationMethods ?? [])],
+    createdAt: input.createdAt ?? nowIso(),
+    lastSeenAt: input.lastSeenAt ?? nowIso(),
+    idleExpiresAt: idleExpiresAt.toISOString(),
+    expiresAt: expiresAt.toISOString(),
+    ip: input.ip ?? null,
+    userAgent: input.userAgent ?? null,
+  };
+}
+
+const accountActionTypes = new Set(['email-verification', 'password-reset']);
+
+function normalizeAccountActionToken(input) {
+  if (!/^[A-Za-z0-9_-]{43}$/.test(input.tokenDigest ?? '')) throw new TypeError('Account action token digest is invalid');
+  if (!accountActionTypes.has(input.type)) throw new TypeError('Account action token type is invalid');
+  const expiresAt = new Date(input.expiresAt);
+  if (!Number.isFinite(expiresAt.getTime())) throw new TypeError('Account action token expiry is invalid');
+  const email = input.email == null ? null : String(input.email).trim().toLowerCase();
+  if ((input.type === 'email-verification') !== Boolean(email)) {
+    throw new TypeError('Account action token email context is invalid');
+  }
+  return {
+    tokenDigest: input.tokenDigest,
+    realm: input.realm,
+    userId: input.userId,
+    type: input.type,
+    email,
+    expiresAt: expiresAt.toISOString(),
+    createdAt: input.createdAt ?? nowIso(),
+  };
+}
+
 function rowToWebAuthnCredential(row) {
   if (!row) return null;
   return normalizeWebAuthnCredential({
@@ -137,6 +185,36 @@ function rowToWebAuthnChallenge(row) {
   };
 }
 
+function rowToAccountSession(row) {
+  if (!row) return null;
+  return normalizeAccountSession({
+    idDigest: row.id_digest,
+    realm: row.realm_name,
+    userId: row.user_id,
+    securityVersion: row.security_version,
+    authenticationMethods: row.authentication_methods,
+    createdAt: row.created_at?.toISOString?.() ?? row.created_at,
+    lastSeenAt: row.last_seen_at?.toISOString?.() ?? row.last_seen_at,
+    idleExpiresAt: row.idle_expires_at?.toISOString?.() ?? row.idle_expires_at,
+    expiresAt: row.expires_at?.toISOString?.() ?? row.expires_at,
+    ip: row.ip_address,
+    userAgent: row.user_agent,
+  });
+}
+
+function rowToAccountActionToken(row) {
+  if (!row) return null;
+  return normalizeAccountActionToken({
+    tokenDigest: row.token_digest,
+    realm: row.realm_name,
+    userId: row.user_id,
+    type: row.token_type,
+    email: row.target_email,
+    expiresAt: row.expires_at?.toISOString?.() ?? row.expires_at,
+    createdAt: row.created_at?.toISOString?.() ?? row.created_at,
+  });
+}
+
 export function publicUser(user) {
   if (!user) return null;
   const {
@@ -151,6 +229,8 @@ export class MemoryIdentityStore {
   #users = new Map();
   #adminGrants = new Map();
   #adminSessions = new Map();
+  #accountSessions = new Map();
+  #accountActionTokens = new Map();
   #audit = [];
   #webauthnCredentials = new Map();
   #webauthnChallenges = new Map();
@@ -273,6 +353,12 @@ export class MemoryIdentityStore {
     for (const [digest, session] of this.#adminSessions) {
       if (session.realm === realm && session.userId === id) this.#adminSessions.delete(digest);
     }
+    for (const [digest, session] of this.#accountSessions) {
+      if (session.realm === realm && session.userId === id) this.#accountSessions.delete(digest);
+    }
+    for (const [key, token] of this.#accountActionTokens) {
+      if (token.realm === realm && token.userId === id) this.#accountActionTokens.delete(key);
+    }
     for (const [credentialKey, credential] of this.#webauthnCredentials) {
       if (credential.realm === realm && credential.userId === id) this.#webauthnCredentials.delete(credentialKey);
     }
@@ -352,6 +438,84 @@ export class MemoryIdentityStore {
       if (deleted >= limit) break;
       if (new Date(session.expiresAt).getTime() <= now || new Date(session.idleExpiresAt).getTime() <= now) {
         this.#adminSessions.delete(digest);
+        deleted += 1;
+      }
+    }
+    return deleted;
+  }
+
+  async createAccountSession(input) {
+    const session = normalizeAccountSession(input);
+    if (!this.#users.has(`${session.realm}:${session.userId}`) || this.#accountSessions.has(session.idDigest)) return null;
+    this.#accountSessions.set(session.idDigest, structuredClone(session));
+    return structuredClone(session);
+  }
+
+  async findAccountSession(idDigest) {
+    const session = this.#accountSessions.get(idDigest);
+    return session ? structuredClone(session) : null;
+  }
+
+  async listAccountSessions(realm, userId) {
+    return [...this.#accountSessions.values()]
+      .filter((session) => session.realm === realm && session.userId === userId)
+      .sort((left, right) => right.lastSeenAt.localeCompare(left.lastSeenAt))
+      .map((session) => structuredClone(session));
+  }
+
+  async touchAccountSession(idDigest, idleExpiresAt) {
+    const session = this.#accountSessions.get(idDigest);
+    if (!session) return null;
+    session.lastSeenAt = nowIso();
+    session.idleExpiresAt = new Date(idleExpiresAt).toISOString();
+    return structuredClone(session);
+  }
+
+  async deleteAccountSession(idDigest) {
+    return this.#accountSessions.delete(idDigest);
+  }
+
+  async cleanupExpiredAccountSessions(limit = 1000) {
+    let deleted = 0;
+    const now = Date.now();
+    for (const [digest, session] of this.#accountSessions) {
+      if (deleted >= limit) break;
+      if (new Date(session.expiresAt).getTime() <= now || new Date(session.idleExpiresAt).getTime() <= now) {
+        this.#accountSessions.delete(digest);
+        deleted += 1;
+      }
+    }
+    return deleted;
+  }
+
+  async createAccountActionToken(input) {
+    const token = normalizeAccountActionToken(input);
+    if (!this.#users.has(`${token.realm}:${token.userId}`)) return null;
+    for (const [key, existing] of this.#accountActionTokens) {
+      if (existing.realm === token.realm && existing.userId === token.userId && existing.type === token.type) {
+        this.#accountActionTokens.delete(key);
+      }
+    }
+    const key = `${token.realm}:${token.tokenDigest}`;
+    this.#accountActionTokens.set(key, structuredClone(token));
+    return structuredClone(token);
+  }
+
+  async consumeAccountActionToken({ realm, tokenDigest, type }) {
+    const key = `${realm}:${tokenDigest}`;
+    const token = this.#accountActionTokens.get(key);
+    if (!token || token.type !== type) return null;
+    this.#accountActionTokens.delete(key);
+    if (new Date(token.expiresAt).getTime() <= Date.now()) return null;
+    return structuredClone(token);
+  }
+
+  async cleanupExpiredAccountActionTokens(limit = 1000) {
+    let deleted = 0;
+    for (const [key, token] of this.#accountActionTokens) {
+      if (deleted >= limit) break;
+      if (new Date(token.expiresAt).getTime() <= Date.now()) {
+        this.#accountActionTokens.delete(key);
         deleted += 1;
       }
     }
@@ -752,6 +916,103 @@ export class PostgresIdentityStore {
          WHERE expires_at<=CURRENT_TIMESTAMP OR idle_expires_at<=CURRENT_TIMESTAMP
          ORDER BY LEAST(expires_at, idle_expires_at)
          FOR UPDATE SKIP LOCKED LIMIT $1
+       )`,
+      [limit],
+    );
+    return result.rowCount;
+  }
+
+  async createAccountSession(input) {
+    const session = normalizeAccountSession(input);
+    const ip = isIP(String(session.ip ?? '')) ? String(session.ip) : null;
+    const result = await this.pool.query(
+      `INSERT INTO account_sessions
+        (id_digest, realm_name, user_id, security_version, authentication_methods,
+         created_at, last_seen_at, idle_expires_at, expires_at, ip_address, user_agent)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+       ON CONFLICT (id_digest) DO NOTHING
+       RETURNING *`,
+      [session.idDigest, session.realm, session.userId, session.securityVersion,
+        session.authenticationMethods, session.createdAt, session.lastSeenAt,
+        session.idleExpiresAt, session.expiresAt, ip, session.userAgent],
+    );
+    return rowToAccountSession(result.rows[0]);
+  }
+
+  async findAccountSession(idDigest) {
+    const result = await this.pool.query('SELECT * FROM account_sessions WHERE id_digest=$1', [idDigest]);
+    return rowToAccountSession(result.rows[0]);
+  }
+
+  async listAccountSessions(realm, userId) {
+    const result = await this.pool.query(
+      `SELECT * FROM account_sessions
+       WHERE realm_name=$1 AND user_id=$2
+         AND expires_at>CURRENT_TIMESTAMP AND idle_expires_at>CURRENT_TIMESTAMP
+       ORDER BY last_seen_at DESC`,
+      [realm, userId],
+    );
+    return result.rows.map(rowToAccountSession);
+  }
+
+  async touchAccountSession(idDigest, idleExpiresAt) {
+    const result = await this.pool.query(
+      `UPDATE account_sessions SET last_seen_at=CURRENT_TIMESTAMP, idle_expires_at=$2
+       WHERE id_digest=$1 AND expires_at>CURRENT_TIMESTAMP AND idle_expires_at>CURRENT_TIMESTAMP
+       RETURNING *`,
+      [idDigest, idleExpiresAt],
+    );
+    return rowToAccountSession(result.rows[0]);
+  }
+
+  async deleteAccountSession(idDigest) {
+    const result = await this.pool.query('DELETE FROM account_sessions WHERE id_digest=$1', [idDigest]);
+    return result.rowCount === 1;
+  }
+
+  async cleanupExpiredAccountSessions(limit = 1000) {
+    const result = await this.pool.query(
+      `DELETE FROM account_sessions WHERE id_digest IN (
+         SELECT id_digest FROM account_sessions
+         WHERE expires_at<=CURRENT_TIMESTAMP OR idle_expires_at<=CURRENT_TIMESTAMP
+         ORDER BY LEAST(expires_at, idle_expires_at)
+         FOR UPDATE SKIP LOCKED LIMIT $1
+       )`,
+      [limit],
+    );
+    return result.rowCount;
+  }
+
+  async createAccountActionToken(input) {
+    const token = normalizeAccountActionToken(input);
+    const result = await this.pool.query(
+      `INSERT INTO account_action_tokens
+        (realm_name, token_digest, user_id, token_type, target_email, expires_at, created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)
+       ON CONFLICT (realm_name, token_type, user_id) DO UPDATE
+         SET token_digest=EXCLUDED.token_digest, target_email=EXCLUDED.target_email,
+             expires_at=EXCLUDED.expires_at, created_at=EXCLUDED.created_at
+       RETURNING *`,
+      [token.realm, token.tokenDigest, token.userId, token.type, token.email, token.expiresAt, token.createdAt],
+    );
+    return rowToAccountActionToken(result.rows[0]);
+  }
+
+  async consumeAccountActionToken({ realm, tokenDigest, type }) {
+    const result = await this.pool.query(
+      `DELETE FROM account_action_tokens
+       WHERE realm_name=$1 AND token_digest=$2 AND token_type=$3 AND expires_at>CURRENT_TIMESTAMP
+       RETURNING *`,
+      [realm, tokenDigest, type],
+    );
+    return rowToAccountActionToken(result.rows[0]);
+  }
+
+  async cleanupExpiredAccountActionTokens(limit = 1000) {
+    const result = await this.pool.query(
+      `DELETE FROM account_action_tokens WHERE ctid IN (
+         SELECT ctid FROM account_action_tokens WHERE expires_at<=CURRENT_TIMESTAMP
+         ORDER BY expires_at FOR UPDATE SKIP LOCKED LIMIT $1
        )`,
       [limit],
     );

@@ -69,6 +69,10 @@ The upstream [`oidc-provider`](https://github.com/panva/node-oidc-provider#imple
 ### Implemented product contract
 
 - User-verified WebAuthn/passkey registration and passwordless login with durable challenges/counters.
+- A realm-scoped self-service account console at `/realms/{realm}/account/`, authenticated through the reserved `authme-account-console` OIDC client with Authorization Code, PKCE, state, nonce, and recent authentication.
+- Self-service safe-profile editing, current-password-protected Argon2id password changes, verified email changes, and enumeration-safe rate-limited password reset. Email and reset capabilities are expiring, one-use, and stored only as keyed digests; production delivery is an injected integration rather than a built-in mail transport.
+- Self-service TOTP enrollment/replacement/removal, one-time recovery-code regeneration, passkey registration/list/removal, and active account/OIDC session listing and revocation. Every operation is bound to the authenticated subject and issuer realm and emits security audit events.
+- Opaque account-console cookies with digest-only durable storage, idle and absolute expiration, account-security-version binding, exact-origin/JSON/CSRF enforcement, and no browser storage of protocol or administration tokens.
 - Versioned, realm-aware trusted identity-extension registry.
 - LDAP/Active Directory credential authentication over LDAPS/StartTLS with mapping and opt-in JIT.
 - Upstream OIDC brokering with Authorization Code + PKCE and strict issuer/callback/token validation.
@@ -79,9 +83,9 @@ The upstream [`oidc-provider`](https://github.com/panva/node-oidc-provider#imple
 
 ### Staged scope
 
-- Complete mutable realm/client/group/role policy administration and a self-service account console; the v0.3 operator console already covers user, credential, session, federation, registration, and audit operations.
-- Self-registration policy, verified email, password reset, required actions, account console, and end-user session/device management.
-- Self-service passkey enrollment, replacement, loss/recovery policy, attestation governance, and migration tooling around the implemented admin-managed passkey baseline.
+- Complete mutable realm/client/group/role policy administration; the v0.3 operator console already covers user, credential, session, federation, registration, and audit operations.
+- Self-registration policy and generalized required-action workflows beyond the implemented email-verification and password-reset actions.
+- Passkey loss/recovery policy, attestation governance, imported credential support, and migration tooling around the implemented administrator and self-service passkey baseline.
 - General client-configurable step-up authentication and `acr`/`amr`/`max_age` policy beyond the v0.3 console's fixed recent-LoA2 production requirement.
 - Nested groups, composite roles, reusable client scopes, and configurable claim mappers.
 - Offline access/session policy and richer revocation controls.

@@ -170,6 +170,40 @@ export function revokeMemoryAccount(realm, accountId) {
   return deleted;
 }
 
+export function listMemoryAccountSessions(realm, accountId) {
+  const sessions = [];
+  for (const [id, record] of bucket(realm, 'Session')) {
+    const live = current(record);
+    if (!live || live.payload.accountId !== accountId) continue;
+    const authorizations = live.payload.authorizations;
+    sessions.push({
+      id,
+      createdAt: Number.isFinite(live.payload.iat) ? new Date(live.payload.iat * 1000).toISOString() : null,
+      lastSeenAt: Number.isFinite(live.payload.touched) ? new Date(live.payload.touched * 1000).toISOString() : null,
+      expiresAt: live.expiresAt == null ? null : new Date(live.expiresAt).toISOString(),
+      clientIds: authorizations && typeof authorizations === 'object' ? Object.keys(authorizations) : [],
+    });
+  }
+  return structuredClone(sessions);
+}
+
+export function revokeMemorySession(realm, accountId, sessionId) {
+  const sessions = bucket(realm, 'Session');
+  const target = current(sessions.get(sessionId));
+  if (!target || target.payload.accountId !== accountId) return false;
+  const grantIds = new Set(Object.values(target.payload.authorizations ?? {}).filter((value) => typeof value === 'string'));
+  sessions.delete(sessionId);
+  const prefix = `${realm}\u0000`;
+  for (const [key, records] of stores) {
+    if (!key.startsWith(prefix)) continue;
+    const model = key.slice(prefix.length);
+    for (const [id, record] of records) {
+      if ((model === 'Grant' && grantIds.has(id)) || grantIds.has(record.payload.grantId)) records.delete(id);
+    }
+  }
+  return true;
+}
+
 export function claimMemoryInitialAccessToken(realm, id) {
   const record = current(bucket(realm, 'InitialAccessToken').get(id));
   if (!record || record.payload.consumed) return false;
