@@ -2,6 +2,7 @@ import { createIdentityExtensionRegistry } from './registry.js';
 import { createLdapExtension } from '../federation/ldap.js';
 import { createOidcFederationExtension } from '../federation/oidc.js';
 import { createSamlFederationExtension } from '../federation/saml-broker.js';
+import { createSamlIdentityProvider } from '../federation/saml-idp.js';
 import { createAdapterSamlReplayCache } from '../federation/saml-replay-cache.js';
 import { createAdapterFederationStateStore } from '../federation/state-store.js';
 import {
@@ -31,6 +32,19 @@ export function createIdentityRuntime({ config, data, store, disabledPasswordHas
     providersByRealm: config.samlProvidersByRealm,
     replayCacheFor: (realm) => createAdapterSamlReplayCache(data.adapterFor(realm)),
   });
+  const samlIdentityProviders = new Map();
+  for (const [realm, configuration] of Object.entries(config.samlIdentityProvidersByRealm ?? {})) {
+    if (!configuration) continue;
+    samlIdentityProviders.set(realm, createSamlIdentityProvider({
+      realm,
+      configuration,
+      replayCache: createAdapterSamlReplayCache(data.adapterFor(realm)),
+      subjectSalt: config.subjectSalt,
+      oidcAuthorizationUrl: `${config.publicUrl}/realms/${realm}/protocol/openid-connect/auth`,
+      oidcLogoutUrl: `${config.publicUrl}/realms/${realm}/protocol/openid-connect/logout`,
+      sessionTtlMs: Math.min(config.sessionTtl * 1000, 24 * 60 * 60 * 1000),
+    }));
+  }
   let scimRepository = null;
   if (anyEnabled(config.scimTokensByRealm)) {
     if (!data.pool) throw new Error('SCIM provisioning requires PostgreSQL, including in development mode');
@@ -62,6 +76,7 @@ export function createIdentityRuntime({ config, data, store, disabledPasswordHas
     ldap,
     oidc,
     saml,
+    samlIdentityProviderFor: (realm) => samlIdentityProviders.get(realm),
     scim,
     federationEntriesFor(realm) {
       return registry.forRealm('federation', realm);

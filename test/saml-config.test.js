@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { parseSamlProviders } from '../src/federation/saml-config.js';
+import { parseSamlIdentityProviders, parseSamlProviders } from '../src/federation/saml-config.js';
 
 const certificate = `-----BEGIN CERTIFICATE-----\n${'A'.repeat(128)}\n-----END CERTIFICATE-----`;
 
@@ -44,4 +44,13 @@ test('SAML provider configuration fails closed for HTTP, partial signing keys, a
   assert.throws(() => parseSamlProviders(input(), {
     realms: ['staff'], publicUrl: 'https://reader:secret@login.example.test',
   }), /HTTPS AUTHME_PUBLIC_URL origin/);
+});
+
+test('SAML IdP configuration is disabled safely without requiring a production origin', () => {
+  assert.deepEqual(parseSamlIdentityProviders(undefined, {
+    realms: ['master'], publicUrl: 'http://127.0.0.1:3000',
+  }), { master: null });
+  assert.deepEqual(parseSamlIdentityProviders('{}', {
+    realms: ['master'], publicUrl: 'http://127.0.0.1:3000',
+  }), { master: null });
 });

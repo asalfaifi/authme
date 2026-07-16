@@ -113,11 +113,12 @@ The upstream [`oidc-provider`](https://github.com/panva/node-oidc-provider#imple
 - Exact-origin, JSON content-type, CSRF, realm-binding, and per-permission enforcement for unsafe authenticated console API operations.
 - A deployment-root bearer for automation under `/admin/v1`, kept separate from the console's OIDC login, cookie, and realm grants.
 - A read-only, allowlisted realm configuration catalog that exposes operator-safe policy and capability metadata without secrets, key material, credential hashes, or bootstrap tokens.
+- Realm-scoped SAML 2.0 IdP operation with published metadata, HTTP-Redirect and HTTP-POST AuthnRequests, exact registered ACS enforcement, AuthMe login/session reuse, signed Responses and Assertions, audience/time/one-use/request correlation, optional per-SP assertion encryption, opt-in IdP-initiated login, and signed SP-initiated redirect SLO.
 
 ### Staged scope
 
 - Curated social-provider templates and advanced upstream OIDC discovery/governance around the v0.2 broker.
-- SAML IdP operation, encrypted assertions, artifact binding, IdP-initiated login, and single logout around the v0.2 SP baseline.
+- SAML artifact binding, encrypted assertions received by AuthMe's upstream-SP broker, and POST/SOAP or multi-party logout beyond the implemented SAML IdP redirect-SLO baseline.
 - SCIM Bulk, sorting, arbitrary extensions, fine-grained token scopes, and full filtering around the v0.2 Users/Groups baseline.
 - Organizations within realms: domains, invitations, memberships, organization-specific IdPs, and token context.
 - Approval-backed administrator-grant lifecycle and organization-level delegation beyond the implemented realm permission model.

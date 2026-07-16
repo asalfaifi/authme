@@ -48,7 +48,7 @@ Keycloak's current feature inventory includes OIDC/OAuth, SAML, identity brokeri
 | FAPI 2.0 | Implemented in v0.4, opt-in | AuthMe `fapi_profile: "2.0"` authorization-code clients require PAR, PKCE `S256`, PS256/ES256 JAR/JARM, DPoP or mTLS token binding, and private-key or mTLS client authentication; AuthMe is not certified |
 | Keycloak Admin REST API | Not supported | AuthMe administration is a separate API/model |
 | Upstream OIDC brokering | Implemented baseline | Fixed-provider Authorization Code + PKCE; collision-safe JIT/admin linking; no social presets |
-| SAML 2.0 federation | Implemented SP baseline | SP-initiated signed response/assertion; no encrypted assertions, SLO, IdP-initiated login, or SAML IdP |
+| SAML 2.0 | Implemented SP and IdP baselines | Upstream SP federation plus downstream IdP metadata, Redirect/POST login, signed Response/Assertion, optional outgoing assertion encryption, opt-in IdP initiation, and redirect SLO; no artifact binding or broker-side decryption |
 | LDAP/Active Directory | Implemented authentication baseline | LDAPS/StartTLS credential validation and mapping; no synchronization or Kerberos |
 | SCIM 2.0 | Implemented core baseline | Users/Groups CRUD/PATCH, discovery, core `eq`, pagination, ETags; no Bulk/full filters/extensions |
 | Kerberos/SPNEGO | Not supported | No v0.3 implementation |
@@ -215,7 +215,7 @@ Applications must discover endpoints from the issuer rather than concatenate und
 
 The following require staged implementations and separate compatibility specifications:
 
-- SAML IdP operation, IdP-initiated login, encrypted assertions, artifact binding, and single logout;
+- SAML artifact binding, encrypted assertions received by the upstream broker, and POST/SOAP or multi-party logout beyond the implemented IdP baseline;
 - LDAP/Active Directory synchronization and Kerberos/SPNEGO;
 - curated social identity-provider presets and arbitrary broker plugins; upstream OIDC and SAML federation are implemented baselines;
 - Keycloak Admin REST and `kcadm` compatibility;
