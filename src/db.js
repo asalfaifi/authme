@@ -1,5 +1,11 @@
 import pg from 'pg';
-import { claimMemoryInitialAccessToken, createMemoryAdapter, revokeMemoryAccount } from './adapters/memory.js';
+import {
+  claimMemoryInitialAccessToken,
+  createMemoryAdapter,
+  listMemoryAccountSessions,
+  revokeMemoryAccount,
+  revokeMemorySession,
+} from './adapters/memory.js';
 import { createPostgresAdapter } from './adapters/postgres.js';
 import { verifyMigrationState } from './migrations.js';
 import { MemoryIdentityStore, PostgresIdentityStore } from './repositories/identity-store.js';
@@ -45,6 +51,10 @@ export async function createDataLayer(config) {
       }),
       async claimInitialAccessToken(realm, id) { return claimMemoryInitialAccessToken(realm, id); },
       async revokeAccount(realm, accountId) { return revokeMemoryAccount(realm, accountId); },
+      async listOidcSessions(realm, accountId) { return listMemoryAccountSessions(realm, accountId); },
+      async revokeOidcSession(realm, accountId, sessionId) {
+        return revokeMemorySession(realm, accountId, sessionId);
+      },
       async deleteAccount(realm, accountId, auditEvent) {
         const credentials = await store.listWebAuthnCredentials(realm, accountId);
         const adminGrant = await store.findAdminGrant(realm, accountId);
@@ -80,7 +90,9 @@ export async function createDataLayer(config) {
       },
       async cleanupExpired(limit = 1000) {
         return await store.cleanupExpiredWebAuthnChallenges(limit)
-          + await store.cleanupExpiredAdminSessions(limit);
+          + await store.cleanupExpiredAdminSessions(limit)
+          + await store.cleanupExpiredAccountSessions(limit)
+          + await store.cleanupExpiredAccountActionTokens(limit);
       },
       async cleanupAudit() { return 0; },
       async close() { await store.close(); },
@@ -126,6 +138,68 @@ export async function createDataLayer(config) {
     async revokeAccount(realm, accountId) {
       const result = await pool.query(revokeAccountSql, [realm, accountId]);
       return result.rowCount;
+    },
+    async listOidcSessions(realm, accountId) {
+      const result = await pool.query(
+        `SELECT id, payload, created_at, updated_at, expires_at
+         FROM oidc_records
+         WHERE realm_name=$1 AND model='Session'
+           AND payload->>'accountId'=$2
+           AND (expires_at IS NULL OR expires_at>CURRENT_TIMESTAMP)
+           AND EXISTS (
+             SELECT 1 FROM users
+             WHERE users.realm_name=oidc_records.realm_name
+               AND users.id=(oidc_records.payload->>'accountId')::uuid
+               AND users.enabled
+               AND users.security_version=oidc_records.account_security_version
+           )
+         ORDER BY updated_at DESC`,
+        [realm, accountId],
+      );
+      return result.rows.map((row) => ({
+        id: row.id,
+        createdAt: row.created_at?.toISOString?.() ?? row.created_at,
+        lastSeenAt: row.updated_at?.toISOString?.() ?? row.updated_at,
+        expiresAt: row.expires_at?.toISOString?.() ?? row.expires_at,
+        clientIds: row.payload?.authorizations && typeof row.payload.authorizations === 'object'
+          ? Object.keys(row.payload.authorizations)
+          : [],
+      }));
+    },
+    async revokeOidcSession(realm, accountId, sessionId) {
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const target = await client.query(
+          `SELECT payload FROM oidc_records
+           WHERE realm_name=$1 AND model='Session' AND id=$2
+             AND payload->>'accountId'=$3
+           FOR UPDATE`,
+          [realm, sessionId, accountId],
+        );
+        if (target.rowCount !== 1) {
+          await client.query('ROLLBACK');
+          return false;
+        }
+        const grantIds = Object.values(target.rows[0].payload?.authorizations ?? {})
+          .filter((value) => typeof value === 'string');
+        await client.query(
+          `DELETE FROM oidc_records
+           WHERE realm_name=$1 AND (
+             (model='Session' AND id=$2)
+             OR (model='Grant' AND id=ANY($3::text[]))
+             OR grant_id=ANY($3::text[])
+           )`,
+          [realm, sessionId, grantIds],
+        );
+        await client.query('COMMIT');
+        return true;
+      } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw error;
+      } finally {
+        client.release();
+      }
     },
     async deleteAccount(realm, accountId, auditEvent) {
       const client = await pool.connect();
@@ -198,7 +272,9 @@ export async function createDataLayer(config) {
       );
       return oidc.rowCount
         + await store.cleanupExpiredWebAuthnChallenges(limit)
-        + await store.cleanupExpiredAdminSessions(limit);
+        + await store.cleanupExpiredAdminSessions(limit)
+        + await store.cleanupExpiredAccountSessions(limit)
+        + await store.cleanupExpiredAccountActionTokens(limit);
     },
     async cleanupAudit(retentionDays, limit = 1000) {
       const result = await pool.query(

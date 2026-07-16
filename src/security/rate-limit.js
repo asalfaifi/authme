@@ -18,6 +18,9 @@ export function createRateLimits(config, logger) {
   const loginIp = limiter(redis, { keyPrefix: 'authme:login:ip', points: 20, duration: 60, blockDuration: 60 });
   const loginAccount = limiter(redis, { keyPrefix: 'authme:login:account', points: 10, duration: 900, blockDuration: 900 });
   const admin = limiter(redis, { keyPrefix: 'authme:admin', points: 120, duration: 60, blockDuration: 60 });
+  const account = limiter(redis, { keyPrefix: 'authme:account', points: 120, duration: 60, blockDuration: 60 });
+  const passwordResetIp = limiter(redis, { keyPrefix: 'authme:password-reset:ip', points: 10, duration: 3600, blockDuration: 3600 });
+  const passwordResetAccount = limiter(redis, { keyPrefix: 'authme:password-reset:account', points: 3, duration: 3600, blockDuration: 3600 });
   const registration = limiter(redis, { keyPrefix: 'authme:registration', points: 30, duration: 60, blockDuration: 60 });
   const deviceVerification = limiter(redis, { keyPrefix: 'authme:device:verify', points: 30, duration: 60, blockDuration: 60 });
 
@@ -35,6 +38,13 @@ export function createRateLimits(config, logger) {
     },
     async consumeAdmin(ip) {
       await admin.consume(opaqueKey('admin-ip', ip));
+    },
+    async consumeAccount(ip) {
+      await account.consume(opaqueKey('account-ip', ip));
+    },
+    async consumePasswordReset(ip, accountName) {
+      await passwordResetIp.consume(opaqueKey('password-reset-ip', ip));
+      await passwordResetAccount.consume(opaqueKey('password-reset-account', accountName));
     },
     async consumeRegistration(ip) {
       await registration.consume(opaqueKey('registration-ip', ip));

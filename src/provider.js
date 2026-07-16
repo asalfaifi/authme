@@ -63,6 +63,7 @@ const cibaDevelopmentPollInterval = 1;
 const cibaGrant = 'urn:openid:params:grant-type:ciba';
 
 export const ADMIN_CONSOLE_CLIENT_ID = 'authme-admin-console';
+export const ACCOUNT_CONSOLE_CLIENT_ID = 'authme-account-console';
 
 const REQUEST_OBJECT_SIGNING_ALGORITHMS = Object.freeze(['RS256', 'PS256', 'ES256']);
 
@@ -79,6 +80,22 @@ function adminConsoleClient(config) {
     application_type: 'web',
     subject_type: 'public',
     scope: 'openid profile email roles',
+  };
+}
+
+function accountConsoleClient(config, realm) {
+  return {
+    client_id: ACCOUNT_CONSOLE_CLIENT_ID,
+    client_name: 'AuthMe account console',
+    token_endpoint_auth_method: 'none',
+    redirect_uris: [`${config.publicUrl}/realms/${realm}/account/oidc/callback`],
+    post_logout_redirect_uris: [`${config.publicUrl}/realms/${realm}/account/`],
+    web_origins: [config.publicUrl],
+    response_types: ['code'],
+    grant_types: ['authorization_code'],
+    application_type: 'web',
+    subject_type: 'public',
+    scope: 'openid profile email',
   };
 }
 
@@ -108,11 +125,13 @@ function developmentClients(realm) {
 
 export function configuredClientsForRealm(config, realm) {
   const clients = structuredClone(config.clientsByRealm[realm] ?? []);
-  if (clients.some((client) => client.client_id === ADMIN_CONSOLE_CLIENT_ID)) {
-    throw new Error(`${ADMIN_CONSOLE_CLIENT_ID} is reserved for the built-in administration console`);
+  const reserved = [ADMIN_CONSOLE_CLIENT_ID, ACCOUNT_CONSOLE_CLIENT_ID]
+    .find((clientId) => clients.some((client) => client.client_id === clientId));
+  if (reserved) {
+    throw new Error(`${reserved} is reserved for a built-in AuthMe console`);
   }
   if (config.devMode && clients.length === 0) clients.push(...developmentClients(realm));
-  clients.push(adminConsoleClient(config));
+  clients.push(adminConsoleClient(config), accountConsoleClient(config, realm));
   return clients;
 }
 
