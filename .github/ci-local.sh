@@ -12,14 +12,22 @@ cleanup() {
 }
 trap cleanup EXIT
 
-docker run --detach --rm --name "$postgres_container" \
-  --env POSTGRES_DB=authme_test \
-  --env POSTGRES_USER=authme \
-  --env POSTGRES_PASSWORD=authme-ci-only \
-  --publish 127.0.0.1::5432 postgres:17-alpine >/dev/null
-
-docker run --detach --rm --name "$redis_container" \
-  --publish 127.0.0.1::6379 redis:7.4-alpine >/dev/null
+started=false
+for _ in {1..5}; do
+  cleanup
+  if docker run --detach --rm --name "$postgres_container" \
+      --env POSTGRES_DB=authme_test \
+      --env POSTGRES_USER=authme \
+      --env POSTGRES_PASSWORD=authme-ci-only \
+      --publish 127.0.0.1::5432 postgres:17-alpine >/dev/null && \
+    docker run --detach --rm --name "$redis_container" \
+      --publish 127.0.0.1::6379 redis:7.4-alpine >/dev/null; then
+    started=true
+    break
+  fi
+  sleep 2
+done
+[[ "$started" == "true" ]]
 
 for _ in {1..60}; do
   if docker exec "$postgres_container" pg_isready -U authme -d authme_test >/dev/null 2>&1 && \
@@ -45,6 +53,13 @@ export AUTHME_PASSWORD_PEPPER="$(openssl rand -hex 32)"
 export AUTHME_SUBJECT_SALT="$(openssl rand -hex 32)"
 export AUTHME_FIELD_ENCRYPTION_KEY="$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n')"
 export AUTHME_ADMIN_TOKEN="$(openssl rand -hex 32)"
+export AUTHME_SMOKE_PORT="$(python3 - <<'PY'
+import socket
+with socket.socket() as listener:
+    listener.bind(("127.0.0.1", 0))
+    print(listener.getsockname()[1])
+PY
+)"
 
 mkdir -p "$AUTHME_JWKS_DIR"
 npm run keys:generate
