@@ -3,6 +3,10 @@ set -Eeuo pipefail
 
 [[ "${1:-}" == "test" ]] || exit 0
 
+docker() {
+  command docker --config "${DOCKER_CONFIG:?DOCKER_CONFIG is required}" "$@"
+}
+
 suffix="${GITHUB_RUN_ID:-local}-$$"
 postgres_container="universal-ci-authme-postgres-${suffix}"
 redis_container="universal-ci-authme-redis-${suffix}"
@@ -47,19 +51,21 @@ export DATABASE_URL="postgresql://authme:authme-ci-only@127.0.0.1:${postgres_por
 export REDIS_URL="redis://127.0.0.1:${redis_port}/0"
 export AUTHME_SMOKE_DATABASE_URL="$DATABASE_URL"
 export AUTHME_JWKS_DIR="${RUNNER_TEMP:-/tmp}/authme-jwks-${suffix}"
-export AUTHME_COOKIE_KEYS="$(openssl rand -hex 32),$(openssl rand -hex 32)"
-export AUTHME_CSRF_SECRET="$(openssl rand -hex 32)"
-export AUTHME_PASSWORD_PEPPER="$(openssl rand -hex 32)"
-export AUTHME_SUBJECT_SALT="$(openssl rand -hex 32)"
-export AUTHME_FIELD_ENCRYPTION_KEY="$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n')"
-export AUTHME_ADMIN_TOKEN="$(openssl rand -hex 32)"
-export AUTHME_SMOKE_PORT="$(python3 - <<'PY'
+AUTHME_COOKIE_KEYS="$(openssl rand -hex 32),$(openssl rand -hex 32)"
+AUTHME_CSRF_SECRET="$(openssl rand -hex 32)"
+AUTHME_PASSWORD_PEPPER="$(openssl rand -hex 32)"
+AUTHME_SUBJECT_SALT="$(openssl rand -hex 32)"
+AUTHME_FIELD_ENCRYPTION_KEY="$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n')"
+AUTHME_ADMIN_TOKEN="$(openssl rand -hex 32)"
+AUTHME_SMOKE_PORT="$(python3 - <<'PY'
 import socket
 with socket.socket() as listener:
     listener.bind(("127.0.0.1", 0))
     print(listener.getsockname()[1])
 PY
 )"
+export AUTHME_COOKIE_KEYS AUTHME_CSRF_SECRET AUTHME_PASSWORD_PEPPER
+export AUTHME_SUBJECT_SALT AUTHME_FIELD_ENCRYPTION_KEY AUTHME_ADMIN_TOKEN AUTHME_SMOKE_PORT
 
 mkdir -p "$AUTHME_JWKS_DIR"
 npm run keys:generate
