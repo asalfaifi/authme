@@ -6,8 +6,7 @@ FROM node:${NODE_VERSION} AS production-dependencies
 WORKDIR /opt/authme
 
 COPY package.json package-lock.json ./
-RUN --mount=type=cache,target=/root/.npm \
-    npm ci --omit=dev --no-audit --no-fund \
+RUN npm ci --omit=dev --no-audit --no-fund \
     && npm cache clean --force
 
 FROM node:${NODE_VERSION} AS runtime
