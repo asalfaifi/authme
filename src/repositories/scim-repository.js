@@ -214,10 +214,11 @@ export class PostgresScimRepository {
         await client.query(
           `INSERT INTO users
            (realm_name,id,username,email,email_verified,display_name,given_name,family_name,enabled,
-            password_hash,roles,groups,client_roles,attributes)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'{}','{}',$12)`,
+            password_hash,has_local_password,roles,groups,client_roles,attributes)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'{}','{}',$13)`,
           [realm, id, core.username, core.email, core.emailVerified, core.displayName, core.givenName,
-            core.familyName, core.enabled, passwordHash, core.roles, { scim: core.extra }],
+            core.familyName, core.enabled, passwordHash, attributes.password !== undefined,
+            core.roles, { scim: core.extra }],
         );
         await client.query(
           'UPDATE scim_user_resources SET external_id=$3 WHERE realm_name=$1 AND user_id=$2',
@@ -255,10 +256,13 @@ export class PostgresScimRepository {
           `UPDATE users SET username=$3,email=$4,email_verified=$5,display_name=$6,given_name=$7,
              family_name=$8,enabled=$9,password_hash=$10,roles=$11,
              attributes=jsonb_set(attributes,'{scim}',$12::jsonb,true),
+             has_local_password=has_local_password OR $13,
+             ldap_sync_disable_provider_id=NULL,ldap_sync_disable_issuer=NULL,
              security_version=security_version+1,failed_attempts=0,locked_until=NULL
            WHERE realm_name=$1 AND id=$2`,
           [realm, id, core.username, core.email, core.emailVerified, core.displayName, core.givenName,
-            core.familyName, core.enabled, passwordHash ?? locked.rows[0].password_hash, core.roles, core.extra],
+            core.familyName, core.enabled, passwordHash ?? locked.rows[0].password_hash, core.roles,
+            core.extra, attributes.password !== undefined],
         );
         await client.query(
           'UPDATE scim_user_resources SET external_id=$3 WHERE realm_name=$1 AND user_id=$2',

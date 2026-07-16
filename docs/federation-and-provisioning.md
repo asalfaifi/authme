@@ -1,6 +1,6 @@
 # Federation, directory authentication, and provisioning
 
-AuthMe supports realm-scoped LDAP/Active Directory authentication, upstream OpenID Connect federation, SAML 2.0 service-provider federation, and SCIM 2.0 Users/Groups provisioning. These integrations are disabled until their corresponding JSON configuration contains a provider or token for a realm.
+AuthMe supports realm-scoped LDAP/Active Directory authentication and synchronization, upstream OpenID Connect federation, SAML 2.0 service-provider federation, and SCIM 2.0 Users/Groups provisioning. These integrations are disabled until their corresponding JSON configuration contains a provider or token for a realm.
 
 All four JSON values contain credentials or trust material and belong in the runtime Secret, not the Helm ConfigMap, source control, image, or command-line history:
 
@@ -32,15 +32,43 @@ Example:
     "username_attribute": "uid",
     "email_attribute": "mail",
     "external_id_attribute": "entryUUID",
+    "binary_attributes": [],
     "groups_attribute": "memberOf",
+    "sync_enabled": true,
+    "sync_filter": "(employeeType=employee)",
+    "sync_page_size": 200,
+    "sync_groups": true,
+    "sync_deletion_policy": "disable",
+    "sync_max_deprovision_fraction": 0.2,
+    "sync_max_deprovision_count": 100,
     "jit_provisioning": false
   }]
 }
 ```
 
-For Active Directory, choose an immutable external ID such as `objectGUID` when the directory exposes it in a stable representation. Falling back to a DN means moving or renaming the entry changes its AuthMe subject. When `jit_provisioning` is false, pre-link the external subject through the administration API. When it is true, AuthMe can create a new account only if its username and email do not collide with an existing account.
+For Active Directory, choose an immutable external ID such as `objectGUID`; for standards-oriented LDAP servers, `entryUUID` is the usual choice. Text attributes remain text in the external identity key. List an attribute in `binary_attributes` only when the directory schema defines it as binary; AuthMe then requests raw bytes and base64url-encodes them in both synchronization and interactive authentication. For example, an AD configuration using `objectGUID` should set `"binary_attributes": ["objectGUID"]`, while textual `entryUUID` must not be listed. Interactive credential authentication can fall back to a DN when the configured attribute is absent, but synchronization requires a non-empty `external_id_attribute` on every returned entry and fails the run before deletion reconciliation if one is missing. This prevents moves and renames from creating duplicate AuthMe users. When `jit_provisioning` is false, pre-link the external subject through the administration API. When it is true, AuthMe can create a new account only if its username and email do not collide with an existing account.
 
 Plain `ldap://` is accepted only with `start_tls: true`. An insecure loopback exception requires both development mode and `allow_insecure_development: true`; it cannot be enabled in production.
+
+### Import and synchronization
+
+`sync_enabled` is an independent opt-in from interactive JIT. The synchronizer searches `user_base_dn` with subtree scope and combines `(objectClass=<user_object_class>)` with the optional operator-supplied `sync_filter`. It requests only mapped attributes and streams pages through `ldapts`; `sync_page_size` accepts 1–1000 and defaults to 200. Search referrals are not followed because a partial authority view is unsafe for deletion reconciliation.
+
+Mapped name and email fields are updated only on the user already identified by the immutable external subject. `sync_groups: true` makes `groups_attribute` authoritative for the user's AuthMe group paths; setting it to false leaves existing group assignments untouched and creates new directory users without groups. A configured `roles_attribute` similarly makes its values authoritative for realm roles. Username/email collisions are reported in the run count and never auto-linked.
+
+After every page completes, links that existed when the run began but were not observed are considered for reconciliation. `sync_deletion_policy: "disable"` disables the AuthMe account and records this provider as the disable owner. A later observed entry re-enables the account only when that same provider's sync disabled it; an administrator or another source always retains control of its disable decision.
+
+`sync_deletion_policy: "delete"` hard-deletes only an account created by this provider's sync that still has exactly one federated link and has no local password, TOTP/recovery/passkey credential, or administrator grant. Every other candidate is downgraded to disable and counted in `deletionRefused`, so a directory run cannot cascade-delete local credentials, grants, or other identity links.
+
+Reconciliation fails safe when the scan returns zero entries. It also returns `needs_confirmation` without deprovisioning when the missing set exceeds either `sync_max_deprovision_fraction` of the provider's existing links or `sync_max_deprovision_count`. The defaults are 20% and 100 accounts. The JSON result reports the reason plus existing/candidate counts, and the CLI exits nonzero. Directory, TLS, bind, paging, invalid-entry, or pre-reconciliation database failures also skip the deletion phase; successfully committed earlier entry updates remain safe to replay on the next run. Each permitted disable/delete is its own transaction, so a reconciliation failure resumes safely.
+
+Run one realm explicitly, optionally narrowing it to one provider:
+
+```sh
+npm run ldap:sync -- --realm master --provider corporate-directory
+```
+
+The command requires PostgreSQL and the normal AuthMe production configuration. It emits one credential-free JSON summary per provider and exits nonzero for an outage, local failure, overlapping run, or reconciliation requiring confirmation. See the scheduling and recovery runbook in [production.md](production.md).
 
 ## Upstream OpenID Connect / OAuth
 
@@ -154,4 +182,4 @@ The current SCIM profile does not implement Bulk, sorting, `/Me`, arbitrary exte
 
 Built-in mechanisms register through the versioned `authme.identity/v1` extension contract as authenticator, federation, or provisioning modules. The registry exposes realm capability discovery and keeps protocol-specific code outside the OIDC core. It is a compile-time trusted-code boundary, not a facility for loading unreviewed JavaScript at runtime.
 
-There is no finite, safe interpretation of “every authentication mechanism.” This release covers passwords, TOTP, recovery codes, WebAuthn/passkeys, LDAP/Active Directory credential validation, OIDC/OAuth federation, SAML federation, and SCIM provisioning. Kerberos/SPNEGO, RADIUS, X.509 authentication, email/SMS OTP and magic links, proprietary social-provider presets, SAML IdP operation, inbound LDAP synchronization, encrypted SAML assertions, and arbitrary runtime plugins remain outside the implemented contract until each receives storage, interaction, threat-model, interoperability, and operational release gates.
+There is no finite, safe interpretation of “every authentication mechanism.” This release covers passwords, TOTP, recovery codes, WebAuthn/passkeys, LDAP/Active Directory credential validation and synchronization, OIDC/OAuth federation, SAML federation, and SCIM provisioning. Kerberos/SPNEGO, RADIUS, X.509 authentication, email/SMS OTP and magic links, proprietary social-provider presets, SAML IdP operation, LDAP server-side delta/change-log controls, encrypted SAML assertions, and arbitrary runtime plugins remain outside the implemented contract until each receives storage, interaction, threat-model, interoperability, and operational release gates.

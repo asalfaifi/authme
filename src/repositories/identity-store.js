@@ -19,6 +19,9 @@ function normalizeUser(input) {
     enabled: input.enabled !== false,
     securityVersion: Number(input.securityVersion ?? 0),
     passwordHash: input.passwordHash,
+    hasLocalPassword: input.hasLocalPassword !== false,
+    syncDisableProviderId: input.syncDisableProviderId ?? null,
+    syncDisableIssuer: input.syncDisableIssuer ?? null,
     roles: [...new Set(input.roles ?? [])],
     groups: [...new Set(input.groups ?? [])],
     clientRoles: input.clientRoles ?? {},
@@ -136,7 +139,11 @@ function rowToWebAuthnChallenge(row) {
 
 export function publicUser(user) {
   if (!user) return null;
-  const { passwordHash, totpSecret, pendingTotpSecret, pendingTotpCreatedAt, recoveryCodeHashes, lastTotpStep, securityVersion, ...safe } = user;
+  const {
+    passwordHash, hasLocalPassword, syncDisableProviderId, syncDisableIssuer,
+    totpSecret, pendingTotpSecret, pendingTotpCreatedAt, recoveryCodeHashes,
+    lastTotpStep, securityVersion, ...safe
+  } = user;
   return { ...safe, mfaEnabled: Boolean(user.totpConfirmed), recoveryCodesRemaining: recoveryCodeHashes?.length ?? 0 };
 }
 
@@ -206,9 +213,55 @@ export class MemoryIdentityStore {
       if (duplicate) throw Object.assign(new Error('A user with that email already exists'), { code: 'USER_EXISTS' });
     }
     for (const field of allowed) if (field in patch) next[field] = structuredClone(patch[field]);
+    if ('passwordHash' in patch) next.hasLocalPassword = true;
+    if ('enabled' in patch) {
+      next.syncDisableProviderId = null;
+      next.syncDisableIssuer = null;
+    }
     next.updatedAt = nowIso();
     this.#users.set(key, next);
     return structuredClone(next);
+  }
+
+  async updateFederatedUser(realm, id, patch) {
+    const key = `${realm}:${id}`;
+    const current = this.#users.get(key);
+    if (!current) return null;
+    const normalized = {
+      ...patch,
+      ...('username' in patch ? { username: String(patch.username).trim() } : {}),
+      ...('email' in patch ? { email: String(patch.email).trim().toLowerCase() } : {}),
+    };
+    if ('username' in normalized && !normalized.username) throw new TypeError('User username cannot be empty');
+    if ('email' in normalized && !normalized.email) throw new TypeError('User email cannot be empty');
+    const username = (normalized.username ?? current.username).toLowerCase();
+    const email = normalized.email ?? current.email;
+    const duplicate = [...this.#users.values()].find(
+      (item) => item.realm === realm && item.id !== id
+        && [item.username.toLowerCase(), item.email].some((login) => login === username || login === email),
+    );
+    if (duplicate) throw Object.assign(new Error('A user with that username or email already exists'), { code: 'USER_EXISTS' });
+    const next = structuredClone(current);
+    const allowed = ['username', 'email', 'emailVerified', 'name', 'givenName', 'familyName', 'enabled', 'roles', 'groups'];
+    for (const field of allowed) if (field in normalized) next[field] = structuredClone(normalized[field]);
+    if (normalized.enabled === true) {
+      next.syncDisableProviderId = null;
+      next.syncDisableIssuer = null;
+    }
+    next.updatedAt = nowIso();
+    this.#users.set(key, next);
+    return structuredClone(next);
+  }
+
+  async disableUserForLdapSync(realm, id, { providerId, issuer }) {
+    const user = this.#users.get(`${realm}:${id}`);
+    if (!user?.enabled) return false;
+    user.enabled = false;
+    user.syncDisableProviderId = providerId;
+    user.syncDisableIssuer = issuer;
+    user.securityVersion += 1;
+    user.updatedAt = nowIso();
+    return true;
   }
 
   async deleteUser(realm, id) {
@@ -521,6 +574,9 @@ function rowToUser(row) {
     enabled: row.enabled,
     securityVersion: row.security_version,
     passwordHash: row.password_hash,
+    hasLocalPassword: row.has_local_password,
+    syncDisableProviderId: row.ldap_sync_disable_provider_id,
+    syncDisableIssuer: row.ldap_sync_disable_issuer,
     roles: row.roles,
     groups: row.groups,
     clientRoles: row.client_roles,
@@ -586,12 +642,12 @@ export class PostgresIdentityStore {
       const result = await this.pool.query(
         `INSERT INTO users
           (id, realm_name, username, email, email_verified, display_name, given_name, family_name,
-           enabled, password_hash, roles, groups, client_roles, totp_secret, totp_confirmed,
+           enabled, password_hash, has_local_password, roles, groups, client_roles, totp_secret, totp_confirmed,
            recovery_code_hashes, last_totp_step, failed_attempts, locked_until, created_at, updated_at, last_login_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
          RETURNING *`,
         [user.id, user.realm, user.username, user.email, user.emailVerified, user.name, user.givenName,
-          user.familyName, user.enabled, user.passwordHash, user.roles, user.groups, user.clientRoles,
+          user.familyName, user.enabled, user.passwordHash, user.hasLocalPassword, user.roles, user.groups, user.clientRoles,
           user.totpSecret, user.totpConfirmed, user.recoveryCodeHashes, user.lastTotpStep, user.failedAttempts, user.lockedUntil,
           user.createdAt, user.updatedAt, user.lastLoginAt],
       );
@@ -716,6 +772,10 @@ export class PostgresIdentityStore {
       values.push(value);
       return `${columns[field]}=$${values.length}`;
     });
+    if ('passwordHash' in patch) assignments.push('has_local_password=true');
+    if ('enabled' in patch) {
+      assignments.push('ldap_sync_disable_provider_id=NULL', 'ldap_sync_disable_issuer=NULL');
+    }
     try {
       const result = await this.pool.query(
         `UPDATE users SET ${assignments.join(', ')}, updated_at=now()
@@ -727,6 +787,47 @@ export class PostgresIdentityStore {
       if (error.code === '23505') throw Object.assign(new Error('A user with that email already exists'), { code: 'USER_EXISTS' });
       throw error;
     }
+  }
+
+  async updateFederatedUser(realm, id, patch) {
+    const columns = {
+      username: 'username', email: 'email', emailVerified: 'email_verified', name: 'display_name',
+      givenName: 'given_name', familyName: 'family_name', enabled: 'enabled', roles: 'roles', groups: 'groups',
+    };
+    const entries = Object.entries(patch).filter(([field]) => field in columns);
+    if (!entries.length) return this.findUserById(realm, id);
+    const values = [realm, id];
+    const assignments = entries.map(([field, raw]) => {
+      const value = field === 'email' ? String(raw).trim().toLowerCase()
+        : field === 'username' ? String(raw).trim() : raw;
+      if ((field === 'username' || field === 'email') && !value) throw new TypeError(`User ${field} cannot be empty`);
+      values.push(value);
+      return `${columns[field]}=$${values.length}`;
+    });
+    if (patch.enabled === true) {
+      assignments.push('ldap_sync_disable_provider_id=NULL', 'ldap_sync_disable_issuer=NULL');
+    }
+    try {
+      const result = await this.pool.query(
+        `UPDATE users SET ${assignments.join(', ')}, updated_at=now()
+         WHERE realm_name=$1 AND id=$2 RETURNING *`,
+        values,
+      );
+      return rowToUser(result.rows[0]);
+    } catch (error) {
+      if (error.code === '23505') throw Object.assign(new Error('A user with that username or email already exists'), { code: 'USER_EXISTS' });
+      throw error;
+    }
+  }
+
+  async disableUserForLdapSync(realm, id, { providerId, issuer }) {
+    const result = await this.pool.query(
+      `UPDATE users SET enabled=false,ldap_sync_disable_provider_id=$3,
+         ldap_sync_disable_issuer=$4,security_version=security_version+1,updated_at=now()
+       WHERE realm_name=$1 AND id=$2 AND enabled RETURNING id`,
+      [realm, id, providerId, issuer],
+    );
+    return result.rowCount === 1;
   }
 
   async deleteUser(realm, id) {

@@ -23,6 +23,7 @@ const child = spawn(process.execPath, [
   'test/postgres-admin-console.test.js',
   'test/postgres-concurrency.test.js',
   'test/postgres-federated-identities.test.js',
+  'test/postgres-ldap-sync.test.js',
   'test/postgres-migrations.test.js',
   'test/postgres-scim.test.js',
   'test/postgres-webauthn.test.js',
