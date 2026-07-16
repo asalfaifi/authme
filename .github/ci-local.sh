@@ -19,12 +19,12 @@ trap cleanup EXIT
 started=false
 for _ in {1..5}; do
   cleanup
-  if docker run --detach --rm --name "$postgres_container" \
+  if docker run --pull=never --detach --rm --name "$postgres_container" \
       --env POSTGRES_DB=authme_test \
       --env POSTGRES_USER=authme \
       --env POSTGRES_PASSWORD=authme-ci-only \
       --publish 127.0.0.1::5432 postgres:17-alpine >/dev/null && \
-    docker run --detach --rm --name "$redis_container" \
+    docker run --pull=never --detach --rm --name "$redis_container" \
       --publish 127.0.0.1::6379 redis:7.4-alpine >/dev/null; then
     started=true
     break
