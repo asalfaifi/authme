@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { isIP } from 'node:net';
 import { z } from 'zod';
 
@@ -5,6 +6,10 @@ import { AUTHME_EXTENSION_API_VERSION } from '../authentication/registry.js';
 
 const attributeName = z.string().regex(/^[a-zA-Z][a-zA-Z0-9-]{0,63}$/);
 const providerId = z.string().regex(/^[a-z][a-z0-9-]{1,31}$/);
+const ldapFilter = z.string().trim().min(3).max(4096)
+  .refine((value) => value.startsWith('(') && value.endsWith(')') && !/[\u0000-\u001f\u007f]/u.test(value), {
+    message: 'must be a parenthesized LDAP filter without control characters',
+  });
 const providerSchema = z.object({
   id: providerId,
   display_name: z.string().trim().min(1).max(100),
@@ -23,9 +28,17 @@ const providerSchema = z.object({
   given_name_attribute: attributeName.optional().default('givenName'),
   family_name_attribute: attributeName.optional().default('sn'),
   external_id_attribute: attributeName.optional().default('entryUUID'),
+  binary_attributes: z.array(attributeName).max(20).optional().default([]),
   groups_attribute: attributeName.optional().default('memberOf'),
   roles_attribute: attributeName.optional(),
   jit_provisioning: z.boolean().optional().default(false),
+  sync_enabled: z.boolean().optional().default(false),
+  sync_filter: ldapFilter.optional(),
+  sync_page_size: z.number().int().min(1).max(1000).optional().default(200),
+  sync_deletion_policy: z.enum(['disable', 'delete']).optional().default('disable'),
+  sync_max_deprovision_fraction: z.number().min(0.01).max(1).optional().default(0.2),
+  sync_max_deprovision_count: z.number().int().min(1).max(1_000_000).optional().default(100),
+  sync_groups: z.boolean().optional().default(true),
   connect_timeout_ms: z.number().int().min(500).max(20_000).optional().default(5_000),
   operation_timeout_ms: z.number().int().min(500).max(20_000).optional().default(5_000),
 }).strict();
@@ -106,9 +119,17 @@ export function parseLdapProviders(value, { realms, devMode }) {
         givenNameAttribute: provider.given_name_attribute,
         familyNameAttribute: provider.family_name_attribute,
         externalIdAttribute: provider.external_id_attribute,
+        binaryAttributes: [...new Map(provider.binary_attributes.map((name) => [name.toLowerCase(), name])).values()],
         groupsAttribute: provider.groups_attribute,
         rolesAttribute: provider.roles_attribute,
         jitProvisioning: provider.jit_provisioning,
+        syncEnabled: provider.sync_enabled,
+        syncFilter: provider.sync_filter,
+        syncPageSize: provider.sync_page_size,
+        syncDeletionPolicy: provider.sync_deletion_policy,
+        syncMaxDeprovisionFraction: provider.sync_max_deprovision_fraction,
+        syncMaxDeprovisionCount: provider.sync_max_deprovision_count,
+        syncGroups: provider.sync_groups,
         connectTimeoutMs: provider.connect_timeout_ms,
         operationTimeoutMs: provider.operation_timeout_ms,
       };
@@ -159,17 +180,30 @@ function groupPath(value) {
   return name ? `/${name}` : null;
 }
 
-function externalSubject(entry, provider, dn) {
-  const value = entryValue(entry, provider.externalIdAttribute);
-  if (Buffer.isBuffer(value)) return value.toString('base64url');
-  const item = Array.isArray(value) ? value[0] : value;
-  return item === undefined || item === null || String(item).trim() === '' ? dn : String(item).trim();
+function binaryAttribute(provider, attribute) {
+  return provider.binaryAttributes?.some((name) => name.toLowerCase() === attribute.toLowerCase()) ?? false;
 }
 
-function profileFor(entry, provider, login, dn) {
+function externalSubject(entry, provider, dn) {
+  const value = entryValue(entry, provider.externalIdAttribute);
+  const item = Array.isArray(value) ? value[0] : value;
+  if (item === undefined || item === null || (Buffer.isBuffer(item) && item.length === 0)
+    || (!Buffer.isBuffer(item) && String(item).trim() === '')) return dn;
+  if (binaryAttribute(provider, provider.externalIdAttribute)) {
+    if (!Buffer.isBuffer(item)) throw invalidSyncEntry(`${provider.externalIdAttribute} was not returned as binary`);
+    return item.toString('base64url');
+  }
+  return (Buffer.isBuffer(item) ? item.toString('utf8') : String(item)).trim();
+}
+
+function explicitBufferAttributes(provider) {
+  return binaryAttribute(provider, provider.externalIdAttribute) ? [provider.externalIdAttribute] : [];
+}
+
+function profileFor(entry, provider, login, dn, { includeGroups = true } = {}) {
   const username = first(entry, provider.usernameAttribute) || login;
   const email = first(entry, provider.emailAttribute);
-  const groupValues = strings(entryValue(entry, provider.groupsAttribute));
+  const groupValues = includeGroups ? strings(entryValue(entry, provider.groupsAttribute)) : [];
   return {
     externalSubject: externalSubject(entry, provider, dn),
     username,
@@ -236,6 +270,211 @@ function loggableError(error) {
   return result;
 }
 
+function syncFilter(provider) {
+  const objectClass = `(objectClass=${provider.userObjectClass})`;
+  return provider.syncFilter ? `(&${objectClass}${provider.syncFilter})` : objectClass;
+}
+
+function syncAttributes(provider) {
+  return [...new Set([
+    provider.usernameAttribute, provider.emailAttribute, provider.displayNameAttribute,
+    provider.givenNameAttribute, provider.familyNameAttribute, provider.externalIdAttribute,
+    provider.syncGroups ? provider.groupsAttribute : null, provider.rolesAttribute,
+  ].filter(Boolean))];
+}
+
+function invalidSyncEntry(message) {
+  return Object.assign(new Error(`Invalid LDAP sync entry: ${message}`), {
+    code: 'AUTHME_LDAP_SYNC_ENTRY_INVALID',
+  });
+}
+
+function syncProfile(entry, provider) {
+  const dn = String(entry.dn ?? '').trim();
+  const subject = externalSubject(entry, provider, '');
+  if (!subject) throw invalidSyncEntry(`missing ${provider.externalIdAttribute}`);
+  if (subject.length > 2048 || /[\u0000-\u001f\u007f]/u.test(subject)) {
+    throw invalidSyncEntry(`${provider.externalIdAttribute} is invalid`);
+  }
+  const profile = profileFor(entry, provider, subject, dn, { includeGroups: provider.syncGroups });
+  profile.groups.sort((left, right) => left.localeCompare(right));
+  profile.roles.sort((left, right) => left.localeCompare(right));
+  return { externalSubject: subject, profile };
+}
+
+function initialSyncResult(realm, provider) {
+  return {
+    realm,
+    providerId: provider.id,
+    pages: 0,
+    scanned: 0,
+    created: 0,
+    updated: 0,
+    unchanged: 0,
+    conflicts: 0,
+    disabled: 0,
+    deleted: 0,
+    deletionRefused: 0,
+    reconciliation: null,
+  };
+}
+
+async function syncFailure(status, result, error, logger) {
+  const level = status === 'unavailable' ? 'warn' : 'error';
+  logger?.[level]?.({
+    realm: result.realm,
+    providerId: result.providerId,
+    error: loggableError(error),
+  }, status === 'unavailable' ? 'LDAP sync provider unavailable' : 'LDAP sync failed');
+  return { ...result, status, error };
+}
+
+/**
+ * Streams one realm/provider directory into the canonical user store. Each
+ * entry commits independently; missing-entry reconciliation begins only after
+ * every LDAP page has been received successfully.
+ */
+export async function syncLdapProvider(provider, { realm, repository }, {
+  clientFactory = defaultClientFactory,
+  logger,
+} = {}) {
+  if (typeof realm !== 'string' || !realm) throw new TypeError('LDAP sync realm is required');
+  if (!repository?.syncEntry || !repository?.reconcileMissing) {
+    throw new TypeError('LDAP sync repository is required');
+  }
+
+  const result = initialSyncResult(realm, provider);
+  const syncId = randomUUID();
+  let startedAt;
+  let releaseLock;
+  let client;
+  try {
+    let protocol;
+    try { protocol = new URL(provider.url).protocol; } catch { /* Report through the ordinary safe failure path. */ }
+    if (protocol !== 'ldaps:' && !(protocol === 'ldap:' && provider.startTls)) {
+      return syncFailure('failed', result, configurationError(`${realm}.${provider.id}.url must use LDAPS or StartTLS`), logger);
+    }
+    try {
+      releaseLock = await repository.acquireSyncLock?.({
+        realm, providerId: provider.id, issuer: provider.url,
+      });
+    } catch (error) {
+      return syncFailure('failed', result, error, logger);
+    }
+    if (releaseLock === null) return { ...result, status: 'busy' };
+    startedAt = releaseLock?.startedAt ?? new Date().toISOString();
+
+    try {
+      client = await secureClient(provider, clientFactory);
+      if (provider.bindDn) await client.bind(provider.bindDn, provider.bindPassword);
+    } catch (error) {
+      return syncFailure('unavailable', result, error, logger);
+    }
+
+    const options = {
+      scope: 'sub',
+      filter: syncFilter(provider),
+      attributes: syncAttributes(provider),
+      explicitBufferAttributes: explicitBufferAttributes(provider),
+      paged: { pageSize: provider.syncPageSize },
+      sizeLimit: 0,
+      timeLimit: Math.max(1, Math.ceil(provider.operationTimeoutMs / 1000)),
+    };
+    let pages;
+    try {
+      pages = client.searchPaginated
+        ? client.searchPaginated(provider.userBaseDn, options)
+        : (async function* singlePage() { yield await client.search(provider.userBaseDn, options); }());
+    } catch (error) {
+      return syncFailure('unavailable', result, error, logger);
+    }
+
+    const iterator = pages[Symbol.asyncIterator]();
+    while (true) {
+      let page;
+      try {
+        page = await iterator.next();
+      } catch (error) {
+        return syncFailure('unavailable', result, error, logger);
+      }
+      if (page.done) break;
+      result.pages += 1;
+      if ((page.value?.searchReferences?.length ?? 0) > 0) {
+        return syncFailure('failed', result, new Error('LDAP sync does not follow search referrals'), logger);
+      }
+      for (const entry of page.value?.searchEntries ?? []) {
+        result.scanned += 1;
+        let mapped;
+        try {
+          mapped = syncProfile(entry, provider);
+        } catch (error) {
+          return syncFailure('failed', result, error, logger);
+        }
+        let outcome;
+        try {
+          outcome = await repository.syncEntry({
+            realm,
+            providerId: provider.id,
+            issuer: provider.url,
+            externalSubject: mapped.externalSubject,
+            profile: mapped.profile,
+            syncId,
+            syncGroups: provider.syncGroups,
+            syncRoles: Boolean(provider.rolesAttribute),
+          });
+        } catch (error) {
+          return syncFailure('failed', result, error, logger);
+        }
+        if (outcome.status === 'created') result.created += 1;
+        else if (outcome.status === 'updated') result.updated += 1;
+        else if (outcome.status === 'unchanged') result.unchanged += 1;
+        else if (outcome.status === 'conflict') result.conflicts += 1;
+        else return syncFailure('failed', result, new Error('LDAP sync repository returned an invalid status'), logger);
+      }
+    }
+
+    await closeClient(client);
+    client = null;
+    try {
+      const reconciled = await repository.reconcileMissing({
+        realm,
+        providerId: provider.id,
+        issuer: provider.url,
+        syncId,
+        startedAt,
+        scanned: result.scanned,
+        deletionPolicy: provider.syncDeletionPolicy,
+        maxDeprovisionFraction: provider.syncMaxDeprovisionFraction,
+        maxDeprovisionCount: provider.syncMaxDeprovisionCount,
+        batchSize: provider.syncPageSize,
+      });
+      result.disabled = reconciled.disabled;
+      result.deleted = reconciled.deleted;
+      result.deletionRefused = reconciled.deletionRefused;
+      result.reconciliation = {
+        status: reconciled.status,
+        reason: reconciled.reason ?? null,
+        existing: reconciled.existing,
+        candidates: reconciled.candidates,
+      };
+      if (reconciled.status === 'skipped') {
+        logger?.warn?.({
+          realm: result.realm,
+          providerId: result.providerId,
+          reconciliation: result.reconciliation,
+        }, 'LDAP sync reconciliation needs confirmation');
+        return { ...result, status: 'needs_confirmation' };
+      }
+    } catch (error) {
+      return syncFailure('failed', result, error, logger);
+    }
+    return { ...result, status: 'success' };
+  } finally {
+    await closeClient(client);
+    await releaseLock?.();
+  }
+}
+
 export async function authenticateLdapProvider(provider, { login, secret }, { clientFactory = defaultClientFactory } = {}) {
   if (!String(login).trim() || !String(secret)) return { status: 'failure' };
   let searchClient;
@@ -251,6 +490,7 @@ export async function authenticateLdapProvider(provider, { login, secret }, { cl
       scope: 'sub',
       filter: userFilter(provider, String(login).trim()),
       attributes,
+      explicitBufferAttributes: explicitBufferAttributes(provider),
       sizeLimit: 2,
       timeLimit: Math.max(1, Math.ceil(provider.operationTimeoutMs / 1000)),
     });
@@ -293,7 +533,7 @@ export function createLdapExtension({ providersByRealm, clientFactory, logger })
       id: 'builtin.ldap',
       kind: 'authenticator',
       displayName: 'LDAP and Active Directory',
-      capabilities: ['active-directory', 'jit-provisioning', 'ldap'],
+      capabilities: ['active-directory', 'directory-sync', 'jit-provisioning', 'ldap'],
     },
     implementation: {
       enabledFor: (realm) => (providersByRealm[realm]?.length ?? 0) > 0,

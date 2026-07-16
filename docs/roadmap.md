@@ -105,6 +105,7 @@ The upstream [`oidc-provider`](https://github.com/panva/node-oidc-provider#imple
 ### Implemented product contract
 
 - A permanently expanded, realm-scoped operator console at `/admin/` with user, credential, session, federation, dynamic-registration, audit, and safe configuration views.
+- Realm-scoped LDAP/Active Directory import, synchronization, and reconciliation with immutable external keys, bounded paged searches, collision-safe account creation, mapped group/role updates, and configurable disable/delete handling for removed entries.
 - A reserved `authme-admin-console` OIDC client using Authorization Code with PKCE `S256`, exact callback matching, and validated `state` and `nonce`.
 - Durable, enabled realm-administrator grants with explicit permissions and a revocable version snapshot. The development bootstrap grant uses `*`; production deployments should grant only required permissions.
 - Production console authentication requires a recent LoA2 result: a passkey, or password plus TOTP/recovery. Development mode deliberately permits password-only console authentication.
@@ -117,7 +118,6 @@ The upstream [`oidc-provider`](https://github.com/panva/node-oidc-provider#imple
 
 - Curated social-provider templates and advanced upstream OIDC discovery/governance around the v0.2 broker.
 - SAML IdP operation, encrypted assertions, artifact binding, IdP-initiated login, and single logout around the v0.2 SP baseline.
-- LDAP/Active Directory import, synchronization, and reconciliation around the v0.2 credential-authentication baseline.
 - SCIM Bulk, sorting, arbitrary extensions, fine-grained token scopes, and full filtering around the v0.2 Users/Groups baseline.
 - Organizations within realms: domains, invitations, memberships, organization-specific IdPs, and token context.
 - Approval-backed administrator-grant lifecycle and organization-level delegation beyond the implemented realm permission model.

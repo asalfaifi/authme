@@ -24,6 +24,7 @@
     "test:postgres": "node scripts/run-postgres-tests.mjs",
     "test:coverage": "node --test --experimental-test-coverage",
     "db:migrate": "node scripts/migrate.mjs",
+    "ldap:sync": "node scripts/ldap-sync.mjs",
     "keys:generate": "node scripts/generate-jwks.mjs",
     "bootstrap:user": "node scripts/bootstrap-user.mjs",
     "smoke": "node scripts/smoke.mjs"

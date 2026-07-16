@@ -2,7 +2,7 @@
 
 ## Production status
 
-AuthMe v0.3 is a production-oriented identity foundation with OAuth/OIDC, SAML/OIDC federation, LDAP/AD authentication, SCIM provisioning, strong credentials, and a realm-scoped administration console. It is not a declaration of complete Keycloak parity or an independently certified identity product. A deployment is production-ready only after the exact build, configuration, proxy, external-provider trust, database adapter, interactions, and operational controls pass the release gates below.
+AuthMe v0.3 is a production-oriented identity foundation with OAuth/OIDC, SAML/OIDC federation, LDAP/AD authentication and synchronization, SCIM provisioning, strong credentials, and a realm-scoped administration console. It is not a declaration of complete Keycloak parity or an independently certified identity product. A deployment is production-ready only after the exact build, configuration, proxy, external-provider trust, database adapter, interactions, and operational controls pass the release gates below.
 
 The protocol engine is [`oidc-provider` 9.9.1](https://oidc-provider.dev/changelog/#_9-9-1-2026-07-07), whose upstream project publishes OpenID/FAPI certifications and supported profiles. That certification does not automatically extend to AuthMe or a particular deployment.
 
@@ -73,7 +73,7 @@ The v0.3 executable recognizes these security-critical inputs:
 | `AUTHME_TRUST_PROXY` | Enable only behind the intended trusted proxy topology |
 | `AUTHME_CLIENTS_JSON` | Reviewed static clients grouped by configured realm |
 | `AUTHME_RESOURCE_SERVERS_JSON` | Explicit HTTPS API audiences, scopes, authorized clients, claim policy, and JWT/opaque format by realm |
-| `AUTHME_LDAP_PROVIDERS_JSON` | Secret-managed realm directory endpoints, bind credentials, CA trust, mappings, and opt-in JIT |
+| `AUTHME_LDAP_PROVIDERS_JSON` | Secret-managed realm directory endpoints, bind credentials, CA trust, mappings, opt-in JIT, and per-provider sync/reconciliation policy |
 | `AUTHME_OIDC_PROVIDERS_JSON` | Secret-managed upstream endpoints, client credentials, signing policy, mappings, and opt-in JIT |
 | `AUTHME_SAML_PROVIDERS_JSON` | Secret-managed IdP entity/SSO trust, signing certificates, optional SP signing key, mappings, and opt-in JIT |
 | `AUTHME_SCIM_TOKENS_JSON` | Independent high-entropy realm provisioning tokens; enabling any token requires PostgreSQL |
@@ -90,6 +90,22 @@ Treat provider ID, issuer/entity ID, endpoint, CA, and attribute mapping changes
 Restrict egress from AuthMe to the exact LDAP, upstream OIDC/SAML, PostgreSQL, Redis, and DNS destinations. Validate directory and IdP certificate chains, rotate bind/client/SCIM credentials independently, and alert on provider unavailability, federation callback failures, replay rejection, SCIM mutation failures, and unexpected JIT creation. SAML certificate rollover needs an overlap period with both intended IdP verification certificates configured.
 
 Register only the exact callback/ACS URLs documented in [federation-and-provisioning.md](federation-and-provisioning.md). Verify metadata, one full sign-in, a rejected replay, account collision behavior, disabled/locked accounts, and multi-replica completion before enabling a provider for users. SCIM clients must read after ambiguous `5xx` responses because a mutation can commit before application audit persistence fails.
+
+### LDAP synchronization runbook
+
+Apply migration `007_ldap_sync.sql` before enabling sync. Select and test a truly immutable `external_id_attribute` (`entryUUID` or AD `objectGUID`), a narrowly reviewed base/filter, and a page size the directory supports. Begin with `sync_deletion_policy: "disable"`; use `"delete"` only after restore and accidental-filter-change recovery have been rehearsed. Decide explicitly whether directory groups and roles are authoritative.
+
+Run a baseline manually and inspect the credential-free counters:
+
+```sh
+npm run ldap:sync -- --realm master --provider corporate-directory
+```
+
+Investigate every nonzero `conflicts` count through explicit account linking or source-data correction; rerunning will not auto-link it. Verify a sample of created, renamed, group-mapped, disabled, and re-enabled users before scheduling. The command requires `--realm`, considers only providers with `sync_enabled: true`, and exits nonzero unless every selected provider succeeds.
+
+Schedule the same command with a platform CronJob or equivalent using the AuthMe image, production Secret, network policy, and PostgreSQL access. Permit only one active job per realm/provider. PostgreSQL advisory locking makes an accidental overlap return `busy` instead of racing reconciliation; treat that nonzero exit as a scheduling alert. Capture stdout JSON as metrics or job logs, but do not enable shell tracing or print `AUTHME_LDAP_PROVIDERS_JSON`.
+
+On directory, TLS, bind, paging, entry-validation, or pre-reconciliation database failure, AuthMe closes the LDAP client and does not run the missing-entry phase. Entries committed before the failure may already be updated; this is expected and the next invocation safely resumes them. A database failure during reconciliation preserves each already-completed disable/delete transaction and resumes the remaining links on retry. Do not compensate manually. Restore directory/database connectivity, correct the invalid mapping or entry, and rerun the same realm/provider. Alert on `unavailable`, `failed`, `busy`, conflicts, unexpected create/update volume, and any disable/delete count.
 
 ## Reverse proxy and TLS
 
@@ -126,6 +142,7 @@ Operational rules:
 - Run migrations as an explicit release step, once, under an advisory lock where supported.
 - The migrator preflights applied names and checksums before applying pending files, then AuthMe verifies the exact release manifest again before production startup. A missing `schema_migrations` table, pending or modified migration, or migration unknown to the running image fails startup before realm state is touched. Run `npm run db:migrate` with the target image first; do not hand-edit migration history.
 - Migration `006_ciba.sql` adds durable CIBA polling deadline columns to `oidc_records`; apply it before enabling a release that accepts CIBA requests on any replica.
+- Migration `007_ldap_sync.sql` adds per-run reconciliation markers to immutable external-identity links; apply it before running `ldap:sync`.
 - Back up before schema changes and verify that the target application can run against the migrated schema.
 - Bound each AuthMe replica's connection pool so the combined maximum remains below database capacity with headroom for migrations and operations.
 - Configure statement, lock, and idle transaction timeouts.
