@@ -22,6 +22,27 @@ function interactionClientName(client) {
   return client.clientName || client.clientId;
 }
 
+function amrSatisfies(type, amr) {
+  if (type === 'password') return amr.includes('pwd') || amr.includes('ldap');
+  if (type === 'totp') return amr.includes('otp') || amr.includes('recovery');
+  if (type === 'passkey') return amr.includes('passkey') || amr.includes('hwk');
+  if (type === 'federated') return amr.includes('federated');
+  return false;
+}
+
+export function authenticationSatisfiesFlow(flow, amr, user = {}) {
+  if (!flow) return true;
+  const required = flow.steps.filter((step) => step.requirement === 'required'
+    || (step.requirement === 'conditional' && step.type === 'totp' && user.totpConfirmed));
+  if (required.some((step) => !amrSatisfies(step.type, amr))) return false;
+  const alternatives = flow.steps.filter((step) => step.requirement === 'alternative');
+  return alternatives.length === 0 || alternatives.some((step) => amrSatisfies(step.type, amr));
+}
+
+function requestedAcrs(details) {
+  return String(details.params.acr_values ?? '').split(' ').filter(Boolean);
+}
+
 async function interaction(provider, req, res, expectedPrompt) {
   const details = await provider.interactionDetails(req, res);
   if (details.uid !== req.params.uid || (expectedPrompt && details.prompt.name !== expectedPrompt)) {
@@ -59,10 +80,34 @@ export function createInteractionRouter({
   logger,
   webauthn,
   identityRuntime,
+  management,
 }) {
   const passkeys = webauthn ?? createWebAuthn(config);
   const router = Router();
   const base = `/realms/${realm}/interaction/:uid`;
+
+  async function authenticationContext(details, user, amr, defaultAcr) {
+    const requested = requestedAcrs(details);
+    const flow = management && await management.resolveAuthenticationFlow(realm, {
+      clientId: details.params.client_id,
+      requestedAcrs: requested,
+    });
+    const organizationContext = details.params.organization;
+    const organizations = organizationContext && management
+      ? await management.listUserOrganizations(realm, user.id)
+      : [];
+    const organizationAccepted = !organizationContext || organizations.some((organization) => (
+      organization.id === organizationContext || organization.alias === organizationContext
+    ));
+    const acr = flow?.acr ?? defaultAcr;
+    return {
+      accepted: authenticationSatisfiesFlow(flow, amr, user)
+        && (!flow || requested.length === 0 || requested.includes(acr))
+        && organizationAccepted,
+      acr,
+      flow,
+    };
+  }
 
   function federationProviders(interactionUid) {
     return (identityRuntime?.federationEntriesFor?.(realm) ?? []).flatMap(({ manifest, implementation }) => (
@@ -185,13 +230,37 @@ export function createInteractionRouter({
         const replacementHash = await hashPassword(suppliedPassword, config.passwordPepper);
         await store.rehashPasswordIfCurrent(realm, user.id, user.passwordHash, replacementHash);
       }
-      await store.recordLoginSuccess(realm, user.id);
       const amr = user.totpConfirmed
         ? [authenticationMethod, recoveryUsed ? 'recovery' : 'otp']
         : [authenticationMethod];
+      const context = await authenticationContext(
+        details,
+        user,
+        amr,
+        user.totpConfirmed ? 'urn:authme:loa:2' : 'urn:authme:loa:1',
+      );
+      if (!context.accepted) {
+        await store.writeAudit({
+          realm,
+          type: 'identity.login.step_up_failed',
+          subjectId: user.id,
+          clientId: details.params.client_id,
+          ip: req.ip,
+          userAgent: req.get('user-agent'),
+          metadata: { requestedAcrs: requestedAcrs(details), flow: context.flow?.alias, amr },
+        });
+        const client = await provider.Client.find(details.params.client_id);
+        return res.status(401).send(loginView({
+          uid: details.uid,
+          clientName: interactionClientName(client),
+          login,
+          error: 'This application requires a stronger authentication method for this sign-in.',
+        }));
+      }
+      await store.recordLoginSuccess(realm, user.id);
       await store.writeAudit({ realm, type: 'identity.login.succeeded', subjectId: user.id, clientId: details.params.client_id, ip: req.ip, userAgent: req.get('user-agent'), metadata: { amr } });
       return provider.interactionFinished(req, res, {
-        login: { accountId: user.id, acr: user.totpConfirmed ? 'urn:authme:loa:2' : 'urn:authme:loa:1', amr, remember: true },
+        login: { accountId: user.id, acr: context.acr, amr, remember: true },
       }, { mergeWithLastSubmission: false });
     } catch (error) {
       if (error?.msBeforeNext) {
@@ -300,8 +369,26 @@ export function createInteractionRouter({
         }));
       }
 
-      await store.recordLoginSuccess(realm, user.id);
       const amr = ['passkey'];
+      const context = await authenticationContext(details, user, amr, 'urn:authme:loa:2');
+      if (!context.accepted) {
+        await store.writeAudit({
+          realm,
+          type: 'identity.login.step_up_failed',
+          subjectId: user.id,
+          clientId: details.params.client_id,
+          ip: req.ip,
+          userAgent: req.get('user-agent'),
+          metadata: { requestedAcrs: requestedAcrs(details), flow: context.flow?.alias, amr },
+        });
+        const client = await provider.Client.find(details.params.client_id);
+        return res.status(401).send(loginView({
+          uid: details.uid,
+          clientName: interactionClientName(client),
+          error: 'This application requires a different authentication method for this sign-in.',
+        }));
+      }
+      await store.recordLoginSuccess(realm, user.id);
       await store.writeAudit({
         realm,
         type: 'identity.login.succeeded',
@@ -312,7 +399,7 @@ export function createInteractionRouter({
         metadata: { amr, credentialId: credential.id },
       });
       return provider.interactionFinished(req, res, {
-        login: { accountId: user.id, acr: 'urn:authme:loa:2', amr, remember: true },
+        login: { accountId: user.id, acr: context.acr, amr, remember: true },
       }, { mergeWithLastSubmission: false });
     } catch (error) {
       logger.warn({ error, realm }, 'Passkey interaction failed');
@@ -335,6 +422,14 @@ export function createInteractionRouter({
         for (const [indicator, scopes] of Object.entries(missing.missingResourceScopes)) grant.addResourceScope(indicator, scopes.join(' '));
       }
       grantId = await grant.save();
+      if (params.organization) {
+        try {
+          await provider.authmeOrganizationContexts.set(grantId, accountId, params.organization);
+        } catch (error) {
+          if (!details.grantId) await provider.Grant.adapter.destroy(grantId).catch(() => {});
+          throw error;
+        }
+      }
       const consent = details.grantId ? {} : { grantId };
       await store.writeAudit({ realm, type: 'identity.consent.granted', subjectId: accountId, clientId: params.client_id, ip: req.ip, metadata: { scope: params.scope } });
       return provider.interactionFinished(req, res, { consent }, { mergeWithLastSubmission: true });

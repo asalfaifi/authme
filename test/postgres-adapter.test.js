@@ -258,7 +258,8 @@ test('backchannel polling is client-bound, realm-bound, and atomically rate limi
   assert.match(sql, /records\.consumed_at IS NULL/);
   assert.match(sql, /records\.expires_at > CURRENT_TIMESTAMP/);
   assert.match(sql, /FOR UPDATE/);
-  assert.match(sql, /LEAST\(COALESCE\(target\.ciba_poll_interval_seconds, \$4::integer\) \+ 5, 300\)/);
+  assert.match(sql, /COALESCE\(target\.ciba_poll_interval_seconds, \$4::integer\) \+ 5/);
+  assert.doesNotMatch(sql, /LEAST|300/);
 });
 
 test('backchannel lookup exposes expiry to the provider while other models filter it in SQL', async () => {

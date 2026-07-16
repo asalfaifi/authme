@@ -179,6 +179,7 @@ export function createFederationRouter({
   completionTtlSeconds = 120,
   maxSamlPostBytes = 1_500_000,
   maxOidcCallbackBytes = 16_384,
+  loginPolicy = async () => true,
 }) {
   if (typeof realm !== 'string' || !/^[a-z][a-z0-9-]{0,62}$/.test(realm)) throw new TypeError('Federation realm is invalid');
   if (!provider?.interactionDetails || !provider?.interactionFinished) throw new TypeError('Federation OIDC provider is required');
@@ -368,6 +369,9 @@ export function createFederationRouter({
       const { extensionId, providerId } = login;
       extensionFor(registry, realm, extensionId, providerId,
         extensionId === 'builtin.saml-federation' ? 'saml2' : 'oidc');
+      if (!await loginPolicy({ details, login })) {
+        throw requestError('The federated identity is not authorized for the requested organization', 403, 'AUTHME_FEDERATION_ORGANIZATION_DENIED');
+      }
       await audit(auditEvent(req, realm, 'identity.federation.login_succeeded', extensionId, providerId, {
         clientId: details.params?.client_id,
         subjectId: login.accountId,

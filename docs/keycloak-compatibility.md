@@ -2,15 +2,15 @@
 
 ## Compatibility promise
 
-AuthMe v0.3 provides a migration-oriented compatibility facade for common Keycloak OpenID Connect clients. It preserves Keycloak-shaped issuer URLs, OIDC endpoint paths, and role claims so many relying parties can switch providers with little or no application code change.
+AuthMe v1.0.0-rc.1 provides a migration-oriented compatibility facade for common Keycloak OpenID Connect clients. It preserves Keycloak-shaped issuer URLs, OIDC endpoint paths, and role claims so many relying parties can switch providers with little or no application code change.
 
 It is not a drop-in replacement for the Keycloak Admin REST API, database, extensions, adapters, SAML surface, or every Keycloak feature. Compatibility means explicitly listed behavior only.
 
 Keycloak's current feature inventory includes OIDC/OAuth, SAML, identity brokering, social login, LDAP/AD federation, Kerberos, admin and account consoles, themes, flexible authentication, passkeys/TOTP/recovery codes, sessions, token mappers, and SPIs; see the official [Keycloak Server Administration Guide](https://www.keycloak.org/docs/latest/server_admin/). AuthMe implements a documented subset and stages the rest rather than implying drop-in parity.
 
-## v0.3 compatibility status
+## v1.0 release-candidate compatibility status
 
-| Capability | v0.3 status | Notes |
+| Capability | Status | Notes |
 |---|---|---|
 | Realm-shaped issuer | Implemented | `https://host/realms/{realm}` |
 | OIDC discovery | Implemented | Keycloak-shaped discovery URL |
@@ -38,20 +38,24 @@ Keycloak's current feature inventory includes OIDC/OAuth, SAML, identity brokeri
 | Administration console | Implemented, AuthMe-native | Realm-scoped OIDC login, grants, users, credentials, audit, client registration, and safe configuration; not the Keycloak console or theme system |
 | Administration API | Implemented, AuthMe-native | Separate root bearer for automation; not Keycloak Admin REST compatible |
 | Realm/client role claims | Implemented | Keycloak-shaped JSON claims |
-| Groups claim | Implemented baseline | Flat emitted paths; advanced mapping is staged |
+| Groups and roles | Implemented | Stable nested group paths, group roles, composite realm-role expansion, reusable client scopes, and configured claim mappers |
 | API audiences/JWT access tokens | Implemented | Exact configured RFC 8707 audiences; per-client and multi-resource policy; `typ: at+jwt`; audience-filtered scopes and role/group claims |
 | Pairwise subjects | Implemented | Realm- and client/sector-bound identifiers |
 | Direct Access Grants/password grant | Not supported | Deliberately omitted under current OAuth security guidance |
-| Implicit/hybrid flows | Not in v0.3 contract | Upstream capability does not mean enabled AuthMe behavior |
+| Implicit/hybrid flows | Not in product contract | Upstream capability does not mean enabled AuthMe behavior |
 | mTLS | Implemented in v0.4 | `tls_client_auth` + `self_signed_tls_client_auth` via trusted proxy; `cnf.x5t#S256` certificate-bound tokens |
 | CIBA | Implemented in v0.4 | Poll mode, confidential clients only; ping/push staged |
 | FAPI 2.0 | Implemented in v0.4, opt-in | AuthMe `fapi_profile: "2.0"` authorization-code clients require PAR, PKCE `S256`, PS256/ES256 JAR/JARM, DPoP or mTLS token binding, and private-key or mTLS client authentication; AuthMe is not certified |
 | Keycloak Admin REST API | Not supported | AuthMe administration is a separate API/model |
-| Upstream OIDC brokering | Implemented baseline | Fixed-provider Authorization Code + PKCE; collision-safe JIT/admin linking; no social presets |
+| Upstream OIDC brokering | Implemented baseline | Fixed-provider Authorization Code + PKCE; collision-safe JIT/admin linking; organization IdP policy; no social presets |
 | SAML 2.0 | Implemented SP and IdP baselines | Upstream SP federation plus downstream IdP metadata, Redirect/POST login, signed Response/Assertion, optional outgoing assertion encryption, opt-in IdP initiation, and redirect SLO; no artifact binding or broker-side decryption |
-| LDAP/Active Directory | Implemented authentication baseline | LDAPS/StartTLS credential validation and mapping; no synchronization or Kerberos |
-| SCIM 2.0 | Implemented core baseline | Users/Groups CRUD/PATCH, discovery, core `eq`, pagination, ETags; no Bulk/full filters/extensions |
-| Kerberos/SPNEGO | Not supported | No v0.3 implementation |
+| LDAP/Active Directory | Implemented | LDAPS/StartTLS credential validation plus bounded import, synchronization, reconciliation, mapped groups/roles, and disable/delete policy; no Kerberos |
+| SCIM 2.0 | Implemented | Users/Groups CRUD/PATCH, discovery, Bulk, sorting, supported full core filter grammar, pagination, and ETags; arbitrary extension schemas are not promised |
+| Account console | Implemented, AuthMe-native | Profile, password/recovery, email verification, TOTP/recovery codes, passkeys, sessions, and organization invitation acceptance |
+| Organizations | Implemented, AuthMe-native | Domains, invitations, memberships/roles, organization IdP policy, and authorization token context |
+| Authentication flows | Implemented, AuthMe-native | Client/ACR-selected password, TOTP, passkey, and federation steps with AMR and maximum-age enforcement |
+| Signing/operations | Implemented code path | Encrypted backup/restore, HA/load rehearsal, and file/KMS/HSM signing-provider rotation; real hardware/DR drills remain external evidence |
+| Kerberos/SPNEGO | Not supported | No implementation |
 
 ## URL mapping
 
@@ -112,13 +116,13 @@ Compatibility rules:
 - Role names are case-sensitive and should be migrated without normalization surprises.
 - Token consumers must tolerate additional standard claims and must not depend on JSON member ordering.
 
-Composite-role expansion, arbitrary Keycloak protocol mappers, authorization-services permissions, lightweight access-token conventions, and every Keycloak built-in role are not guaranteed in v0.3.
+Composite realm roles and AuthMe's documented hardcoded, user-attribute, role, group, and organization claim mappers are implemented. Keycloak script mappers, authorization-services permissions, lightweight access-token conventions, and every Keycloak built-in role are not guaranteed.
 
 ## Client mapping
 
 The ordinary Keycloak OIDC client concepts map as follows:
 
-| Keycloak concept | AuthMe v0.3 mapping |
+| Keycloak concept | AuthMe v1.0 mapping |
 |---|---|
 | Client ID | Client identifier, unchanged when possible |
 | Valid redirect URIs | Exact redirect URI registrations |
@@ -128,8 +132,8 @@ The ordinary Keycloak OIDC client concepts map as follows:
 | Confidential client | Client authentication configured at token endpoints |
 | Service accounts | Client Credentials grant plus assigned client roles/scopes |
 | Standard flow | Authorization Code flow |
-| Direct access grants | No v0.3 equivalent |
-| Client scopes | Explicit OIDC scopes and claim policy; advanced reusable mappers staged |
+| Direct access grants | No equivalent |
+| Client scopes | Reusable default/optional scopes with configured claim mappers |
 | Realm/client roles | Separate realm and client-role assignments |
 
 Do not copy a Keycloak client secret into logs, command history, tickets, or migration files. Prefer rotating the secret during migration.
@@ -211,21 +215,20 @@ Even when URLs and claims match, test these behaviors:
 
 Applications must discover endpoints from the issuer rather than concatenate undocumented paths. Resource servers must validate tokens using standards-based libraries, not Keycloak-internal classes or database access.
 
-## Deliberately unsupported v0.3 surfaces
+## Deliberately unsupported surfaces
 
-The following require staged implementations and separate compatibility specifications:
+The following are outside the v1.0 release-candidate compatibility promise:
 
 - SAML artifact binding, encrypted assertions received by the upstream broker, and POST/SOAP or multi-party logout beyond the implemented IdP baseline;
-- LDAP/Active Directory synchronization and Kerberos/SPNEGO;
+- Kerberos/SPNEGO and X.509 end-user authentication;
 - curated social identity-provider presets and arbitrary broker plugins; upstream OIDC and SAML federation are implemented baselines;
 - Keycloak Admin REST and `kcadm` compatibility;
-- a self-service account console, complete Keycloak-equivalent policy administration, and Keycloak theme/SPI packages; AuthMe's native administration console is implemented;
-- configurable authentication flows, arbitrary required actions, imported WebAuthn/U2F credentials, attestation policy, and X.509 end-user login; fresh AuthMe passkey, TOTP, and one-use recovery-code enrollment is implemented;
-- organizations and invitations;
-- SCIM Bulk, sorting, arbitrary extension schemas, and the complete filter grammar; core Users/Groups provisioning is implemented;
+- Keycloak-equivalent UI behavior, Keycloak theme/SPI packages, and arbitrary required-action plugins; AuthMe's native account/admin consoles and documented authentication steps are implemented;
+- imported WebAuthn/U2F credentials and attestation policy; fresh AuthMe passkey, TOTP, and one-use recovery-code enrollment is implemented;
+- arbitrary SCIM extension schemas beyond the documented core Users/Groups model;
 - Authorization Services/UMA 2 policy evaluation;
-- Keycloak realm JSON import fidelity;
-- not-before revocation policies and every protocol mapper.
+- byte-for-byte Keycloak realm JSON import fidelity; AuthMe provides a deterministic supported-subset transformation and compatibility report;
+- not-before revocation policies, script mappers, and every historical protocol mapper.
 
 ## Compatibility validation
 

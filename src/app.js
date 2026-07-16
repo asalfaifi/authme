@@ -6,7 +6,7 @@ import pinoHttp from 'pino-http';
 import { createDataLayer } from './db.js';
 import { resolveFederatedLogin } from './authentication/federated-login.js';
 import { createIdentityRuntime } from './authentication/runtime.js';
-import { loadRealmJwks } from './crypto/jwks.js';
+import { createSigningKeyManager } from './crypto/signing-key-manager.js';
 import { hashPassword } from './crypto/password.js';
 import { randomToken } from './crypto/secrets.js';
 import { createLogger, loggableError } from './logging.js';
@@ -140,14 +140,23 @@ export async function createAuthMeApp(config, overrides = {}) {
     });
     const providers = new Map();
     const jwksByRealm = new Map();
+    const signingKeyManagers = new Map();
     for (const realm of config.realms) {
-      const jwks = await loadRealmJwks(config, realm);
+      const signingKeyManager = createSigningKeyManager({
+        config,
+        realm,
+        management: data.management,
+        adapters: overrides.signingKeyAdapters,
+      });
+      const jwks = await signingKeyManager.load();
+      signingKeyManagers.set(realm, signingKeyManager);
       jwksByRealm.set(realm, jwks);
       const provider = await createRealmProvider({
         realm,
         config,
         store,
         data,
+        management: data.management,
         Adapter: data.adapterFor(realm),
         jwks,
         logger,
@@ -246,11 +255,26 @@ export async function createAuthMeApp(config, overrides = {}) {
         res.set('Cache-Control', 'public, max-age=3600').type('text/javascript').send(await readFile(passkeyScriptPath, 'utf8'));
       } catch (error) { next(error); }
     });
+    app.use('/realms/:realm', async (req, res, next) => {
+      try {
+        if (!config.realms.includes(req.params.realm)) return next();
+        const realm = await data.management.findRealm(req.params.realm);
+        if (realm?.enabled !== false) return next();
+        res.set('Cache-Control', 'no-store');
+        return res.status(503).type('application/problem+json').json({
+          type: 'about:blank',
+          title: 'Realm disabled',
+          status: 503,
+          detail: 'This identity realm is temporarily disabled.',
+        });
+      } catch (error) { return next(error); }
+    });
     if (identityRuntime.scimRepository) {
       app.use('/scim/v2/realms', identityRuntime.scim.implementation.createRouter({
         repository: identityRuntime.scimRepository,
         authenticate: identityRuntime.scimAuthenticate,
-        realmExists: async (realm) => config.realms.includes(realm),
+        realmExists: async (realm) => config.realms.includes(realm)
+          && (await data.management.findRealm(realm))?.enabled !== false,
         baseUrl: `${config.publicUrl}/scim/v2/realms`,
         audit: async ({ realm, actor, type, resourceType, resourceId, changes, request }) => store.writeAudit({
           realm,
@@ -265,9 +289,11 @@ export async function createAuthMeApp(config, overrides = {}) {
     app.use('/admin', createAdminRouter({
       config, store, rateLimits, metrics, providers, data, webauthn,
       federatedIdentities: identityRuntime.federatedIdentities,
+      management: data.management,
       jwksByRealm,
       fetch: overrides.fetch,
       extensions: identityRuntime.registry,
+      signingKeyManagers,
     }));
 
     for (const [realm, provider] of providers) {
@@ -287,6 +313,7 @@ export async function createAuthMeApp(config, overrides = {}) {
         config,
         store,
         data,
+        management: data.management,
         rateLimits,
         jwks: jwksByRealm.get(realm),
         webauthn,
@@ -305,6 +332,14 @@ export async function createAuthMeApp(config, overrides = {}) {
         publicUrl: config.publicUrl,
         csrfSecret: config.csrfSecret,
         audit: (event) => store.writeAudit(event),
+        loginPolicy: async ({ details, login }) => {
+          const organizationContext = details.params?.organization;
+          if (!organizationContext) return true;
+          const organization = await data.management.findOrganization(realm, organizationContext);
+          if (!organization?.enabled || !organization.identityProviderIds.includes(login.providerId)) return false;
+          const memberships = await data.management.listOrganizationMemberships(realm, organization.id);
+          return memberships.some((membership) => membership.userId === login.accountId);
+        },
         accountResolver: async ({ extensionId, providerId, profile, identity }) => {
           const configured = extensionId === 'builtin.saml-federation'
             ? config.samlProvidersByRealm[realm]?.find((candidate) => candidate.id === providerId)
@@ -342,6 +377,7 @@ export async function createAuthMeApp(config, overrides = {}) {
       app.use(createInteractionRouter({
         realm, provider, store, config, rateLimits, dummyPasswordHash, logger, webauthn,
         identityRuntime,
+        management: data.management,
       }));
       const callback = provider.callback();
       app.use(`/realms/${realm}/device`, async (req, res, next) => {
@@ -415,6 +451,7 @@ export async function createAuthMeApp(config, overrides = {}) {
       logger,
       metrics,
       providers,
+      signingKeyManagers,
       auditWriter,
       identityRuntime,
       rateLimits,

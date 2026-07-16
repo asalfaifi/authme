@@ -124,6 +124,7 @@ export function createAccountConsole({
   config,
   store,
   data,
+  management,
   rateLimits,
   jwks,
   webauthn,
@@ -516,8 +517,10 @@ export function createAccountConsole({
     } catch (error) { return next(error); }
   });
 
-  router.get('/api/session', (req, res) => {
+  router.get('/api/session', async (req, res, next) => {
+    try {
     const { user, sessionValue } = req.authmeAccount;
+    const organizations = management ? await management.listUserOrganizations(realm, user.id) : [];
     return res.json({
       realm,
       csrf: csrfFor(sessionValue),
@@ -531,7 +534,37 @@ export function createAccountConsole({
         mfaEnabled: Boolean(user.totpConfirmed),
         recoveryCodesRemaining: user.recoveryCodeHashes.length,
       },
+      organizations: organizations.map(({ id, name, alias, roles }) => ({ id, name, alias, roles })),
     });
+    } catch (error) { return next(error); }
+  });
+
+  router.get('/api/organizations', async (req, res, next) => {
+    try {
+      const organizations = management
+        ? await management.listUserOrganizations(realm, req.authmeAccount.user.id)
+        : [];
+      return res.json({ organizations: organizations.map(({ id, name, alias, domains, roles }) => ({ id, name, alias, domains, roles })) });
+    } catch (error) { return next(error); }
+  });
+
+  router.post('/api/organization-invitations/accept', async (req, res, next) => {
+    try {
+      const input = parse(z.object({ token: z.string().regex(/^[A-Za-z0-9_-]{43}$/) }).strict(), req, res);
+      if (!input) return undefined;
+      const { user } = req.authmeAccount;
+      const invitation = management && await management.consumeOrganizationInvitation(
+        realm,
+        keyedDigest(`organization-invitation:${realm}:${input.token}`, config.passwordPepper),
+        user,
+      );
+      if (!invitation) return problem(res, 400, 'Invitation unavailable', 'The invitation is invalid, expired, already used, or belongs to another email address.');
+      await store.writeAudit(auditEvent(req, 'account.organization_invitation.accepted', user.id, {
+        invitationId: invitation.id,
+        organizationId: invitation.organizationId,
+      }));
+      return res.status(204).end();
+    } catch (error) { return next(error); }
   });
 
   router.patch('/api/profile', async (req, res, next) => {

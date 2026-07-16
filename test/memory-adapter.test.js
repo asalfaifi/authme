@@ -105,6 +105,11 @@ test('backchannel requests enforce one-way completion and realm-local polling ca
   assert.deepEqual(await requests.checkCibaPoll('auth-request', 'client', 1), {
     status: 'slow_down', interval: 6,
   });
+  let continuedBackoff;
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    continuedBackoff = await requests.checkCibaPoll('auth-request', 'client', 1);
+  }
+  assert.deepEqual(continuedBackoff, { status: 'slow_down', interval: 306 });
   assert.deepEqual(await requests.checkCibaPoll('auth-request', 'other-client', 1), { status: 'invalid' });
   assert.deepEqual(await staffRequests.checkCibaPoll('auth-request', 'client', 1), { status: 'invalid' });
 

@@ -17,7 +17,7 @@ Before scheduling a cutover:
 - Realm owners approve the password/credential migration strategy.
 - Every relying party has an owner and a test result.
 
-AuthMe v0.3 can replace documented upstream OIDC federation, SP-initiated SAML IdP federation, LDAP/AD credential authentication, and core SCIM Users/Groups use cases. A source realm that serves SAML clients, uses Kerberos, encrypted/IdP-initiated SAML, LDAP synchronization, advanced SCIM, custom authenticators, portable existing WebAuthn credentials, Keycloak Authorization Services, organizations, or custom protocol mappers is not a full-cutover candidate. AuthMe implements fresh passkey/TOTP/recovery enrollment, but not automatic portability of existing Keycloak MFA credentials. Retain Keycloak when seamless credential preservation is mandatory.
+AuthMe v1.0.0-rc.1 can replace the documented OIDC, SAML SP/IdP, LDAP/AD authentication and synchronization, SCIM core/Bulk/filtering, organization, native administration/account, and supported claim-mapping use cases. A source realm that depends on Kerberos, SAML artifact binding or broker-side decryption, custom authenticator/script mapper SPIs, portable existing WebAuthn credentials, Keycloak Authorization Services, Admin REST wire compatibility, or multi-site active/active writes is not a full-cutover candidate. AuthMe implements fresh passkey/TOTP/recovery enrollment, but not automatic portability of existing Keycloak MFA credentials. Retain Keycloak when seamless credential preservation is mandatory.
 
 ## Phase 1: inventory
 
@@ -35,9 +35,9 @@ Capture the source version and, per realm:
 
 Classify each item as:
 
-1. direct v0.3 mapping;
+1. direct v1.0 mapping;
 2. transformable mapping;
-3. staged/blocked;
+3. unsupported/blocked;
 4. intentionally retired.
 
 Unowned clients are a migration blocker, not an invitation to assume compatibility.
@@ -153,17 +153,17 @@ missing source user UUIDs are explicit warnings.
 | Direct Access Grant / implicit flow | Not emitted | Unsupported |
 | Disabled, bearer-only, SAML, or reserved client | Not emitted as a static OIDC client | Unsupported/skipped; bearer APIs need explicit resource-server policy |
 | Realm and client roles | Separate role inventories and user namespaces | Direct for portable role names |
-| Composite role | Role name retained; no automatic expansion | Warning; materialize and reconcile effective entitlements |
+| Composite role | Role name retained; transformer does not emit the composite graph | Warning; create/reconcile the graph through the mutable role API before cutover |
 | Nested group | Canonical flattened path such as `/engineering/platform` | Direct path mapping |
 | Group role mapping | Retained on group and materialized onto affected users, including ancestors | Warning; AuthMe emits flat user entitlements |
 | User profile and assignments | AuthMe user fields, safe attributes, roles, group paths, client roles | Direct; email required and normalized lowercase |
 | Password/TOTP/WebAuthn/recovery credential | Transition status only; no credential material | Unsupported/skipped; reset or fresh enrollment required |
 | OIDC identity provider | Fixed endpoints, claim names, JIT policy | Warning; new upstream client secret required |
 | SAML identity provider | Entity ID, SSO URL, signing certificate, simple attribute mappings | Direct only when complete; advanced/encrypted/IdP-initiated behavior unsupported |
-| LDAP provider | TLS endpoint and direct profile attributes | Warning; bind credential rotation and no synchronization semantics |
+| LDAP provider | TLS endpoint and direct profile attributes | Warning; rotate bind credentials and separately configure/rehearse synchronization policy |
 | Role/group and direct profile mapper | Built-in AuthMe claim/profile behavior | Direct where claim semantics match |
-| Script, hardcoded, audience, custom, or transform mapper | Not emitted | Unsupported; manual claim/resource policy review |
-| Sessions, tokens, initial-access tokens, authentication flows, required actions, organizations | Not emitted | Unsupported/runtime state skipped |
+| Script, hardcoded, audience, custom, or transform mapper | Not emitted by transformer | Map supported hardcoded/attribute/role/group/organization cases through the claim-mapper API; scripts/custom transforms remain unsupported |
+| Sessions, tokens, initial-access tokens, authentication flows, required actions, organizations | Not emitted | Runtime state is intentionally skipped; recreate reviewed flows/organizations through the native API |
 
 Suggested order:
 
@@ -181,23 +181,23 @@ Do not import active authorization codes, access tokens, refresh tokens, browser
 
 ### Claim mapper transformation
 
-For each Keycloak protocol mapper, write the expected claim name, source, type, scope, inclusion in ID/access/UserInfo responses, and audience. Map simple role/group/attribute cases to AuthMe's v0.3 claim policy. Mark scripts, custom SPIs, composite expansion, authorization-service permissions, and unsupported transforms as blockers.
+For each Keycloak protocol mapper, write the expected claim name, source, type, scope, inclusion in ID/access/UserInfo responses, and audience. Map hardcoded, user-attribute, role, group, and organization cases to AuthMe client/client-scope claim mappers. Recreate and test composite-role graphs separately. Mark scripts, custom SPIs, authorization-service permissions, and unsupported transforms as blockers.
 
 ## Phase 5: credentials
 
 ### Passwords
 
-AuthMe v0.3 does not promise transparent import of Keycloak password hash records. Treat credential formats as sensitive, versioned implementation details. Choose one reviewed strategy:
+AuthMe v1.0 does not promise transparent import of Keycloak password hash records. Treat credential formats as sensitive, versioned implementation details. Choose one reviewed strategy:
 
-1. **Password reset:** import accounts without a password and require a one-use reset through a verified channel. This is the simplest v0.3 strategy.
-2. **Federated transition:** configure Keycloak as an upstream OIDC authority, use immutable-subject links or collision-safe JIT, and move users to a separate verified password-reset/re-enrollment workflow. The v0.3 broker does not receive or rehash the Keycloak password.
+1. **Password reset:** import accounts without a password and require a one-use reset through a verified channel. This is the simplest strategy.
+2. **Federated transition:** configure Keycloak as an upstream OIDC authority, use immutable-subject links or collision-safe JIT, and move users to a separate verified password-reset/re-enrollment workflow. The broker does not receive or rehash the Keycloak password.
 3. **Reviewed hash bridge:** implement a narrowly scoped verifier for the exact exported Keycloak algorithm/parameters, then replace it with AuthMe's current password hash after successful login. This requires its own threat model, test vectors, constant-time review, and removal plan.
 
 Never downgrade the AuthMe password policy to accept plaintext or reversibly encrypted passwords. Never email temporary passwords.
 
 ### MFA, passkeys, recovery codes, and federated credentials
 
-AuthMe v0.3 supports fresh passkey and TOTP enrollment and generates one-use recovery codes. It does not import Keycloak WebAuthn credential keys/counters, TOTP seeds, or recovery codes. Plan authenticated re-enrollment on the AuthMe origin and invalidate the source credential material. Federated links can be recreated through AuthMe's explicit administration API only after reconciling the exact provider issuer and immutable subject; never infer them from email. X.509 mappings have no v0.3 compatibility guarantee. Defer migration when existing passkeys must be retained without re-enrollment.
+AuthMe supports fresh passkey and TOTP enrollment and generates one-use recovery codes. It does not import Keycloak WebAuthn credential keys/counters, TOTP seeds, or recovery codes. Plan authenticated re-enrollment on the AuthMe origin and invalidate the source credential material. Federated links can be recreated through AuthMe's explicit administration API only after reconciling the exact provider issuer and immutable subject; never infer them from email. X.509 mappings have no compatibility guarantee. Defer migration when existing passkeys must be retained without re-enrollment.
 
 ### Client secrets
 

@@ -265,11 +265,11 @@ export function createPostgresAdapter({ pool, realm }) {
            UPDATE oidc_records AS records
            SET ciba_poll_interval_seconds=CASE WHEN target.allowed
                  THEN COALESCE(target.ciba_poll_interval_seconds, $4::integer)
-                 ELSE LEAST(COALESCE(target.ciba_poll_interval_seconds, $4::integer) + 5, 300)
+                 ELSE COALESCE(target.ciba_poll_interval_seconds, $4::integer) + 5
                END,
                ciba_next_poll_at=CURRENT_TIMESTAMP + (CASE WHEN target.allowed
                  THEN COALESCE(target.ciba_poll_interval_seconds, $4::integer)
-                 ELSE LEAST(COALESCE(target.ciba_poll_interval_seconds, $4::integer) + 5, 300)
+                 ELSE COALESCE(target.ciba_poll_interval_seconds, $4::integer) + 5
                END * INTERVAL '1 second'),
                updated_at=CURRENT_TIMESTAMP
            FROM target

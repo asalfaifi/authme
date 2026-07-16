@@ -1,6 +1,6 @@
 {
   "name": "authme",
-  "version": "0.3.0",
+  "version": "1.0.0-rc.1",
   "description": "A standards-first, self-hosted identity and access server.",
   "type": "module",
   "private": false,
@@ -26,6 +26,12 @@
     "db:migrate": "node scripts/migrate.mjs",
     "ldap:sync": "node scripts/ldap-sync.mjs",
     "keys:generate": "node scripts/generate-jwks.mjs",
+    "keys:rotate": "node scripts/rotate-jwks.mjs",
+    "backup": "node scripts/backup.mjs",
+    "restore": "node scripts/restore.mjs",
+    "ha:rehearse": "node scripts/ha-rehearsal.mjs",
+    "perf:rehearse": "node scripts/load-rehearsal.mjs",
+    "release:artifacts": "node scripts/release-artifacts.mjs",
     "bootstrap:user": "node scripts/bootstrap-user.mjs",
     "smoke": "node scripts/smoke.mjs"
   },
@@ -53,5 +59,15 @@
   },
   "devDependencies": {
     "supertest": "^7.2.2"
-  }
+  },
+  "files": [
+    "charts",
+    "docs",
+    "migrations",
+    "scripts",
+    "src",
+    "LICENSE",
+    "README.md",
+    "SECURITY.md"
+  ]
 }

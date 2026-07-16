@@ -132,7 +132,9 @@ try {
   assert(discovery.issuer === `${base}/realms/master`, 'Issuer mismatch');
   assert(!discovery.grant_types_supported.includes('implicit'), 'Implicit grant must not be advertised');
   assert(discovery.code_challenge_methods_supported.includes('S256'), 'S256 PKCE is not advertised');
-  assert(discovery.token_endpoint_auth_methods_supported.join(' ') === 'client_secret_basic none', 'Unsupported client authentication methods are advertised');
+  assert(JSON.stringify(discovery.token_endpoint_auth_methods_supported) === JSON.stringify([
+    'client_secret_basic', 'private_key_jwt', 'client_secret_jwt', 'none',
+  ]), 'Client authentication discovery does not match the supported profile');
   assert(discovery.subject_types_supported.includes('pairwise'), 'Pairwise subject identifiers are not advertised');
   const oauthMetadataResponse = await request(`${base}/.well-known/oauth-authorization-server/realms/master`);
   const oauthMetadata = await oauthMetadataResponse.json();

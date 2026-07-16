@@ -2,13 +2,16 @@ import pg from 'pg';
 import {
   claimMemoryInitialAccessToken,
   createMemoryAdapter,
+  listMemoryAdapterRecords,
   listMemoryAccountSessions,
   revokeMemoryAccount,
+  revokeMemoryClient,
   revokeMemorySession,
 } from './adapters/memory.js';
 import { createPostgresAdapter } from './adapters/postgres.js';
 import { verifyMigrationState } from './migrations.js';
 import { MemoryIdentityStore, PostgresIdentityStore } from './repositories/identity-store.js';
+import { MemoryManagementStore, PostgresManagementStore } from './repositories/management-store.js';
 
 const revokeAccountSql = `WITH account_grants AS MATERIALIZED (
     SELECT id FROM oidc_records
@@ -28,6 +31,15 @@ const revokeAccountSql = `WITH account_grants AS MATERIALIZED (
   WHERE records.realm_name=doomed.realm_name
     AND records.model=doomed.model AND records.id=doomed.id`;
 
+export const cleanupExpiredOidcSql = `DELETE FROM oidc_records WHERE ctid IN (
+  SELECT ctid FROM oidc_records
+  WHERE expires_at <= CURRENT_TIMESTAMP
+    AND (model <> 'BackchannelAuthenticationRequest'
+      OR expires_at <= CURRENT_TIMESTAMP - INTERVAL '1 day')
+    ORDER BY expires_at
+    FOR UPDATE SKIP LOCKED LIMIT $1
+)`;
+
 async function restoreMemoryWebAuthnCredentials(store, realm, accountId, snapshot) {
   const current = await store.listWebAuthnCredentials(realm, accountId);
   for (const credential of current) {
@@ -40,15 +52,35 @@ export async function createDataLayer(config) {
   if (!config.databaseUrl) {
     if (!config.devMode) throw new Error('The in-memory store is permitted only in development mode');
     const store = new MemoryIdentityStore();
+    const management = new MemoryManagementStore(config.realms);
+    const adapterFor = (realm) => createMemoryAdapter({
+      realm,
+      async securityVersionFor(accountId) {
+        const user = await store.findUserById(realm, accountId);
+        return user?.enabled ? user.securityVersion : null;
+      },
+    });
     return {
       store,
-      adapterFor: (realm) => createMemoryAdapter({
-        realm,
-        async securityVersionFor(accountId) {
-          const user = await store.findUserById(realm, accountId);
-          return user?.enabled ? user.securityVersion : null;
-        },
-      }),
+      management,
+      adapterFor,
+      async listManagedClients(realm) {
+        return listMemoryAdapterRecords(realm, 'Client').map(({ id, payload }) => ({ id, metadata: payload }));
+      },
+      async upsertManagedClient(realm, metadata) {
+        const Adapter = adapterFor(realm);
+        await new Adapter('Client').upsert(metadata.client_id, metadata);
+        return cloneManagedClient(metadata);
+      },
+      async deleteManagedClient(realm, clientId) {
+        const Adapter = adapterFor(realm);
+        const existing = await new Adapter('Client').find(clientId);
+        if (!existing) return false;
+        await new Adapter('Client').destroy(clientId);
+        revokeMemoryClient(realm, clientId);
+        await management.deleteClientPolicy(realm, clientId);
+        return true;
+      },
       async claimInitialAccessToken(realm, id) { return claimMemoryInitialAccessToken(realm, id); },
       async revokeAccount(realm, accountId) { return revokeMemoryAccount(realm, accountId); },
       async listOidcSessions(realm, accountId) { return listMemoryAccountSessions(realm, accountId); },
@@ -107,6 +139,7 @@ export async function createDataLayer(config) {
     application_name: 'authme',
   });
   const store = new PostgresIdentityStore(pool);
+  const management = new PostgresManagementStore(pool);
   try {
     await store.ready();
     if (!config.devMode) await verifyMigrationState(pool);
@@ -124,7 +157,42 @@ export async function createDataLayer(config) {
   return {
     pool,
     store,
+    management,
     adapterFor: (realm) => createPostgresAdapter({ pool, realm }),
+    async listManagedClients(realm) {
+      const result = await pool.query(
+        `SELECT id, payload FROM oidc_records
+         WHERE realm_name=$1 AND model='Client' AND (expires_at IS NULL OR expires_at>CURRENT_TIMESTAMP)
+         ORDER BY id`,
+        [realm],
+      );
+      return result.rows.map(({ id, payload }) => ({ id, metadata: structuredClone(payload) }));
+    },
+    async upsertManagedClient(realm, metadata) {
+      const Adapter = createPostgresAdapter({ pool, realm });
+      await new Adapter('Client').upsert(metadata.client_id, metadata);
+      return cloneManagedClient(metadata);
+    },
+    async deleteManagedClient(realm, clientId) {
+      const result = await pool.query(
+        `WITH removed_client AS (
+           DELETE FROM oidc_records WHERE realm_name=$1 AND model='Client' AND id=$2 RETURNING id
+         ), client_grants AS MATERIALIZED (
+           SELECT id FROM oidc_records WHERE realm_name=$1 AND model='Grant' AND payload->>'clientId'=$2
+         ), revoked AS (
+           DELETE FROM oidc_records WHERE realm_name=$1
+             AND ((payload->>'clientId'=$2 AND model<>'Client') OR grant_id IN (SELECT id FROM client_grants))
+         ), assignments AS (
+           DELETE FROM client_scope_assignments
+           WHERE realm_name=$1 AND client_id=$2 AND EXISTS (SELECT 1 FROM removed_client)
+         ), mappers AS (
+           DELETE FROM claim_mappers
+           WHERE realm_name=$1 AND owner_type='client' AND owner_id=$2 AND EXISTS (SELECT 1 FROM removed_client)
+         ) SELECT id FROM removed_client`,
+        [realm, clientId],
+      );
+      return result.rowCount === 1;
+    },
     async claimInitialAccessToken(realm, id) {
       const result = await pool.query(
         `UPDATE oidc_records SET consumed_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
@@ -261,15 +329,7 @@ export async function createDataLayer(config) {
       }
     },
     async cleanupExpired(limit = 1000) {
-      const oidc = await pool.query(
-        `DELETE FROM oidc_records WHERE ctid IN (
-           SELECT ctid FROM oidc_records
-         WHERE expires_at <= CURRENT_TIMESTAMP
-           ORDER BY expires_at
-           FOR UPDATE SKIP LOCKED LIMIT $1
-         )`,
-        [limit],
-      );
+      const oidc = await pool.query(cleanupExpiredOidcSql, [limit]);
       return oidc.rowCount
         + await store.cleanupExpiredWebAuthnChallenges(limit)
         + await store.cleanupExpiredAdminSessions(limit)
@@ -290,4 +350,8 @@ export async function createDataLayer(config) {
     },
     async close() { await store.close(); },
   };
+}
+
+function cloneManagedClient(metadata) {
+  return structuredClone(metadata);
 }

@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { after, before, test } from 'node:test';
 import pg from 'pg';
 import { createPostgresAdapter } from '../src/adapters/postgres.js';
-import { createDataLayer } from '../src/db.js';
+import { cleanupExpiredOidcSql, createDataLayer } from '../src/db.js';
 import { PostgresIdentityStore } from '../src/repositories/identity-store.js';
 
 const databaseUrl = process.env.DATABASE_URL;
@@ -53,6 +53,21 @@ test('PostgreSQL consumption and replay claims have exactly one winner', { skip:
     second.upsert('same-proof', { iss: 'client' }, 60),
   ]);
   assert.deepEqual(replayed.map(({ status }) => status).sort(), ['fulfilled', 'rejected']);
+});
+
+test('expired CIBA records survive ordinary cleanup long enough to return expired_token', { skip: !databaseUrl }, async () => {
+  await pool.query(
+    `INSERT INTO oidc_records (realm_name,model,id,payload,expires_at) VALUES
+      ($1,'BackchannelAuthenticationRequest','recent-expired-ciba','{}',CURRENT_TIMESTAMP-INTERVAL '1 minute'),
+      ($1,'AccessToken','recent-expired-access','{}',CURRENT_TIMESTAMP-INTERVAL '1 minute')`,
+    [realm],
+  );
+  await pool.query(cleanupExpiredOidcSql, [10_000]);
+  const remaining = await pool.query(
+    `SELECT model,id FROM oidc_records WHERE realm_name=$1 AND id IN ('recent-expired-ciba','recent-expired-access')`,
+    [realm],
+  );
+  assert.deepEqual(remaining.rows, [{ model: 'BackchannelAuthenticationRequest', id: 'recent-expired-ciba' }]);
 });
 
 test('PostgreSQL field-specific user updates do not lose concurrent security changes', { skip: !databaseUrl }, async () => {
@@ -208,6 +223,40 @@ test('account deletion atomically removes the user and realm-scoped provider sta
     assert.equal(deletionAudit[0].subject_id, undefined);
     assert.ok(deletionAudit[0].createdAt instanceof Date);
     assert.deepEqual(await data.deleteAccount(realm, user.id), { found: false, user: null });
+  } finally {
+    await data.close();
+  }
+});
+
+test('managed client deletion atomically removes grants, tokens, scope assignments, and direct mappers', { skip: !databaseUrl }, async () => {
+  const data = await createDataLayer({ databaseUrl, devMode: false, realms: [realm] });
+  try {
+    const clientId = `managed-${randomUUID().slice(0, 8)}`;
+    await data.upsertManagedClient(realm, { client_id: clientId, redirect_uris: ['https://client.example/callback'] });
+    const scope = await data.management.createClientScope(realm, {
+      name: `scope-${randomUUID().slice(0, 8)}`, description: '', protocol: 'openid-connect', attributes: {},
+    });
+    await data.management.setClientScopeAssignment(realm, clientId, scope.id, 'default');
+    await data.management.createClaimMapper(realm, {
+      ownerType: 'client', ownerId: clientId, name: 'managed-claim', mapperType: 'hardcoded',
+      config: { claim: 'managed_claim', value: true },
+    });
+    const Adapter = data.adapterFor(realm);
+    const grants = new Adapter('Grant');
+    const tokens = new Adapter('AccessToken');
+    const user = await data.store.createUser({
+      realm, username: `managed-${randomUUID().slice(0, 8)}`, email: `${randomUUID()}@example.test`, passwordHash: 'hash',
+    });
+    await grants.upsert('managed-delete-grant', { clientId, accountId: user.id }, 600);
+    await tokens.upsert('managed-delete-token', { clientId, accountId: user.id, grantId: 'managed-delete-grant' }, 600);
+
+    assert.equal(await data.deleteManagedClient(realm, clientId), true);
+    assert.equal(await new Adapter('Client').find(clientId), undefined);
+    assert.equal(await grants.find('managed-delete-grant'), undefined);
+    assert.equal(await tokens.find('managed-delete-token'), undefined);
+    assert.deepEqual(await data.management.listClientScopeAssignments(realm, clientId), []);
+    assert.deepEqual(await data.management.listClaimMappers(realm, 'client', clientId), []);
+    assert.equal(await data.deleteManagedClient(realm, clientId), false);
   } finally {
     await data.close();
   }

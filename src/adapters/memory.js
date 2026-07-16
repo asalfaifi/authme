@@ -125,7 +125,7 @@ export function createMemoryAdapter({ realm, securityVersionFor = async () => nu
       const allowed = record.cibaNextPollAt == null || record.cibaNextPollAt <= now;
       const interval = allowed
         ? record.cibaPollIntervalSeconds ?? intervalSeconds
-        : Math.min((record.cibaPollIntervalSeconds ?? intervalSeconds) + 5, 300);
+        : (record.cibaPollIntervalSeconds ?? intervalSeconds) + 5;
       record.cibaPollIntervalSeconds = interval;
       record.cibaNextPollAt = now + interval * 1000;
       return { status: allowed ? 'allowed' : 'slow_down', interval };
@@ -147,6 +147,15 @@ export function clearMemoryAdapter() {
   stores.clear();
 }
 
+export function listMemoryAdapterRecords(realm, model) {
+  const records = [];
+  for (const [id, record] of bucket(realm, model)) {
+    const live = current(record);
+    if (live) records.push({ id, payload: clone(live.payload) });
+  }
+  return records;
+}
+
 export function revokeMemoryAccount(realm, accountId) {
   const prefix = `${realm}\u0000`;
   const grantIds = new Set();
@@ -162,6 +171,25 @@ export function revokeMemoryAccount(realm, accountId) {
     if (!key.startsWith(prefix)) continue;
     for (const [id, record] of records) {
       if (record.payload.accountId === accountId || grantIds.has(record.payload.grantId)) {
+        records.delete(id);
+        deleted += 1;
+      }
+    }
+  }
+  return deleted;
+}
+
+export function revokeMemoryClient(realm, clientId) {
+  const prefix = `${realm}\u0000`;
+  const grantIds = new Set();
+  for (const [id, record] of bucket(realm, 'Grant')) {
+    if (record.payload.clientId === clientId) grantIds.add(id);
+  }
+  let deleted = 0;
+  for (const [entry, records] of stores) {
+    if (!entry.startsWith(prefix)) continue;
+    for (const [id, record] of records) {
+      if (record.payload.clientId === clientId || grantIds.has(record.payload.grantId)) {
         records.delete(id);
         deleted += 1;
       }

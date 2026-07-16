@@ -28,18 +28,41 @@ const clients = {
     id: 'multi-resource-allowed-client',
     redirectUri: 'http://127.0.0.1:49160/callback',
   },
+  service: {
+    id: 'orders-service-client',
+    secret: 'orders-service-client-secret-00000000000001',
+    kind: 'service',
+  },
+  device: {
+    id: 'orders-device-client',
+    secret: 'orders-device-client-secret-000000000000001',
+    kind: 'device',
+  },
 };
 let runtime;
 let keySet;
 
 function clientMetadata(client) {
+  if (client.kind === 'service') return {
+    client_id: client.id,
+    client_secret: client.secret,
+    token_endpoint_auth_method: 'client_secret_basic',
+    redirect_uris: [], response_types: [], grant_types: ['client_credentials'],
+  };
+  if (client.kind === 'device') return {
+    client_id: client.id,
+    client_secret: client.secret,
+    token_endpoint_auth_method: 'client_secret_basic',
+    redirect_uris: [], response_types: [],
+    grant_types: ['urn:ietf:params:oauth:grant-type:device_code'],
+  };
   return {
     client_id: client.id,
     application_type: 'native',
     token_endpoint_auth_method: 'none',
     redirect_uris: [client.redirectUri],
     response_types: ['code'],
-    grant_types: ['authorization_code'],
+    grant_types: client === clients.single ? ['authorization_code', 'refresh_token'] : ['authorization_code'],
   };
 }
 
@@ -83,6 +106,47 @@ function csrf(html) {
   return match[1];
 }
 
+function formField(html, name) {
+  const match = new RegExp(`name="${name}" value="([^"]*)"`, 'u').exec(html);
+  assert(match, `Form did not include ${name}`);
+  return match[1];
+}
+
+async function approveDevice(agent, device) {
+  const verification = new URL(device.verification_uri);
+  let response = await agent.get(verification.pathname).set('host', host);
+  response = await agent.post(verification.pathname).set('host', host).type('form').send({
+    xsrf: formField(response.text, 'xsrf'),
+    user_code: device.user_code,
+  });
+  response = await agent.post(verification.pathname).set('host', host).type('form').send({
+    xsrf: formField(response.text, 'xsrf'),
+    user_code: formField(response.text, 'user_code'),
+    confirm: 'yes',
+  });
+  let target;
+  for (let step = 0; step < 12; step += 1) {
+    if ([301, 302, 303].includes(response.status)) {
+      target = new URL(response.headers.location, base);
+      response = await agent.get(`${target.pathname}${target.search}`).set('host', host);
+      continue;
+    }
+    if (response.status === 200 && response.text.includes('/login"')) {
+      response = await agent.post(`${target.pathname}/login`).set('host', host).type('form').send({
+        csrf: csrf(response.text), login: 'admin', password: 'AuthMe-Change-Me-Now-2026!', otp: '',
+      });
+      continue;
+    }
+    if (response.status === 200 && response.text.includes('/confirm"')) {
+      response = await agent.post(`${target.pathname}/confirm`).set('host', host).type('form').send({ csrf: csrf(response.text) });
+      continue;
+    }
+    break;
+  }
+  assert.equal(response.status, 200);
+  assert.match(response.text, /Device connected/u);
+}
+
 async function authorize(client, resources, scope) {
   const agent = request.agent(runtime.app);
   const verifier = randomBytes(32).toString('base64url');
@@ -99,6 +163,7 @@ async function authorize(client, resources, scope) {
       code_challenge: createHash('sha256').update(verifier).digest('base64url'),
       code_challenge_method: 'S256',
       state,
+      ...(scope.split(' ').includes('offline_access') ? { prompt: 'consent' } : {}),
     });
 
   for (let step = 0; step < 8; step += 1) {
@@ -248,4 +313,61 @@ test('a multi-resource grant filters every issued token to the selected resource
   );
   assert.equal(scopes(billingPayload.scope).has('orders.read'), false);
   assert.equal(scopes(billingPayload.scope).has('roles'), false);
+});
+
+test('refresh tokens cannot widen their originally granted resource audience', async () => {
+  const authorization = await authorize(
+    clients.single,
+    ordersResource,
+    'openid offline_access orders.read shared',
+  );
+  const issued = await exchangeCode(clients.single, authorization);
+  assert.equal(typeof issued.body.refresh_token, 'string');
+  const widened = await request(runtime.app)
+    .post(tokenPath)
+    .set('host', host)
+    .type('form')
+    .send({
+      grant_type: 'refresh_token',
+      client_id: clients.single.id,
+      refresh_token: issued.body.refresh_token,
+      resource: billingResource,
+    })
+    .expect(400);
+  assert.equal(widened.body.error, 'invalid_target');
+});
+
+test('client credentials and device token polling cannot widen to an unauthorized resource', async () => {
+  const serviceBasic = Buffer.from(`${clients.service.id}:${clients.service.secret}`).toString('base64');
+  const serviceWidened = await request(runtime.app)
+    .post(tokenPath)
+    .set('host', host)
+    .set('authorization', `Basic ${serviceBasic}`)
+    .type('form')
+    .send({ grant_type: 'client_credentials', scope: 'billing.read', resource: billingResource })
+    .expect(400);
+  assert.equal(serviceWidened.body.error, 'invalid_target');
+
+  const deviceBasic = Buffer.from(`${clients.device.id}:${clients.device.secret}`).toString('base64');
+  const deviceAgent = request.agent(runtime.app);
+  const initiated = await deviceAgent
+    .post(`/realms/${realm}/protocol/openid-connect/auth/device`)
+    .set('host', host)
+    .set('authorization', `Basic ${deviceBasic}`)
+    .type('form')
+    .send({ scope: 'openid orders.read', resource: ordersResource })
+    .expect(200);
+  await approveDevice(deviceAgent, initiated.body);
+  const deviceWidened = await request(runtime.app)
+    .post(tokenPath)
+    .set('host', host)
+    .set('authorization', `Basic ${deviceBasic}`)
+    .type('form')
+    .send({
+      grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
+      device_code: initiated.body.device_code,
+      resource: billingResource,
+    })
+    .expect(400);
+  assert.equal(deviceWidened.body.error, 'invalid_target');
 });

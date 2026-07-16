@@ -2,8 +2,14 @@ import { Router, json } from 'express';
 import { z } from 'zod';
 import { createRecoveryCodes, createTotp, totpStep } from '../crypto/mfa.js';
 import { hashPassword } from '../crypto/password.js';
-import { decryptSecret, encryptSecret, safeEqual } from '../crypto/secrets.js';
-import { configuredClientsForRealm } from '../provider.js';
+import { decryptSecret, encryptSecret, keyedDigest, randomToken, safeEqual } from '../crypto/secrets.js';
+import {
+  ACCOUNT_CONSOLE_CLIENT_ID,
+  ADMIN_CONSOLE_CLIENT_ID,
+  configuredClientsForRealm,
+  validateClientSecurity,
+} from '../provider.js';
+import { SAML_IDP_BRIDGE_CLIENT_ID } from '../federation/saml-idp.js';
 import { publicUser } from '../repositories/identity-store.js';
 import { hasAdminPermission } from '../security/admin-permissions.js';
 import { createWebAuthn } from '../security/webauthn.js';
@@ -48,6 +54,80 @@ const paginationSchema = z.object({
   offset: z.string().regex(/^\d+$/).transform(Number).pipe(z.number().int().min(0).max(10_000_000)).optional().default(0),
 }).passthrough();
 const RECENT_ADMIN_AUTHENTICATION_MS = 15 * 60 * 1000;
+const managementId = z.uuid();
+const policyName = z.string().trim().min(1).max(128).regex(/^[a-zA-Z0-9:._/-]+$/);
+const attributes = z.record(z.string().min(1).max(128), z.union([
+  z.string().max(4096), z.number().finite(), z.boolean(), z.array(z.string().max(4096)).max(100),
+])).default({});
+const realmPatchSchema = z.object({
+  displayName: z.string().trim().min(1).max(255).optional(),
+  enabled: z.boolean().optional(),
+  settings: attributes.optional(),
+}).strict().refine((value) => Object.keys(value).length > 0, 'at least one field is required');
+const roleSchema = z.object({
+  description: z.string().max(4096).optional().default(''),
+  composites: z.array(policyName).max(200).optional().default([]),
+  attributes: attributes.optional(),
+}).strict();
+const groupCreateSchema = z.object({
+  name: policyName,
+  parentId: managementId.nullable().optional().default(null),
+  roles: z.array(policyName).max(200).optional().default([]),
+  attributes: attributes.optional(),
+}).strict();
+const groupUpdateSchema = groupCreateSchema.partial().refine((value) => Object.keys(value).length > 0, 'at least one field is required');
+const clientScopeCreateSchema = z.object({
+  name: policyName,
+  description: z.string().max(4096).optional().default(''),
+  protocol: z.literal('openid-connect').optional().default('openid-connect'),
+  attributes: attributes.optional(),
+}).strict();
+const clientScopeUpdateSchema = clientScopeCreateSchema.omit({ protocol: true }).partial().refine((value) => Object.keys(value).length > 0, 'at least one field is required');
+const claimMapperConfig = z.record(z.string().min(1).max(128), z.unknown());
+const claimMapperCreateSchema = z.object({
+  ownerType: z.enum(['client', 'client-scope']),
+  ownerId: z.string().min(1).max(255),
+  name: policyName,
+  mapperType: z.enum(['user-attribute', 'hardcoded', 'realm-roles', 'client-roles', 'groups', 'organization']),
+  config: claimMapperConfig.refine((value) => typeof value.claim === 'string' && /^[a-zA-Z][a-zA-Z0-9_.:-]{0,127}$/.test(value.claim), 'config.claim must be a safe claim name'),
+}).strict();
+const claimMapperUpdateSchema = claimMapperCreateSchema.omit({ ownerType: true, ownerId: true }).partial().refine((value) => Object.keys(value).length > 0, 'at least one field is required');
+const flowStep = z.object({
+  type: z.enum(['password', 'totp', 'passkey', 'federated']),
+  requirement: z.enum(['required', 'alternative', 'conditional']),
+}).strict();
+const authenticationFlowCreateSchema = z.object({
+  alias: policyName,
+  description: z.string().max(4096).optional().default(''),
+  enabled: z.boolean().optional().default(true),
+  priority: z.number().int().min(0).max(100_000).optional().default(100),
+  clientIds: z.array(identifier).max(200).optional().default([]),
+  acr: z.string().trim().min(1).max(255),
+  maxAgeSeconds: z.number().int().min(1).max(2_592_000).nullable().optional().default(null),
+  steps: z.array(flowStep).min(1).max(16),
+}).strict();
+const authenticationFlowUpdateSchema = authenticationFlowCreateSchema.partial().refine((value) => Object.keys(value).length > 0, 'at least one field is required');
+const domainSchema = z.object({
+  domain: z.string().trim().toLowerCase().min(1).max(253).regex(/^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/),
+  verified: z.boolean().optional().default(false),
+}).strict();
+const organizationCreateSchema = z.object({
+  name: z.string().trim().min(1).max(255),
+  alias: policyName,
+  enabled: z.boolean().optional().default(true),
+  domains: z.array(domainSchema).max(100).optional().default([]),
+  identityProviderIds: z.array(federatedProviderId).max(100).optional().default([]),
+  attributes: attributes.optional(),
+}).strict();
+const organizationUpdateSchema = organizationCreateSchema.partial().refine((value) => Object.keys(value).length > 0, 'at least one field is required');
+const organizationMembershipSchema = z.object({ roles: z.array(policyName).max(100).optional().default([]) }).strict();
+const organizationInvitationSchema = z.object({
+  email: z.email().max(254),
+  roles: z.array(policyName).max(100).optional().default([]),
+  expiresInSeconds: z.number().int().min(300).max(604_800).optional().default(86_400),
+}).strict();
+const clientMetadataSchema = z.record(z.string().min(1).max(128), z.unknown())
+  .refine((value) => typeof value.client_id === 'string' && /^[a-zA-Z0-9._-]{1,128}$/.test(value.client_id), 'client_id is required and must be safe');
 
 const createUserSchema = z.object({
   username: identifier,
@@ -136,11 +216,44 @@ function hasRecentAdminAuthentication(authentication, now = Date.now()) {
   return Number.isFinite(authenticatedAt) && age >= -30_000 && age <= RECENT_ADMIN_AUTHENTICATION_MS;
 }
 
+function publicClient(metadata, { managed = false } = {}) {
+  const secretFields = new Set([
+    'client_secret', 'registration_access_token', 'registration_client_uri',
+    'tls_client_auth_subject_dn',
+  ]);
+  return {
+    ...Object.fromEntries(Object.entries(metadata).filter(([name]) => !secretFields.has(name))),
+    managed,
+    hasClientSecret: Boolean(metadata.client_secret),
+  };
+}
+
+function managementFailure(error, res, next) {
+  if (['23505', 'ROLE_COMPOSITE_NOT_FOUND', 'GROUP_EXISTS', 'GROUP_CYCLE', 'GROUP_NOT_EMPTY',
+    'CLIENT_SCOPE_EXISTS', 'CLAIM_MAPPER_EXISTS', 'AUTH_FLOW_EXISTS', 'ORGANIZATION_EXISTS',
+    'ORGANIZATION_DOMAIN_EXISTS'].includes(error?.code)) {
+    return problem(res, 409, 'Configuration conflict', error.message);
+  }
+  if (['23503', 'GROUP_PARENT_NOT_FOUND'].includes(error?.code)) {
+    return problem(res, 400, 'Invalid relationship', error.message);
+  }
+  return next(error);
+}
+
 function requiredAdminPermission(req) {
   const path = normalizedAdminPath(req.path);
   if (/^\/metrics$/iu.test(path)) return 'metrics.read';
   if (/^\/v1\/realms$/iu.test(path)) return 'realms.read';
+  if (/^\/v1\/realms\/[^/]+$/iu.test(path)) return req.method === 'GET' ? 'realms.read' : 'realms.manage';
   if (/^\/v1\/realms\/[^/]+\/configuration$/iu.test(path)) return 'configuration.read';
+  if (/^\/v1\/realms\/[^/]+\/clients\/[^/]+\/client-scopes(?:\/[^/]+)?$/iu.test(path)) return req.method === 'GET' ? 'configuration.read' : 'client-scopes.manage';
+  if (/^\/v1\/realms\/[^/]+\/clients(?:\/[^/]+)?$/iu.test(path)) return req.method === 'GET' ? 'clients.read' : 'clients.manage';
+  if (/^\/v1\/realms\/[^/]+\/roles(?:\/[^/]+)?$/iu.test(path)) return req.method === 'GET' ? 'configuration.read' : 'roles.manage';
+  if (/^\/v1\/realms\/[^/]+\/groups(?:\/[^/]+)?$/iu.test(path)) return req.method === 'GET' ? 'configuration.read' : 'groups.manage';
+  if (/^\/v1\/realms\/[^/]+\/(?:client-scopes|claim-mappers)(?:\/.*)?$/iu.test(path)) return req.method === 'GET' ? 'configuration.read' : 'client-scopes.manage';
+  if (/^\/v1\/realms\/[^/]+\/authentication-flows(?:\/[^/]+)?$/iu.test(path)) return req.method === 'GET' ? 'configuration.read' : 'authentication-flows.manage';
+  if (/^\/v1\/realms\/[^/]+\/organizations(?:\/.*)?$/iu.test(path)) return req.method === 'GET' ? 'configuration.read' : 'organizations.manage';
+  if (/^\/v1\/realms\/[^/]+\/signing-keys(?:\/.*)?$/iu.test(path)) return req.method === 'GET' ? 'configuration.read' : 'signing-keys.manage';
   if (/^\/v1\/realms\/[^/]+\/audit$/iu.test(path)) return 'audit.read';
   if (/^\/v1\/realms\/[^/]+\/client-registration-tokens$/iu.test(path)) return 'clients.register';
   if (/^\/v1\/realms\/[^/]+\/users\/[^/]+\/federated-identities$/iu.test(path)) {
@@ -169,6 +282,8 @@ export function createAdminRouter({
   jwksByRealm,
   fetch,
   extensions,
+  management,
+  signingKeyManagers,
 }) {
   const passkeys = webauthn ?? createWebAuthn(config);
   const router = Router();
@@ -233,20 +348,29 @@ export function createAdminRouter({
     } catch (error) { next(error); }
   });
 
-  router.get('/v1/realms', (_req, res) => {
-    res.json({ realms: config.realms.map((name) => ({ name, issuer: `${config.publicUrl}/realms/${name}` })) });
+  router.get('/v1/realms', async (_req, res, next) => {
+    try {
+      const realms = management ? await management.listRealms() : config.realms.map((name) => ({ name, enabled: true }));
+      res.json({ realms: realms.map((realm) => ({ ...realm, issuer: `${config.publicUrl}/realms/${realm.name}` })) });
+    } catch (error) { next(error); }
   });
 
-  router.get('/v1/realms/:realm/configuration', (req, res) => {
+  router.get('/v1/realms/:realm/configuration', async (req, res, next) => {
+    try {
     const realm = req.params.realm;
     if (!config.realms.includes(realm)) return problem(res, 404, 'Realm not found', 'The requested realm does not exist.');
     const clientFields = [
       'client_id', 'client_name', 'application_type', 'subject_type', 'token_endpoint_auth_method',
       'redirect_uris', 'post_logout_redirect_uris', 'web_origins', 'response_types', 'grant_types', 'scope',
     ];
-    const clients = configuredClientsForRealm(config, realm).map((client) => Object.fromEntries(
+    const staticClients = configuredClientsForRealm(config, realm).map((client) => Object.fromEntries(
       clientFields.filter((field) => client[field] !== undefined).map((field) => [field, structuredClone(client[field])]),
     ));
+    const managedClients = data.listManagedClients ? await data.listManagedClients(realm) : [];
+    const clients = [
+      ...staticClients.map((client) => publicClient(client)),
+      ...managedClients.map(({ metadata }) => publicClient(metadata, { managed: true })),
+    ];
     const ldap = (config.ldapProvidersByRealm[realm] ?? []).map((provider) => ({
       id: provider.id,
       displayName: provider.displayName,
@@ -297,6 +421,7 @@ export function createAdminRouter({
       scim: (config.scimTokensByRealm[realm] ?? []).map(({ id }) => ({ id })),
       extensions: extensions?.describe?.(realm) ?? [],
     });
+    } catch (error) { return next(error); }
   });
 
   router.post('/v1/realms/:realm/client-registration-tokens', async (req, res, next) => {
@@ -318,6 +443,284 @@ export function createAdminRouter({
   router.use('/v1/realms/:realm', (req, res, next) => {
     if (!config.realms.includes(req.params.realm)) return problem(res, 404, 'Realm not found', 'The requested realm does not exist.');
     return next();
+  });
+
+  router.get('/v1/realms/:realm', async (req, res, next) => {
+    try {
+      const realm = await management.findRealm(req.params.realm);
+      if (!realm) return problem(res, 404, 'Realm not found', 'The requested realm does not exist.');
+      return res.json({ ...realm, issuer: `${config.publicUrl}/realms/${realm.name}` });
+    } catch (error) { return next(error); }
+  });
+
+  router.patch('/v1/realms/:realm', async (req, res, next) => {
+    try {
+      const input = parse(realmPatchSchema, req, res);
+      if (!input) return undefined;
+      const realm = await management.updateRealm(req.params.realm, input);
+      if (!realm) return problem(res, 404, 'Realm not found', 'The requested realm does not exist.');
+      await audit(store, req, 'admin.realm.updated', undefined, { fields: Object.keys(input) });
+      return res.json({ ...realm, issuer: `${config.publicUrl}/realms/${realm.name}` });
+    } catch (error) { return managementFailure(error, res, next); }
+  });
+
+  router.get('/v1/realms/:realm/clients', async (req, res, next) => {
+    try {
+      const managed = await data.listManagedClients(req.params.realm);
+      const staticClients = configuredClientsForRealm(config, req.params.realm);
+      return res.json({
+        clients: [
+          ...staticClients.map((metadata) => publicClient(metadata)),
+          ...managed.map(({ metadata }) => publicClient(metadata, { managed: true })),
+        ],
+      });
+    } catch (error) { return next(error); }
+  });
+
+  router.get('/v1/realms/:realm/clients/:clientId', async (req, res, next) => {
+    try {
+      const managed = (await data.listManagedClients(req.params.realm)).find(({ id }) => id === req.params.clientId);
+      const staticClient = configuredClientsForRealm(config, req.params.realm).find((client) => client.client_id === req.params.clientId);
+      const metadata = managed?.metadata ?? staticClient;
+      if (!metadata) return problem(res, 404, 'Client not found', 'The requested client does not exist.');
+      return res.json(publicClient(metadata, { managed: Boolean(managed) }));
+    } catch (error) { return next(error); }
+  });
+
+  router.post('/v1/realms/:realm/clients', async (req, res, next) => {
+    try {
+      const input = parse(clientMetadataSchema, req, res);
+      if (!input) return undefined;
+      if (configuredClientsForRealm(config, req.params.realm).some((client) => client.client_id === input.client_id)) {
+        return problem(res, 409, 'Reserved or deployment client', 'This client identifier is owned by deployment configuration or an AuthMe built-in.');
+      }
+      if ((await data.listManagedClients(req.params.realm)).some(({ id }) => id === input.client_id)) {
+        return problem(res, 409, 'Client already exists', 'Use PUT to replace an existing managed client.');
+      }
+      const metadata = structuredClone(input);
+      validateClientSecurity(metadata, { development: config.devMode, mtlsEnabled: config.mtls.enabled });
+      await providers.get(req.params.realm).Client.validate(metadata);
+      await data.upsertManagedClient(req.params.realm, metadata);
+      await audit(store, req, 'admin.client.created', undefined, { clientId: metadata.client_id });
+      return res.status(201)
+        .location(`/admin/v1/realms/${encodeURIComponent(req.params.realm)}/clients/${encodeURIComponent(metadata.client_id)}`)
+        .json(publicClient(metadata, { managed: true }));
+    } catch (error) {
+      if (/client|redirect|grant|jwks|FAPI|CIBA|origin|secret|subject/iu.test(error?.message ?? '')) {
+        return problem(res, 400, 'Invalid client metadata', error.message);
+      }
+      return managementFailure(error, res, next);
+    }
+  });
+
+  router.put('/v1/realms/:realm/clients/:clientId', async (req, res, next) => {
+    try {
+      const input = parse(clientMetadataSchema, req, res);
+      if (!input) return undefined;
+      if (input.client_id !== req.params.clientId) return problem(res, 400, 'Client identifier mismatch', 'client_id cannot be renamed.');
+      const existing = (await data.listManagedClients(req.params.realm)).find(({ id }) => id === req.params.clientId);
+      if (!existing) return problem(res, 404, 'Managed client not found', 'Deployment and built-in clients cannot be changed through this API.');
+      const metadata = structuredClone(input);
+      validateClientSecurity(metadata, { development: config.devMode, mtlsEnabled: config.mtls.enabled });
+      await providers.get(req.params.realm).Client.validate(metadata);
+      await data.upsertManagedClient(req.params.realm, metadata);
+      await audit(store, req, 'admin.client.updated', undefined, { clientId: metadata.client_id });
+      return res.json(publicClient(metadata, { managed: true }));
+    } catch (error) {
+      if (/client|redirect|grant|jwks|FAPI|CIBA|origin|secret|subject/iu.test(error?.message ?? '')) {
+        return problem(res, 400, 'Invalid client metadata', error.message);
+      }
+      return managementFailure(error, res, next);
+    }
+  });
+
+  router.delete('/v1/realms/:realm/clients/:clientId', async (req, res, next) => {
+    try {
+      if ([ADMIN_CONSOLE_CLIENT_ID, ACCOUNT_CONSOLE_CLIENT_ID, SAML_IDP_BRIDGE_CLIENT_ID].includes(req.params.clientId)) {
+        return problem(res, 409, 'Reserved client', 'Built-in AuthMe clients cannot be removed.');
+      }
+      if (!await data.deleteManagedClient(req.params.realm, req.params.clientId)) {
+        return problem(res, 404, 'Managed client not found', 'Deployment clients cannot be removed through this API.');
+      }
+      await audit(store, req, 'admin.client.deleted', undefined, { clientId: req.params.clientId });
+      return res.status(204).end();
+    } catch (error) { return next(error); }
+  });
+
+  router.get('/v1/realms/:realm/roles', async (req, res, next) => {
+    try { return res.json({ roles: await management.listRoles(req.params.realm) }); } catch (error) { return next(error); }
+  });
+  router.put('/v1/realms/:realm/roles/:roleName', async (req, res, next) => {
+    try {
+      if (!policyName.safeParse(req.params.roleName).success) return problem(res, 400, 'Invalid role name', 'The role name is invalid.');
+      const input = parse(roleSchema, req, res);
+      if (!input) return undefined;
+      const result = await management.putRole(req.params.realm, { name: req.params.roleName, ...input });
+      await audit(store, req, 'admin.role.upserted', undefined, { role: req.params.roleName });
+      return res.status(201).json(result);
+    } catch (error) { return managementFailure(error, res, next); }
+  });
+  router.delete('/v1/realms/:realm/roles/:roleName', async (req, res, next) => {
+    try {
+      if (!await management.deleteRole(req.params.realm, req.params.roleName)) return problem(res, 404, 'Role not found', 'The requested role does not exist.');
+      await audit(store, req, 'admin.role.deleted', undefined, { role: req.params.roleName });
+      return res.status(204).end();
+    } catch (error) { return managementFailure(error, res, next); }
+  });
+
+  router.get('/v1/realms/:realm/groups', async (req, res, next) => {
+    try { return res.json({ groups: await management.listGroups(req.params.realm) }); } catch (error) { return next(error); }
+  });
+  router.post('/v1/realms/:realm/groups', async (req, res, next) => {
+    try {
+      const input = parse(groupCreateSchema, req, res);
+      if (!input) return undefined;
+      const definedRoles = new Set((await management.listRoles(req.params.realm)).map((roleDefinition) => roleDefinition.name));
+      const unknown = input.roles.find((roleName) => !definedRoles.has(roleName));
+      if (unknown) return problem(res, 400, 'Unknown role', `Group role ${unknown} is not defined in this realm.`);
+      const result = await management.createGroup(req.params.realm, input);
+      await audit(store, req, 'admin.group.created', undefined, { groupId: result.id, path: result.path });
+      return res.status(201).json(result);
+    } catch (error) { return managementFailure(error, res, next); }
+  });
+  router.patch('/v1/realms/:realm/groups/:groupId', async (req, res, next) => {
+    try {
+      if (!managementId.safeParse(req.params.groupId).success) return problem(res, 400, 'Invalid group identifier', 'Group identifiers must be UUIDs.');
+      const input = parse(groupUpdateSchema, req, res);
+      if (!input) return undefined;
+      const result = await management.updateGroup(req.params.realm, req.params.groupId, input);
+      if (!result) return problem(res, 404, 'Group not found', 'The requested group does not exist.');
+      await audit(store, req, 'admin.group.updated', undefined, { groupId: result.id, fields: Object.keys(input) });
+      return res.json(result);
+    } catch (error) { return managementFailure(error, res, next); }
+  });
+  router.delete('/v1/realms/:realm/groups/:groupId', async (req, res, next) => {
+    try {
+      if (!await management.deleteGroup(req.params.realm, req.params.groupId)) return problem(res, 404, 'Group not found', 'The requested group does not exist.');
+      await audit(store, req, 'admin.group.deleted', undefined, { groupId: req.params.groupId });
+      return res.status(204).end();
+    } catch (error) { return managementFailure(error, res, next); }
+  });
+
+  router.get('/v1/realms/:realm/client-scopes', async (req, res, next) => {
+    try { return res.json({ clientScopes: await management.listClientScopes(req.params.realm) }); } catch (error) { return next(error); }
+  });
+  router.post('/v1/realms/:realm/client-scopes', async (req, res, next) => {
+    try { const input = parse(clientScopeCreateSchema, req, res); if (!input) return undefined; const scope = await management.createClientScope(req.params.realm, input); await audit(store, req, 'admin.client_scope.created', undefined, { scopeId: scope.id }); return res.status(201).json(scope); } catch (error) { return managementFailure(error, res, next); }
+  });
+  router.patch('/v1/realms/:realm/client-scopes/:scopeId', async (req, res, next) => {
+    try { const input = parse(clientScopeUpdateSchema, req, res); if (!input) return undefined; const scope = await management.updateClientScope(req.params.realm, req.params.scopeId, input); if (!scope) return problem(res, 404, 'Client scope not found', 'The requested client scope does not exist.'); await audit(store, req, 'admin.client_scope.updated', undefined, { scopeId: scope.id }); return res.json(scope); } catch (error) { return managementFailure(error, res, next); }
+  });
+  router.delete('/v1/realms/:realm/client-scopes/:scopeId', async (req, res, next) => {
+    try { if (!await management.deleteClientScope(req.params.realm, req.params.scopeId)) return problem(res, 404, 'Client scope not found', 'The requested client scope does not exist.'); await audit(store, req, 'admin.client_scope.deleted', undefined, { scopeId: req.params.scopeId }); return res.status(204).end(); } catch (error) { return next(error); }
+  });
+  router.get('/v1/realms/:realm/clients/:clientId/client-scopes', async (req, res, next) => {
+    try { return res.json({ assignments: await management.listClientScopeAssignments(req.params.realm, req.params.clientId) }); } catch (error) { return next(error); }
+  });
+  router.put('/v1/realms/:realm/clients/:clientId/client-scopes/:scopeId', async (req, res, next) => {
+    try { const input = parse(z.object({ assignmentType: z.enum(['default', 'optional']) }).strict(), req, res); if (!input) return undefined; if (!await management.setClientScopeAssignment(req.params.realm, req.params.clientId, req.params.scopeId, input.assignmentType)) return problem(res, 404, 'Client scope not found', 'The requested client scope does not exist.'); await audit(store, req, 'admin.client_scope.assigned', undefined, { clientId: req.params.clientId, scopeId: req.params.scopeId, assignmentType: input.assignmentType }); return res.status(204).end(); } catch (error) { return managementFailure(error, res, next); }
+  });
+  router.delete('/v1/realms/:realm/clients/:clientId/client-scopes/:scopeId', async (req, res, next) => {
+    try { if (!await management.deleteClientScopeAssignment(req.params.realm, req.params.clientId, req.params.scopeId)) return problem(res, 404, 'Client-scope assignment not found', 'The requested assignment does not exist.'); await audit(store, req, 'admin.client_scope.unassigned', undefined, { clientId: req.params.clientId, scopeId: req.params.scopeId }); return res.status(204).end(); } catch (error) { return next(error); }
+  });
+  router.get('/v1/realms/:realm/claim-mappers', async (req, res, next) => {
+    try { const ownerType = req.query.ownerType; const ownerId = req.query.ownerId; if ((ownerType || ownerId) && (!['client', 'client-scope'].includes(ownerType) || typeof ownerId !== 'string')) return problem(res, 400, 'Invalid mapper filter', 'ownerType and ownerId must be provided together.'); return res.json({ claimMappers: await management.listClaimMappers(req.params.realm, ownerType, ownerId) }); } catch (error) { return next(error); }
+  });
+  router.post('/v1/realms/:realm/claim-mappers', async (req, res, next) => {
+    try { const input = parse(claimMapperCreateSchema, req, res); if (!input) return undefined; const mapper = await management.createClaimMapper(req.params.realm, input); await audit(store, req, 'admin.claim_mapper.created', undefined, { mapperId: mapper.id, ownerType: mapper.ownerType, ownerId: mapper.ownerId }); return res.status(201).json(mapper); } catch (error) { return managementFailure(error, res, next); }
+  });
+  router.patch('/v1/realms/:realm/claim-mappers/:mapperId', async (req, res, next) => {
+    try { const input = parse(claimMapperUpdateSchema, req, res); if (!input) return undefined; const mapper = await management.updateClaimMapper(req.params.realm, req.params.mapperId, input); if (!mapper) return problem(res, 404, 'Claim mapper not found', 'The requested claim mapper does not exist.'); await audit(store, req, 'admin.claim_mapper.updated', undefined, { mapperId: mapper.id }); return res.json(mapper); } catch (error) { return managementFailure(error, res, next); }
+  });
+  router.delete('/v1/realms/:realm/claim-mappers/:mapperId', async (req, res, next) => {
+    try { if (!await management.deleteClaimMapper(req.params.realm, req.params.mapperId)) return problem(res, 404, 'Claim mapper not found', 'The requested claim mapper does not exist.'); await audit(store, req, 'admin.claim_mapper.deleted', undefined, { mapperId: req.params.mapperId }); return res.status(204).end(); } catch (error) { return next(error); }
+  });
+
+  router.get('/v1/realms/:realm/authentication-flows', async (req, res, next) => {
+    try { return res.json({ authenticationFlows: await management.listAuthenticationFlows(req.params.realm) }); } catch (error) { return next(error); }
+  });
+  router.post('/v1/realms/:realm/authentication-flows', async (req, res, next) => {
+    try { const input = parse(authenticationFlowCreateSchema, req, res); if (!input) return undefined; const flow = await management.createAuthenticationFlow(req.params.realm, input); await audit(store, req, 'admin.authentication_flow.created', undefined, { flowId: flow.id, alias: flow.alias }); return res.status(201).json(flow); } catch (error) { return managementFailure(error, res, next); }
+  });
+  router.patch('/v1/realms/:realm/authentication-flows/:flowId', async (req, res, next) => {
+    try { const input = parse(authenticationFlowUpdateSchema, req, res); if (!input) return undefined; const flow = await management.updateAuthenticationFlow(req.params.realm, req.params.flowId, input); if (!flow) return problem(res, 404, 'Authentication flow not found', 'The requested authentication flow does not exist.'); await audit(store, req, 'admin.authentication_flow.updated', undefined, { flowId: flow.id }); return res.json(flow); } catch (error) { return managementFailure(error, res, next); }
+  });
+  router.delete('/v1/realms/:realm/authentication-flows/:flowId', async (req, res, next) => {
+    try { if (!await management.deleteAuthenticationFlow(req.params.realm, req.params.flowId)) return problem(res, 404, 'Authentication flow not found', 'The requested authentication flow does not exist.'); await audit(store, req, 'admin.authentication_flow.deleted', undefined, { flowId: req.params.flowId }); return res.status(204).end(); } catch (error) { return next(error); }
+  });
+
+  router.get('/v1/realms/:realm/organizations', async (req, res, next) => {
+    try { return res.json({ organizations: await management.listOrganizations(req.params.realm) }); } catch (error) { return next(error); }
+  });
+  router.post('/v1/realms/:realm/organizations', async (req, res, next) => {
+    try {
+      const input = parse(organizationCreateSchema, req, res); if (!input) return undefined;
+      const providerIds = new Set([...(config.ldapProvidersByRealm[req.params.realm] ?? []), ...(config.oidcProvidersByRealm[req.params.realm] ?? []), ...(config.samlProvidersByRealm[req.params.realm] ?? [])].map((provider) => provider.id));
+      const unknown = input.identityProviderIds.find((id) => !providerIds.has(id));
+      if (unknown) return problem(res, 400, 'Unknown identity provider', `Identity provider ${unknown} is not configured in this realm.`);
+      const organization = await management.createOrganization(req.params.realm, input); await audit(store, req, 'admin.organization.created', undefined, { organizationId: organization.id }); return res.status(201).json(organization);
+    } catch (error) { return managementFailure(error, res, next); }
+  });
+  router.get('/v1/realms/:realm/organizations/:organizationId', async (req, res, next) => {
+    try { const organization = await management.findOrganization(req.params.realm, req.params.organizationId); if (!organization) return problem(res, 404, 'Organization not found', 'The requested organization does not exist.'); return res.json(organization); } catch (error) { return next(error); }
+  });
+  router.patch('/v1/realms/:realm/organizations/:organizationId', async (req, res, next) => {
+    try {
+      const input = parse(organizationUpdateSchema, req, res); if (!input) return undefined;
+      if (input.identityProviderIds) {
+        const providerIds = new Set([...(config.ldapProvidersByRealm[req.params.realm] ?? []), ...(config.oidcProvidersByRealm[req.params.realm] ?? []), ...(config.samlProvidersByRealm[req.params.realm] ?? [])].map((provider) => provider.id));
+        const unknown = input.identityProviderIds.find((id) => !providerIds.has(id));
+        if (unknown) return problem(res, 400, 'Unknown identity provider', `Identity provider ${unknown} is not configured in this realm.`);
+      }
+      const organization = await management.updateOrganization(req.params.realm, req.params.organizationId, input);
+      if (!organization) return problem(res, 404, 'Organization not found', 'The requested organization does not exist.');
+      await audit(store, req, 'admin.organization.updated', undefined, { organizationId: organization.id, fields: Object.keys(input) });
+      return res.json(organization);
+    } catch (error) { return managementFailure(error, res, next); }
+  });
+  router.delete('/v1/realms/:realm/organizations/:organizationId', async (req, res, next) => {
+    try { if (!await management.deleteOrganization(req.params.realm, req.params.organizationId)) return problem(res, 404, 'Organization not found', 'The requested organization does not exist.'); await audit(store, req, 'admin.organization.deleted', undefined, { organizationId: req.params.organizationId }); return res.status(204).end(); } catch (error) { return next(error); }
+  });
+  router.get('/v1/realms/:realm/organizations/:organizationId/members', async (req, res, next) => {
+    try { return res.json({ memberships: await management.listOrganizationMemberships(req.params.realm, req.params.organizationId) }); } catch (error) { return next(error); }
+  });
+  router.put('/v1/realms/:realm/organizations/:organizationId/members/:userId', async (req, res, next) => {
+    try { if (!userId.safeParse(req.params.userId).success) return problem(res, 400, 'Invalid user identifier', 'User identifiers must be UUIDs.'); const input = parse(organizationMembershipSchema, req, res); if (!input) return undefined; if (!await store.findUserById(req.params.realm, req.params.userId)) return problem(res, 404, 'User not found', 'The requested user does not exist.'); const membership = await management.upsertOrganizationMembership(req.params.realm, req.params.organizationId, req.params.userId, input.roles); if (!membership) return problem(res, 404, 'Organization not found', 'The requested organization does not exist.'); await audit(store, req, 'admin.organization.member_upserted', req.params.userId, { organizationId: req.params.organizationId, roles: input.roles }); return res.json(membership); } catch (error) { return managementFailure(error, res, next); }
+  });
+  router.delete('/v1/realms/:realm/organizations/:organizationId/members/:userId', async (req, res, next) => {
+    try { if (!await management.deleteOrganizationMembership(req.params.realm, req.params.organizationId, req.params.userId)) return problem(res, 404, 'Organization membership not found', 'The requested membership does not exist.'); await audit(store, req, 'admin.organization.member_removed', req.params.userId, { organizationId: req.params.organizationId }); return res.status(204).end(); } catch (error) { return next(error); }
+  });
+  router.get('/v1/realms/:realm/organizations/:organizationId/invitations', async (req, res, next) => {
+    try { return res.json({ invitations: await management.listOrganizationInvitations(req.params.realm, req.params.organizationId) }); } catch (error) { return next(error); }
+  });
+  router.post('/v1/realms/:realm/organizations/:organizationId/invitations', async (req, res, next) => {
+    try { const input = parse(organizationInvitationSchema, req, res); if (!input) return undefined; if (!await management.findOrganization(req.params.realm, req.params.organizationId)) return problem(res, 404, 'Organization not found', 'The requested organization does not exist.'); const token = randomToken(); const invitation = await management.createOrganizationInvitation(req.params.realm, { organizationId: req.params.organizationId, email: input.email, roles: input.roles, tokenDigest: keyedDigest(`organization-invitation:${req.params.realm}:${token}`, config.passwordPepper), expiresAt: new Date(Date.now() + input.expiresInSeconds * 1000) }); await audit(store, req, 'admin.organization.invitation_created', undefined, { organizationId: req.params.organizationId, invitationId: invitation.id, email: input.email }); return res.status(201).json({ ...invitation, token }); } catch (error) { return managementFailure(error, res, next); }
+  });
+
+  router.get('/v1/realms/:realm/signing-keys', async (req, res, next) => {
+    try { return res.json({ signingKeys: await management.listSigningKeys(req.params.realm) }); } catch (error) { return next(error); }
+  });
+  router.post('/v1/realms/:realm/signing-keys/rotate', async (req, res, next) => {
+    try {
+      const input = parse(z.object({ force: z.boolean().optional().default(false) }).strict(), req, res);
+      if (!input) return undefined;
+      const manager = signingKeyManagers?.get(req.params.realm);
+      if (!manager) return problem(res, 409, 'Signing-key manager unavailable', 'No signing-key manager is active for this realm.');
+      const result = await manager.rotate(input);
+      await audit(store, req, result.rotated ? 'admin.signing_key.rotated' : 'admin.signing_key.rotation_checked', undefined, {
+        keyId: result.keyId,
+        dueAt: result.dueAt,
+      });
+      return res.json({
+        rotated: result.rotated,
+        keyId: result.keyId,
+        dueAt: result.dueAt,
+        activation: result.rotated ? 'rolling-restart-required' : 'not-due',
+      });
+    } catch (error) {
+      if (error.code === 'SIGNING_KEY_FILE_ROTATION_REQUIRED') return problem(res, 409, 'External file rotation required', error.message);
+      return next(error);
+    }
   });
   router.param('id', (req, res, next, value) => {
     if (!userId.safeParse(value).success) {

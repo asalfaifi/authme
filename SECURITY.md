@@ -15,15 +15,21 @@ Use GitHub's **Report a vulnerability** flow in the repository Security tab to o
 - security impact and whether exploitation has been observed;
 - any suggested mitigation.
 
-You should receive an acknowledgement through the advisory within five business days. Coordinated disclosure timing depends on validation, impact, and rollout needs. If private advisories are unavailable, contact the repository owner through a private GitHub channel before sharing details.
+You should receive an acknowledgement through the advisory within two business days. The maintainers target initial severity triage within five business days, a mitigation plan within ten business days for confirmed critical/high issues, and a coordinated fix as quickly as safe validation and rollout permit. These are response targets, not a guarantee. If private advisories are unavailable, contact the repository owner through a private GitHub channel before sharing details.
 
 ## Supported versions
 
-Until tagged releases are published, only the latest commit on `main` receives security fixes. Once releases exist, the support table in this file must be updated before older branches are described as supported.
+| Release line | Security support |
+|---|---|
+| `1.0.x` release candidates and final releases | Supported until 12 months after a superseding stable major release |
+| Latest `main` | Best effort; not a release artifact |
+| `0.x` | Unsupported after the first `1.0.0-rc.1` publication |
+
+Only the newest patch in a supported line receives fixes. Operators must upgrade to that patch before requesting a backport. A release candidate remains subject to breaking fixes before `1.0.0`; external certification, penetration testing, hardware rotation, and regional-failover evidence are release gates rather than implied support claims.
 
 ## Security boundary
 
-AuthMe v0.2 is a production-oriented identity foundation with OAuth/OIDC, upstream OIDC/SAML federation, LDAP/AD authentication, SCIM provisioning, and strong credentials. It is not a complete Keycloak replacement and not an independently OpenID-certified distribution. The upstream protocol engine's certification does not automatically certify AuthMe or an operator's deployment.
+AuthMe v1.0.0-rc.1 is a code-complete identity platform for the capabilities explicitly listed in the compatibility matrix. It is not an independently OpenID-certified distribution and has not completed the external release gates in `MILESTONES.md`. The upstream protocol engine's certification does not automatically certify AuthMe or an operator's deployment.
 
 The implemented and staged boundaries are documented in:
 
@@ -33,7 +39,7 @@ The implemented and staged boundaries are documented in:
 - [Federation and provisioning](docs/federation-and-provisioning.md)
 - [Roadmap and release gates](docs/roadmap.md)
 
-Do not use v0.2 as a replacement where Kerberos/SPNEGO, RADIUS, X.509 login, SAML IdP operation, encrypted/IdP-initiated SAML, LDAP synchronization, advanced SCIM/Bulk, imported WebAuthn credentials, UMA, configurable authentication flows, Keycloak Admin REST compatibility, or multi-site active/active operation is required. Treat the exact baseline documented for each implemented mechanism as the supported boundary.
+Do not use AuthMe as a replacement where Kerberos/SPNEGO, RADIUS, X.509 end-user login, SAML artifact binding, broker-side assertion decryption, imported WebAuthn credentials, UMA/Authorization Services, Keycloak Admin REST/SPI/theme compatibility, or multi-site active/active writes are required. Treat the exact baseline documented for each implemented mechanism as the supported boundary.
 
 ## Operator responsibilities
 
@@ -53,7 +59,7 @@ A secure production deployment requires operators to:
 - run unit, smoke, migration, container, dependency-audit, and protocol-conformance gates on the exact release artifact;
 - review log and proxy configuration so authorization headers, cookies, codes, tokens, passwords, MFA material, and client secrets are never recorded.
 
-`AUTHME_ADMIN_TOKEN` is a bootstrap-grade global administration credential in v0.2. Store it in a secret manager, restrict access to the administration routes at the network layer, rotate it on suspected exposure, and do not treat it as delegated RBAC.
+`AUTHME_ADMIN_TOKEN` is a bootstrap-grade global administration credential. Store it in a secret manager, restrict access to the administration routes at the network layer, rotate it on suspected exposure, and do not treat it as delegated RBAC.
 
 ## Development and dependency policy
 

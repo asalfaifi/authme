@@ -108,6 +108,8 @@ export function renderAdminConsole() {
       ${navItem('overview', 'Overview', 'overview', true)}
       ${navItem('users', 'Users', 'users')}
       ${navItem('clients', 'Clients & APIs', 'clients')}
+      ${navItem('access', 'Roles, groups & flows', 'system')}
+      ${navItem('organizations', 'Organizations', 'users')}
       ${navItem('federation', 'Federation', 'federation')}
       <p class="sidebar-section-label sidebar-section-secondary">Operations</p>
       ${navItem('audit', 'Audit trail', 'audit')}

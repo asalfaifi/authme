@@ -19,7 +19,7 @@ The resulting console cookie is an opaque 32-byte bearer value. It is `Secure` i
 
 Switching realm starts a new OIDC authorization and creates a new realm-bound console session. The console never receives `AUTHME_ADMIN_TOKEN` and does not place credentials in HTML, URLs, JavaScript, or browser storage.
 
-Supported grant permissions are `realms.read`, `configuration.read`, `users.read`, `users.write`, `users.delete`, `credentials.manage`, `sessions.revoke`, `federation.manage`, `clients.register`, `administrators.manage`, `audit.read`, and `metrics.read`; `*` is the wildcard. The bootstrap command creates the first realm administrator with a wildcard grant. There is not yet a grant-management API or approval workflow, so additional grant lifecycle changes remain a controlled operator procedure.
+Supported grant permissions are `realms.read`, `realms.manage`, `configuration.read`, `clients.read`, `clients.manage`, `roles.manage`, `groups.manage`, `client-scopes.manage`, `authentication-flows.manage`, `organizations.manage`, `signing-keys.manage`, `users.read`, `users.write`, `users.delete`, `credentials.manage`, `sessions.revoke`, `federation.manage`, `clients.register`, `administrators.manage`, `audit.read`, and `metrics.read`; `*` is the wildcard. The bootstrap command creates the first realm administrator with a wildcard grant. There is not yet an approval workflow, so additional grant lifecycle changes remain a controlled operator procedure.
 
 All cookie-session mutations require authentication no more than 15 minutes old. Accounts that already have an administrator grant are additionally protected: password, MFA, passkey, federation, profile, session, and deletion changes require `administrators.manage`, so a narrowly scoped credential operator cannot take over a more privileged administrator. Root automation remains the reviewed break-glass path.
 
@@ -40,6 +40,8 @@ User identifiers are UUIDs. List endpoints accept decimal `limit` (1–250, defa
 | Method | Path | Result |
 |---|---|---|
 | `GET` | `/admin/v1/realms` | Configured realm names and issuers |
+| `GET` | `/admin/v1/realms/{realm}` | Read mutable realm display/status/settings metadata |
+| `PATCH` | `/admin/v1/realms/{realm}` | Change display name, enabled state, or settings; realm slug and issuer remain immutable |
 | `GET` | `/admin/v1/realms/{realm}/configuration` | Sanitized, read-only realm configuration catalog |
 | `GET` | `/admin/v1/realms/{realm}/users` | Paginated public user records |
 | `POST` | `/admin/v1/realms/{realm}/users` | Create a user and password |
@@ -60,6 +62,34 @@ Audience-bound JWT access tokens already issued to offline resource servers cann
 Deletion is realm-scoped and idempotent. The first successful deletion writes `admin.user.deleted`; retries do not create duplicate deletion audit events.
 
 The configuration catalog returns the realm issuer, deployment/storage mode, Redis and dynamic-registration status, TTLs, safe client/resource-server metadata, federation provider metadata, SCIM token identifiers, and extension capabilities. It deliberately excludes client secrets, LDAP bind credentials, upstream client secrets, SAML private keys, SCIM bearer values, private JWK members, cookie/CSRF/password/encryption secrets, and the root token. Treat even this sanitized catalog as privileged operational metadata.
+
+## Client and authorization-model operations
+
+| Resource | Operations | Notes |
+|---|---|---|
+| `/realms/{realm}/clients[/{clientId}]` | `GET`, collection `POST`, item `PUT`/`DELETE` | Full OIDC client metadata is validated by the same security policy as startup. Secrets are never returned. Static and reserved clients are immutable. Delete revokes client grants and protocol artifacts. |
+| `/realms/{realm}/roles[/{roleName}]` | `GET`, item `PUT`/`DELETE` | Supports attributes and composite roles; missing references and cycles are rejected. |
+| `/realms/{realm}/groups[/{groupId}]` | `GET`, collection `POST`, item `PATCH`/`DELETE` | Supports parent IDs, stable canonical paths, role assignment, and cycle prevention. A group with children must be reconciled before deletion. |
+| `/realms/{realm}/client-scopes[/{scopeId}]` | `GET`, collection `POST`, item `PATCH`/`DELETE` | Reusable OIDC client scopes. |
+| `/realms/{realm}/clients/{clientId}/client-scopes[/{scopeId}]` | `GET`, item `PUT`/`DELETE` | Assign a scope as `default` or `optional`. |
+| `/realms/{realm}/claim-mappers[/{mapperId}]` | `GET`, collection `POST`, item `PATCH`/`DELETE` | Client- or client-scope-owned hardcoded/user-attribute/role/group/organization mappers. |
+| `/realms/{realm}/authentication-flows[/{flowId}]` | `GET`, collection `POST`, item `PATCH`/`DELETE` | Ordered required/alternative/conditional password, TOTP, passkey, and federation steps with client, `acr`, and maximum-age policy. |
+
+All paths in this table are below `/admin/v1`. Mutations are realm-scoped and audited. A newly stored client is visible to the protocol provider without a restart; deleting it invalidates further client use immediately.
+
+## Organization and signing-key operations
+
+| Method | Path | Result |
+|---|---|---|
+| `GET`/`POST` | `/admin/v1/realms/{realm}/organizations` | List or create organizations with aliases, domains, IdP allowlists, and attributes |
+| `GET`/`PATCH`/`DELETE` | `/admin/v1/realms/{realm}/organizations/{organizationId}` | Read, update, or remove one organization |
+| `GET` | `/admin/v1/realms/{realm}/organizations/{organizationId}/members` | List memberships |
+| `PUT`/`DELETE` | `/admin/v1/realms/{realm}/organizations/{organizationId}/members/{userId}` | Set membership roles or remove membership |
+| `GET`/`POST` | `/admin/v1/realms/{realm}/organizations/{organizationId}/invitations` | List invitations or issue a single-use, email-bound invitation token |
+| `GET` | `/admin/v1/realms/{realm}/signing-keys` | List public-only active/retiring key inventory and provider references |
+| `POST` | `/admin/v1/realms/{realm}/signing-keys/rotate` | Request an overlap-safe provider rotation; roll replicas after rotation |
+
+Invitation plaintext is returned only at creation and is stored as a digest. Acceptance occurs through the authenticated account console and requires the invited email address. Supplying an `organization` authorization parameter constrains tokens to a current enabled membership, and configured organization IdPs are enforced during federation.
 
 Federated login never links by email or username. The link POST body is:
 
@@ -90,4 +120,4 @@ The provider ID and issuer must exactly match an enabled LDAP, OIDC, or SAML pro
 
 MFA provisioning secrets and recovery codes are returned once. Treat the response as a secret and never log it. Passkey registration is a two-call WebAuthn ceremony: send the returned `publicKey` options to `navigator.credentials.create()` on the exact AuthMe origin, then submit its JSON response with `challengeId` and an optional `name`. A challenge is consumed on the first verification attempt, including a failed attempt. The AuthMe console can mediate this ceremony through its cookie session and CSRF boundary; other browser code must never receive `AUTHME_ADMIN_TOKEN`.
 
-Passkey registration/deletion, other account-security changes, session revocation, and deletion commit their audit with the PostgreSQL mutation. User creation, unlock, and TOTP-enrollment start audit immediately after mutation; if one of those requests returns `5xx`, reconcile the resource before retrying because the mutation may have committed. The v0.3 administration plane does not yet provide grant CRUD/approval workflows, organization-scoped delegation, a transactional outbox, complete mutable client/group/role/policy administration, self-service credential recovery, or an account console.
+Passkey registration/deletion, other account-security changes, session revocation, and deletion commit their audit with the PostgreSQL mutation. User creation, unlock, and TOTP-enrollment start audit immediately after mutation; if one of those requests returns `5xx`, reconcile the resource before retrying because the mutation may have committed. AuthMe does not provide Keycloak Admin REST compatibility, arbitrary administrator approval workflows, or a general transactional outbox.

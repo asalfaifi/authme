@@ -8,6 +8,8 @@ const PAGES = Object.freeze({
   overview: { title: 'Overview', eyebrow: 'Workspace' },
   users: { title: 'Users', eyebrow: 'Directory' },
   clients: { title: 'Clients & APIs', eyebrow: 'Applications' },
+  access: { title: 'Access model', eyebrow: 'Roles, groups & flows' },
+  organizations: { title: 'Organizations', eyebrow: 'Realm tenants' },
   federation: { title: 'Federation & provisioning', eyebrow: 'Identity sources' },
   audit: { title: 'Audit trail', eyebrow: 'Operations' },
   system: { title: 'System & settings', eyebrow: 'Configuration' },
@@ -16,6 +18,8 @@ const PAGES = Object.freeze({
 const PAGE_PERMISSIONS = Object.freeze({
   users: 'users.read',
   clients: 'configuration.read',
+  access: 'configuration.read',
+  organizations: 'configuration.read',
   federation: 'configuration.read',
   audit: 'audit.read',
   system: 'configuration.read',
@@ -304,7 +308,7 @@ function setHeader(page, actions = []) {
   pageTitle.textContent = metadata.title;
   pageEyebrow.textContent = metadata.eyebrow;
   document.title = `${metadata.title} · AuthMe`;
-  pageActions.replaceChildren(...actions);
+  pageActions.replaceChildren(...actions.filter(Boolean));
   for (const link of document.querySelectorAll('[data-nav-page]')) {
     if (link.getAttribute('data-nav-page') === page) link.setAttribute('aria-current', 'page');
     else link.removeAttribute('aria-current');
@@ -413,6 +417,8 @@ async function navigate({ focus = true } = {}) {
     else if (route.page === 'users' && route.id) await renderUserDetail(route.id, signal);
     else if (route.page === 'users') await renderUsers(signal);
     else if (route.page === 'clients') await renderClients(signal);
+    else if (route.page === 'access') await renderAccessModel(signal);
+    else if (route.page === 'organizations') await renderOrganizations(signal);
     else if (route.page === 'federation') await renderFederation(signal);
     else if (route.page === 'audit') await renderAudit(signal);
     else if (route.page === 'system') await renderSystem(signal);
@@ -1074,11 +1080,17 @@ function clientIdentifier(client) {
   return text(client.clientId ?? client.client_id, 'Unnamed client');
 }
 
+function editableClientMetadata(client) {
+  return Object.fromEntries(Object.entries(client).filter(([name, value]) => (
+    !['managed', 'hasClientSecret'].includes(name) && value !== undefined
+  )));
+}
+
 function clientCard(client) {
   const grants = list(client.grantTypes ?? client.grant_types);
   const redirects = list(client.redirectUris ?? client.redirect_uris);
   const method = client.tokenEndpointAuthMethod ?? client.token_endpoint_auth_method ?? 'client_secret_basic';
-  return element('article', { className: 'catalog-card' }, [
+  const card = element('article', { className: 'catalog-card' }, [
     element('div', { className: 'catalog-card-header' }, [
       element('span', { className: 'catalog-card-icon', text: 'C' }),
       badge(method === 'none' ? 'Public' : 'Confidential', method === 'none' ? 'info' : 'success'),
@@ -1091,6 +1103,30 @@ function clientCard(client) {
       element('li', {}, [element('span', { text: 'Authentication' }), element('strong', { text: method })]),
     ]),
   ]);
+  if (client.managed && can('clients.manage')) {
+    card.append(actionButton('Edit managed client', async () => {
+      const metadata = editableClientMetadata(client);
+      if (client.hasClientSecret) {
+        const secret = await promptedValue('Enter a replacement client secret (at least 32 bytes). The current secret cannot be read.', '');
+        if (!secret) return;
+        metadata.client_secret = secret;
+      }
+      const updated = await promptedJson('Edit the complete OIDC client metadata.', metadata);
+      if (!updated) return;
+      await requestJson(`/admin/v1/realms/${encodeURIComponent(state.realm)}/clients/${encodeURIComponent(clientIdentifier(client))}`, { method: 'PUT', body: updated });
+      state.configuration = null;
+      toast('Managed client updated.');
+      await navigate({ focus: false });
+    }, 'secondary'));
+    card.append(actionButton('Delete managed client', async (button) => {
+      if (!await askConfirmation({ title: 'Delete managed client?', message: `${clientIdentifier(client)} will no longer authenticate and its grants will be revoked.`, action: 'Delete client' })) return;
+      await busy(button, 'Deleting…', () => requestJson(`/admin/v1/realms/${encodeURIComponent(state.realm)}/clients/${encodeURIComponent(clientIdentifier(client))}`, { method: 'DELETE', body: {} }));
+      state.configuration = null;
+      toast('Managed client deleted.');
+      await navigate({ focus: false });
+    }, 'danger-quiet'));
+  }
+  return card;
 }
 
 function resourceServerItem(server) {
@@ -1198,7 +1234,28 @@ async function renderClients(signal) {
   const resources = list(configuration.resourceServers);
   const register = actionButton('Register application', () => openClientDialog(), 'primary');
   register.disabled = !configuration.dynamicRegistration || !can('clients.register');
-  setHeader('clients', can('clients.register') ? [register] : []);
+  const createManaged = actionButton('Create managed client', async () => {
+    const generatedSecret = base64urlFromBytes(window.crypto.getRandomValues(new Uint8Array(32)));
+    const metadata = await promptedJson('Create complete OIDC client metadata. Remove client_secret and use token_endpoint_auth_method "none" for a public client.', {
+      client_id: 'new-client',
+      client_name: 'New client',
+      client_secret: generatedSecret,
+      token_endpoint_auth_method: 'client_secret_basic',
+      redirect_uris: ['https://app.example.com/oidc/callback'],
+      response_types: ['code'],
+      grant_types: ['authorization_code', 'refresh_token'],
+    });
+    if (!metadata) return;
+    await requestJson(`/admin/v1/realms/${encodeURIComponent(state.realm)}/clients`, { method: 'POST', body: metadata });
+    state.configuration = null;
+    if (metadata.client_secret) showOneTimeValues({ title: 'Managed client created', description: 'Store the client secret now. AuthMe will not return it again.', values: [['Client ID', metadata.client_id], ['Client secret', metadata.client_secret]] });
+    toast('Managed client created.');
+    await navigate({ focus: false });
+  }, 'primary');
+  setHeader('clients', [
+    can('clients.manage') ? createManaged : null,
+    can('clients.register') ? register : null,
+  ]);
 
   const clientGrid = element('div', { className: 'card-body catalog-grid' });
   for (const client of clients) clientGrid.append(clientCard(client));
@@ -1217,8 +1274,223 @@ async function renderClients(signal) {
     ),
     contentCard('Applications', `${clients.length} clients exposed by the safe realm configuration`, clientGrid),
     contentCard('Resource servers', 'Explicit audiences, scopes, and access-token formats', resourceList),
-    callout('Configuration boundary', 'Static clients and API policy remain immutable deployment input. Dynamic registration management is per-client and does not provide a realm-wide inventory.'),
+    callout('Configuration boundary', 'Deployment clients remain immutable. Managed and dynamically registered clients appear in this inventory and can be removed by grants with clients.manage.'),
   ]));
+}
+
+function managementItem(title, detail, actions = []) {
+  return element('div', { className: 'resource-item' }, [
+    element('div', {}, [element('strong', { text: title }), element('p', { text: detail })]),
+    element('div', { className: 'table-actions' }, actions),
+  ]);
+}
+
+async function promptedValue(message, initial = '') {
+  const value = window.prompt(message, initial);
+  return value === null ? null : value.trim();
+}
+
+async function promptedJson(message, initial) {
+  const value = window.prompt(message, JSON.stringify(initial, null, 2));
+  if (value === null) return null;
+  try { return JSON.parse(value); } catch { throw new Error('The value must be valid JSON.'); }
+}
+
+async function renderAccessModel(signal) {
+  const base = `/admin/v1/realms/${encodeURIComponent(state.realm)}`;
+  const [roleData, groupData, scopeData, flowData, mapperData] = await Promise.all([
+    requestJson(`${base}/roles`, { signal }), requestJson(`${base}/groups`, { signal }),
+    requestJson(`${base}/client-scopes`, { signal }), requestJson(`${base}/authentication-flows`, { signal }),
+    requestJson(`${base}/claim-mappers`, { signal }),
+  ]);
+  const roles = list(roleData.roles);
+  const groups = list(groupData.groups);
+  const scopes = list(scopeData.clientScopes);
+  const flows = list(flowData.authenticationFlows);
+  const mappers = list(mapperData.claimMappers);
+  const createRole = actionButton('Create role', async () => {
+    const name = await promptedValue('Role name'); if (!name) return;
+    const description = await promptedValue('Description', '') ?? '';
+    await requestJson(`${base}/roles/${encodeURIComponent(name)}`, { method: 'PUT', body: { description, composites: [], attributes: {} } });
+    toast('Role created.'); await navigate({ focus: false });
+  }, 'primary');
+  const createGroup = actionButton('Create group', async () => {
+    const name = await promptedValue('Group name'); if (!name) return;
+    await requestJson(`${base}/groups`, { method: 'POST', body: { name, parentId: null, roles: [], attributes: {} } });
+    toast('Group created.'); await navigate({ focus: false });
+  }, 'secondary');
+  const createScope = actionButton('Create client scope', async () => {
+    const name = await promptedValue('Client scope name'); if (!name) return;
+    await requestJson(`${base}/client-scopes`, { method: 'POST', body: { name, description: '', protocol: 'openid-connect', attributes: {} } });
+    toast('Client scope created.'); await navigate({ focus: false });
+  }, 'secondary');
+  const createFlow = actionButton('Create password flow', async () => {
+    const alias = await promptedValue('Authentication flow alias'); if (!alias) return;
+    const acr = await promptedValue('ACR value', `urn:authme:flow:${alias}`); if (!acr) return;
+    await requestJson(`${base}/authentication-flows`, { method: 'POST', body: { alias, acr, enabled: true, priority: 100, clientIds: [], maxAgeSeconds: null, steps: [{ type: 'password', requirement: 'required' }] } });
+    toast('Authentication flow created.'); await navigate({ focus: false });
+  }, 'secondary');
+  const createMapper = actionButton('Create claim mapper', async () => {
+    const mapper = await promptedJson('Create a claim mapper. ownerId is a client ID or client-scope UUID.', {
+      ownerType: 'client', ownerId: 'client-id', name: 'tenant', mapperType: 'hardcoded',
+      config: { claim: 'tenant', value: 'example' },
+    });
+    if (!mapper) return;
+    await requestJson(`${base}/claim-mappers`, { method: 'POST', body: mapper });
+    toast('Claim mapper created.'); await navigate({ focus: false });
+  }, 'secondary');
+  setHeader('access', [
+    can('roles.manage') ? createRole : null,
+    can('groups.manage') ? createGroup : null,
+    can('client-scopes.manage') ? createScope : null,
+    can('client-scopes.manage') ? createMapper : null,
+    can('authentication-flows.manage') ? createFlow : null,
+  ]);
+  const roleList = element('div', { className: 'card-body resource-list' });
+  for (const role of roles) {
+    const actions = can('roles.manage') ? [
+      actionButton('Edit', async () => {
+        const update = await promptedJson('Edit the role definition.', { description: role.description, composites: role.composites, attributes: role.attributes });
+        if (!update) return;
+        await requestJson(`${base}/roles/${encodeURIComponent(role.name)}`, { method: 'PUT', body: update });
+        toast('Role updated.'); await navigate({ focus: false });
+      }, 'secondary'),
+      actionButton('Delete', async () => { await requestJson(`${base}/roles/${encodeURIComponent(role.name)}`, { method: 'DELETE', body: {} }); toast('Role deleted.'); await navigate({ focus: false }); }, 'danger-quiet'),
+    ] : [];
+    roleList.append(managementItem(role.name, role.composites.length ? `Includes ${role.composites.join(', ')}` : text(role.description, 'Direct realm role'), actions));
+  }
+  if (!roles.length) roleList.append(emptyState('No managed roles', 'Create realm roles and compose them into reusable permission sets.'));
+  const groupList = element('div', { className: 'card-body resource-list' });
+  for (const group of groups) {
+    const actions = can('groups.manage') ? [
+      actionButton('Edit', async () => {
+        const update = await promptedJson('Edit the group. parentId may be null or another group UUID.', { name: group.name, parentId: group.parentId, roles: group.roles, attributes: group.attributes });
+        if (!update) return;
+        await requestJson(`${base}/groups/${encodeURIComponent(group.id)}`, { method: 'PATCH', body: update });
+        toast('Group updated.'); await navigate({ focus: false });
+      }, 'secondary'),
+      actionButton('Delete', async () => { await requestJson(`${base}/groups/${encodeURIComponent(group.id)}`, { method: 'DELETE', body: {} }); toast('Group deleted.'); await navigate({ focus: false }); }, 'danger-quiet'),
+    ] : [];
+    groupList.append(managementItem(group.path, group.roles.length ? `Roles: ${group.roles.join(', ')}` : 'No inherited roles', actions));
+  }
+  if (!groups.length) groupList.append(emptyState('No managed groups', 'Nested groups provide reusable membership and role inheritance.'));
+  const policyList = element('div', { className: 'card-body resource-list' });
+  for (const scope of scopes) policyList.append(managementItem(
+    `Scope · ${scope.name}`,
+    text(scope.description, scope.protocol),
+    can('client-scopes.manage') ? [
+      actionButton('Assign', async () => {
+        const clientId = await promptedValue('Client ID'); if (!clientId) return;
+        const assignmentType = await promptedValue('Assignment type: default or optional', 'default');
+        if (!['default', 'optional'].includes(assignmentType)) throw new Error('Assignment type must be default or optional.');
+        await requestJson(`${base}/clients/${encodeURIComponent(clientId)}/client-scopes/${encodeURIComponent(scope.id)}`, { method: 'PUT', body: { assignmentType } });
+        toast('Client scope assigned.');
+      }, 'secondary'),
+      actionButton('Edit', async () => {
+        const update = await promptedJson('Edit the client scope.', { name: scope.name, description: scope.description, attributes: scope.attributes });
+        if (!update) return;
+        await requestJson(`${base}/client-scopes/${encodeURIComponent(scope.id)}`, { method: 'PATCH', body: update });
+        toast('Client scope updated.'); await navigate({ focus: false });
+      }, 'secondary'),
+      actionButton('Delete', async () => { await requestJson(`${base}/client-scopes/${encodeURIComponent(scope.id)}`, { method: 'DELETE', body: {} }); toast('Client scope deleted.'); await navigate({ focus: false }); }, 'danger-quiet'),
+    ] : [],
+  ));
+  for (const mapper of mappers) policyList.append(managementItem(
+    `Mapper · ${mapper.name}`,
+    `${mapper.mapperType} → ${text(mapper.config?.claim)}`,
+    can('client-scopes.manage') ? [
+      actionButton('Edit', async () => {
+        const update = await promptedJson('Edit the claim mapper.', { name: mapper.name, mapperType: mapper.mapperType, config: mapper.config });
+        if (!update) return;
+        await requestJson(`${base}/claim-mappers/${encodeURIComponent(mapper.id)}`, { method: 'PATCH', body: update });
+        toast('Claim mapper updated.'); await navigate({ focus: false });
+      }, 'secondary'),
+      actionButton('Delete', async () => { await requestJson(`${base}/claim-mappers/${encodeURIComponent(mapper.id)}`, { method: 'DELETE', body: {} }); toast('Claim mapper deleted.'); await navigate({ focus: false }); }, 'danger-quiet'),
+    ] : [],
+  ));
+  for (const flow of flows) policyList.append(managementItem(
+    `Flow · ${flow.alias}`,
+    `${flow.acr} · ${flow.enabled ? 'enabled' : 'disabled'} · ${flow.steps.map((step) => `${step.type}:${step.requirement}`).join(', ')}`,
+    can('authentication-flows.manage') ? [
+      actionButton('Edit', async () => {
+        const update = await promptedJson('Edit the authentication flow.', {
+          alias: flow.alias, description: flow.description, enabled: flow.enabled, priority: flow.priority,
+          clientIds: flow.clientIds, acr: flow.acr, maxAgeSeconds: flow.maxAgeSeconds, steps: flow.steps,
+        });
+        if (!update) return;
+        await requestJson(`${base}/authentication-flows/${encodeURIComponent(flow.id)}`, { method: 'PATCH', body: update });
+        toast('Authentication flow updated.'); await navigate({ focus: false });
+      }, 'secondary'),
+      actionButton('Delete', async () => { await requestJson(`${base}/authentication-flows/${encodeURIComponent(flow.id)}`, { method: 'DELETE', body: {} }); toast('Authentication flow deleted.'); await navigate({ focus: false }); }, 'danger-quiet'),
+    ] : [],
+  ));
+  if (!scopes.length && !mappers.length && !flows.length) policyList.append(emptyState('No reusable policy', 'Add client scopes, claim mappers, and authentication flows for this realm.'));
+  setPage(element('div', { className: 'page-stack' }, [
+    contentCard('Realm roles', `${roles.length} role definitions`, roleList),
+    contentCard('Nested groups', `${groups.length} group definitions`, groupList),
+    contentCard('Scopes, mappers & step-up', `${scopes.length + mappers.length + flows.length} policy objects`, policyList),
+  ]));
+}
+
+async function renderOrganizations(signal) {
+  const base = `/admin/v1/realms/${encodeURIComponent(state.realm)}/organizations`;
+  const { organizations = [] } = await requestJson(base, { signal });
+  const create = actionButton('Create organization', async () => {
+    const name = await promptedValue('Organization name'); if (!name) return;
+    const alias = await promptedValue('Organization alias', name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')); if (!alias) return;
+    const domains = await promptedValue('Verified domains (comma separated)', '');
+    await requestJson(base, { method: 'POST', body: { name, alias, enabled: true, domains: commaValues(domains).map((domain) => ({ domain: domain.toLowerCase(), verified: false })), identityProviderIds: [], attributes: {} } });
+    toast('Organization created.'); await navigate({ focus: false });
+  }, 'primary');
+  setHeader('organizations', can('organizations.manage') ? [create] : []);
+  const items = element('div', { className: 'card-body resource-list' });
+  for (const organization of organizations) {
+    const organizationBase = `${base}/${encodeURIComponent(organization.id)}`;
+    const actions = can('organizations.manage') ? [
+      actionButton('Edit', async () => {
+        const update = await promptedJson('Edit the organization.', {
+          name: organization.name, alias: organization.alias, enabled: organization.enabled,
+          domains: organization.domains, identityProviderIds: organization.identityProviderIds,
+          attributes: organization.attributes,
+        });
+        if (!update) return;
+        await requestJson(organizationBase, { method: 'PATCH', body: update });
+        toast('Organization updated.'); await navigate({ focus: false });
+      }, 'secondary'),
+      actionButton('Set member', async () => {
+        const userId = await promptedValue('User UUID'); if (!userId) return;
+        const roles = await promptedValue('Organization roles (comma separated)', 'member'); if (roles === null) return;
+        await requestJson(`${organizationBase}/members/${encodeURIComponent(userId)}`, { method: 'PUT', body: { roles: commaValues(roles) } });
+        toast('Organization membership updated.');
+      }, 'secondary'),
+      actionButton('Manage members', async () => {
+        const { memberships = [] } = await requestJson(`${organizationBase}/members`);
+        if (!memberships.length) { toast('This organization has no members.'); return; }
+        const userId = await promptedValue(`Enter a user UUID to remove. Current members:\n${memberships.map((membership) => `${membership.userId} (${membership.roles.join(', ') || 'no roles'})`).join('\n')}`);
+        if (!userId) return;
+        await requestJson(`${organizationBase}/members/${encodeURIComponent(userId)}`, { method: 'DELETE', body: {} });
+        toast('Organization member removed.');
+      }, 'secondary'),
+      actionButton('Invite', async () => {
+        const email = await promptedValue('Invitation email'); if (!email) return;
+        const roles = await promptedValue('Organization roles (comma separated)', 'member'); if (roles === null) return;
+        const invitation = await requestJson(`${organizationBase}/invitations`, { method: 'POST', body: { email, roles: commaValues(roles), expiresInSeconds: 86_400 } });
+        showOneTimeValues({ title: 'Organization invitation created', description: 'Deliver this single-use token through a protected channel.', values: [['Email', invitation.email], ['Invitation token', invitation.token]] });
+      }, 'secondary'),
+      actionButton('Delete', async () => {
+        if (!await askConfirmation({ title: 'Delete organization?', message: `${organization.name}, its invitations, and memberships will be removed.`, action: 'Delete organization' })) return;
+        await requestJson(organizationBase, { method: 'DELETE', body: {} });
+        toast('Organization deleted.'); await navigate({ focus: false });
+      }, 'danger-quiet'),
+    ] : [];
+    items.append(managementItem(
+      organization.name,
+      `${organization.alias} · ${organization.enabled ? 'enabled' : 'disabled'} · ${organization.domains.map(({ domain }) => domain).join(', ') || 'no domains'}`,
+      actions,
+    ));
+  }
+  if (!organizations.length) items.append(emptyState('No organizations', 'Organizations bind domains, invitations, memberships, and dedicated identity providers inside this realm.'));
+  setPage(element('div', { className: 'page-stack' }, [contentCard('Organizations', `${organizations.length} realm organizations`, items)]));
 }
 
 function providerSummary(kind, provider) {
@@ -1403,15 +1675,36 @@ function settingLink(title, detail, href) {
 }
 
 async function renderSystem(signal) {
-  const [configuration, health] = await Promise.all([
+  const realmBase = `/admin/v1/realms/${encodeURIComponent(state.realm)}`;
+  const [configuration, health, realmDetails, signingKeyData] = await Promise.all([
     loadConfiguration({ signal }),
     requestJson('/health/ready', { signal, redirectOnUnauthorized: false }).catch(() => ({ status: 'unavailable' })),
+    can('realms.read') ? requestJson(realmBase, { signal }) : Promise.resolve(null),
+    requestJson(`${realmBase}/signing-keys`, { signal }),
   ]);
-  setHeader('system', [actionButton('Refresh configuration', async (button) => {
+  const editRealm = actionButton('Edit realm', async () => {
+    const update = await promptedJson('Edit mutable realm metadata. The name and issuer cannot change.', {
+      displayName: realmDetails.displayName, enabled: realmDetails.enabled, settings: realmDetails.settings,
+    });
+    if (!update) return;
+    await requestJson(realmBase, { method: 'PATCH', body: update });
+    toast('Realm updated.'); await navigate({ focus: false });
+  }, 'secondary');
+  const rotateKey = actionButton('Rotate signing key', async () => {
+    if (!await askConfirmation({ title: 'Rotate the signing key?', message: 'The provider must publish a new active key and preserve the configured verification overlap. Roll all replicas after a successful rotation.', action: 'Rotate key' })) return;
+    const result = await requestJson(`${realmBase}/signing-keys/rotate`, { method: 'POST', body: { force: true } });
+    toast(result.rotated ? `Signing key ${result.keyId} created; rolling restart required.` : `Rotation is not due until ${formatDate(result.dueAt)}.`);
+    await navigate({ focus: false });
+  }, 'secondary');
+  setHeader('system', [
+    can('realms.manage') && realmDetails ? editRealm : null,
+    can('signing-keys.manage') ? rotateKey : null,
+    actionButton('Refresh configuration', async (button) => {
     await busy(button, 'Refreshing…', () => loadConfiguration({ refresh: true }));
     toast('Safe configuration refreshed.');
     await navigate({ focus: false });
-  }, 'secondary')]);
+    }, 'secondary'),
+  ]);
 
   const ttlGrid = element('dl', { className: 'description-grid' });
   const ttlEntries = Object.entries(record(configuration.ttls));
@@ -1426,6 +1719,12 @@ async function renderSystem(signal) {
   const resources = element('div', { className: 'card-body resource-list' });
   for (const server of list(configuration.resourceServers)) resources.append(resourceServerItem(server));
   if (!list(configuration.resourceServers).length) resources.append(emptyState('No API audiences', 'No resource servers are configured in this realm.'));
+  const signingKeys = element('div', { className: 'card-body resource-list' });
+  for (const key of list(signingKeyData.signingKeys)) signingKeys.append(managementItem(
+    key.keyId,
+    `${key.algorithm} · ${key.provider} · ${key.status}${key.retireAfter ? ` · retire after ${formatDate(key.retireAfter)}` : ''}`,
+  ));
+  if (!list(signingKeyData.signingKeys).length) signingKeys.append(emptyState('No key inventory', 'The signing provider has not synchronized its public key inventory.'));
 
   const user = record(state.session.user);
   const discoveryPath = `/realms/${encodeURIComponent(state.realm)}/.well-known/openid-configuration`;
@@ -1451,7 +1750,8 @@ async function renderSystem(signal) {
     ]),
     contentCard('Token & session lifetimes', 'Values exposed by the safe configuration API', element('div', { className: 'card-body' }, [ttlGrid])),
     contentCard('Resource-server policy', 'Explicit protected audiences in this realm', resources),
-    callout('Deployment-managed settings', 'Realm issuers, signing material, static clients, identity-provider trust, SCIM credentials, secrets, storage, and token policy are changed through reviewed deployment configuration and a controlled rollout.', 'warning'),
+    contentCard('Signing-key lifecycle', 'Public-only provider inventory; private key material is never returned', signingKeys),
+    callout('Configuration boundary', 'Realm display/status/settings and external-provider key rotation are mutable here. Realm issuer names, static clients, identity-provider trust, SCIM credentials, secrets, storage, and token policy remain reviewed deployment configuration.', 'warning'),
   ]));
 }
 

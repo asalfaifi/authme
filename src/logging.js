@@ -28,6 +28,9 @@ const redact = {
   paths: [
     'req.headers.authorization',
     'req.headers.cookie',
+    'res.headers.location',
+    'response.headers.location',
+    '*.headers.location',
     'body',
     '*.body',
     ...sensitiveFields.flatMap((field) => [field, `*.${field}`, `*.*.${field}`]),
@@ -48,11 +51,11 @@ export function loggableError(error, message) {
   };
 }
 
-export function createLogger(level = 'info') {
+export function createLogger(level = 'info', destination) {
   return pino({
     level,
     redact,
     base: { service: 'authme' },
     timestamp: pino.stdTimeFunctions.isoTime,
-  });
+  }, destination);
 }

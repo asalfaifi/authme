@@ -1,6 +1,6 @@
 import { createHmac } from 'node:crypto';
 import { isIP } from 'node:net';
-import Provider, { errors } from 'oidc-provider';
+import Provider, { errors, interactionPolicy } from 'oidc-provider';
 import {
   grantType as cibaGrantType,
   handler as cibaGrantHandler,
@@ -18,6 +18,7 @@ import {
   renderLogoutSuccess,
 } from './ui/render.js';
 import { SAML_IDP_BRIDGE_CLIENT_ID } from './federation/saml-idp.js';
+import { applyClaimMappers, expandCompositeRoles } from './repositories/management-store.js';
 
 // oidc-provider 9.9.1 otherwise defaults every client to signed JWT introspection responses.
 delete oidcClientMetadataDefaults.introspection_signed_response_alg;
@@ -459,7 +460,7 @@ function validateClientSecurity(metadata, { development = false, mtlsEnabled = t
   validateFapiClientSecurity(metadata, { mtlsEnabled });
 }
 
-export async function createRealmProvider({ realm, config, store, data, Adapter, jwks, logger, auditWriter }) {
+export async function createRealmProvider({ realm, config, store, data, management, Adapter, jwks, logger, auditWriter }) {
   const issuer = issuerFor(config, realm);
   const clientAssertionAudiences = new Set([
     issuer,
@@ -467,13 +468,96 @@ export async function createRealmProvider({ realm, config, store, data, Adapter,
   ]);
   const cibaClientAssertionAudience = `${issuer}${keycloakRoutes.backchannel_authentication}`;
   const cibaPollInterval = config.devMode ? cibaDevelopmentPollInterval : cibaProductionPollInterval;
+  const organizationContextAdapter = new Adapter('AuthMeOrganizationContext');
   const resourceServers = config.resourceServersByRealm[realm];
   const clients = configuredClientsForRealm(config, realm);
   const mtls = createMtlsFeatureConfiguration(config);
   const enabledClientAuthMethods = config.mtls.enabled ? clientAuthMethods : baseClientAuthMethods;
+  const configuredFlows = management ? await management.listAuthenticationFlows(realm) : [];
+  const configuredClientScopes = management ? await management.listClientScopes(realm) : [];
+  const supportedAcrValues = [...new Set([
+    'urn:authme:loa:1',
+    'urn:authme:loa:2',
+    ...configuredFlows.filter((flow) => flow.enabled).map((flow) => flow.acr),
+  ])];
+  const policy = interactionPolicy.base();
+  if (management) {
+    policy.get('login').checks.add(new interactionPolicy.Check(
+      'authme_authentication_flow',
+      'the configured authentication flow has not been satisfied',
+      async (ctx) => {
+        const accountId = ctx.oidc.session?.accountId;
+        const organizationContext = ctx.oidc.params.organization;
+        if (accountId && organizationContext) {
+          const organizations = await management.listUserOrganizations(realm, accountId);
+          const authorized = organizations.some((organization) => (
+            organization.id === organizationContext || organization.alias === organizationContext
+          ));
+          if (!authorized) return interactionPolicy.Check.REQUEST_PROMPT;
+        }
+        const requestedAcrs = String(ctx.oidc.params.acr_values ?? '').split(' ').filter(Boolean);
+        const flow = await management.resolveAuthenticationFlow(realm, {
+          clientId: ctx.oidc.client?.clientId,
+          requestedAcrs,
+        });
+        if (!flow || !accountId) return interactionPolicy.Check.NO_NEED_TO_PROMPT;
+        if (ctx.oidc.session.acr !== flow.acr) return interactionPolicy.Check.REQUEST_PROMPT;
+        if (flow.maxAgeSeconds && ctx.oidc.session.past(flow.maxAgeSeconds)) {
+          return interactionPolicy.Check.REQUEST_PROMPT;
+        }
+        return interactionPolicy.Check.NO_NEED_TO_PROMPT;
+      },
+      ({ oidc }) => ({
+        acr: oidc.session?.acr,
+        clientId: oidc.client?.clientId,
+        organization: oidc.params.organization,
+      }),
+    ));
+  }
   let cibaAuthenticationDeviceHandler;
   for (const client of clients) {
     validateClientSecurity(client, { development: config.devMode, mtlsEnabled: config.mtls.enabled });
+  }
+
+  async function managedIdentityClaims(user, clientId, organizationContext, grantedScopes = []) {
+    if (!management) return accountClaims(user);
+    const scopeNames = grantedScopes instanceof Set
+      ? [...grantedScopes]
+      : String(grantedScopes ?? '').split(' ').filter(Boolean);
+    const [roles, groups, organizations, mappers] = await Promise.all([
+      management.listRoles(realm),
+      management.listGroups(realm),
+      management.listUserOrganizations(realm, user.id),
+      clientId ? management.effectiveClaimMappers(realm, clientId, scopeNames) : [],
+    ]);
+    const groupRoles = groups
+      .filter((group) => user.groups?.includes(group.path))
+      .flatMap((group) => group.roles);
+    const contextualOrganizations = organizationContext
+      ? organizations.filter((organization) => organization.id === organizationContext || organization.alias === organizationContext)
+      : organizations;
+    const expandedRoles = expandCompositeRoles([...(user.roles ?? []), ...groupRoles], roles);
+    const enriched = { ...user, roles: expandedRoles };
+    return {
+      ...accountClaims(enriched),
+      organizations: contextualOrganizations.map((organization) => ({
+        id: organization.id,
+        alias: organization.alias,
+        name: organization.name,
+        roles: organization.roles,
+      })),
+      ...applyClaimMappers({ user: enriched, organizations: contextualOrganizations, mappers }),
+    };
+  }
+
+  async function organizationContextFor(ctx, token) {
+    if (ctx?.oidc?.params?.organization) return ctx.oidc.params.organization;
+    const grantId = token?.grantId
+      ?? ctx?.oidc?.entities?.AuthorizationCode?.grantId
+      ?? ctx?.oidc?.entities?.RefreshToken?.grantId
+      ?? ctx?.oidc?.entities?.AccessToken?.grantId;
+    if (!grantId) return undefined;
+    return (await organizationContextAdapter.find(grantId))?.organizationId;
   }
 
   async function secureRegistrationPolicy(ctx, properties) {
@@ -499,7 +583,12 @@ export async function createRealmProvider({ realm, config, store, data, Adapter,
     clients,
     jwks,
     routes: keycloakRoutes,
-    scopes: ['openid', 'offline_access', 'profile', 'email', 'phone', 'address', 'roles', 'groups'],
+    extraParams: ['organization'],
+    acrValues: supportedAcrValues,
+    scopes: [...new Set([
+      'openid', 'offline_access', 'profile', 'email', 'phone', 'address', 'roles', 'groups', 'organization',
+      ...configuredClientScopes.map((scope) => scope.name),
+    ])],
     responseTypes: ['code'],
     clientAuthMethods: enabledClientAuthMethods,
     enabledJWA: {
@@ -509,6 +598,7 @@ export async function createRealmProvider({ realm, config, store, data, Adapter,
     async loadExistingGrant(ctx) {
       const grantId = ctx.oidc.result?.consent?.grantId
         || ctx.oidc.session.grantIdFor(ctx.oidc.client.clientId);
+      if (ctx.oidc.params.organization && !ctx.oidc.result?.consent?.grantId) return undefined;
       if (grantId) return ctx.oidc.provider.Grant.find(grantId);
       if (ctx.oidc.client.clientId !== SAML_IDP_BRIDGE_CLIENT_ID || !ctx.oidc.session.accountId) {
         return undefined;
@@ -564,6 +654,7 @@ export async function createRealmProvider({ realm, config, store, data, Adapter,
       profile: ['name', 'family_name', 'given_name', 'middle_name', 'nickname', 'preferred_username', 'profile', 'picture', 'website', 'gender', 'birthdate', 'zoneinfo', 'locale', 'updated_at'],
       roles: ['realm_access', 'resource_access'],
       groups: ['groups'],
+      organization: ['organizations'],
     },
     cookies: {
       keys: [...config.cookieKeys],
@@ -576,6 +667,7 @@ export async function createRealmProvider({ realm, config, store, data, Adapter,
       },
     },
     interactions: {
+      policy,
       url(_ctx, interaction) {
         return `/realms/${realm}/interaction/${interaction.uid}`;
       },
@@ -630,8 +722,15 @@ export async function createRealmProvider({ realm, config, store, data, Adapter,
             'phone_number', 'phone_number_verified', 'name', 'family_name', 'given_name',
             'middle_name', 'nickname', 'preferred_username', 'profile', 'picture', 'website',
             'gender', 'birthdate', 'zoneinfo', 'locale', 'updated_at', 'groups',
-            'realm_access', 'resource_access',
+            'realm_access', 'resource_access', 'organizations',
           ]);
+          const clientId = _ctx.oidc?.client?.clientId;
+          const requestedScopes = String(_ctx.oidc?.params?.scope ?? '').split(' ').filter(Boolean);
+          for (const mapper of clientId && management
+            ? await management.effectiveClaimMappers(realm, clientId, requestedScopes)
+            : []) {
+            if (typeof mapper.config?.claim === 'string') supported.add(mapper.config.claim);
+          }
           for (const section of ['id_token', 'userinfo']) {
             for (const claim of Object.keys(requestedClaims?.[section] ?? {})) {
               if (!supported.has(claim)) throw new errors.InvalidRequest(`unsupported requested claim: ${claim}`);
@@ -801,25 +900,40 @@ export async function createRealmProvider({ realm, config, store, data, Adapter,
     issueRefreshToken(_ctx, client, code) {
       return client.grantTypeAllowed('refresh_token') && code.scopes.has('offline_access');
     },
-    async findAccount(_ctx, id) {
+    async findAccount(ctx, id, token) {
       const user = await store.findUserById(realm, id);
       if (!user?.enabled) return undefined;
+      const clientId = ctx.oidc?.client?.clientId;
+      const organizationContext = await organizationContextFor(ctx, token);
+      const grantedScopes = token?.scope ?? ctx.oidc?.entities?.AccessToken?.scope ?? ctx.oidc?.params?.scope;
       return {
         accountId: user.id,
         async claims() {
-          return accountClaims(user);
+          return managedIdentityClaims(user, clientId, organizationContext, grantedScopes);
         },
       };
     },
-    async extraTokenClaims(_ctx, token) {
-      if (!token.accountId || token.aud === undefined) return undefined;
-      const audiences = Array.isArray(token.aud) ? token.aud : [token.aud];
-      if (audiences.length !== 1) return undefined;
-      const resourceServer = findConfiguredResourceServer(resourceServers, audiences[0]);
-      if (!resourceServer) return undefined;
+    async extraTokenClaims(ctx, token) {
+      if (!token.accountId) return undefined;
       const user = await store.findUserById(realm, token.accountId);
       if (!user?.enabled) return undefined;
-      return resourceTokenClaims(resourceServer, user, token.scopes);
+      const managedClaims = await managedIdentityClaims(
+        user,
+        token.clientId ?? ctx?.oidc?.client?.clientId,
+        await organizationContextFor(ctx, token),
+        token.scopes,
+      );
+      const customClaims = Object.fromEntries(Object.entries(managedClaims).filter(([name]) => ![
+        'sub', 'email', 'email_verified', 'preferred_username', 'name', 'given_name',
+        'family_name', 'groups', 'realm_access', 'resource_access', 'organizations',
+      ].includes(name)));
+      if (token.scopes?.has('organization')) customClaims.organizations = managedClaims.organizations;
+      if (token.aud === undefined) return Object.keys(customClaims).length ? customClaims : undefined;
+      const audiences = Array.isArray(token.aud) ? token.aud : [token.aud];
+      if (audiences.length !== 1) return Object.keys(customClaims).length ? customClaims : undefined;
+      const resourceServer = findConfiguredResourceServer(resourceServers, audiences[0]);
+      if (!resourceServer) return Object.keys(customClaims).length ? customClaims : undefined;
+      return { ...resourceTokenClaims(resourceServer, { ...user, roles: managedClaims.realm_access.roles }, token.scopes), ...customClaims };
     },
     async pairwiseIdentifier(_ctx, accountId, client) {
       const sector = client.sectorIdentifier;
@@ -918,6 +1032,27 @@ export async function createRealmProvider({ realm, config, store, data, Adapter,
     }
   }
 
+  Object.defineProperty(provider, 'authmeOrganizationContexts', {
+    value: Object.freeze({
+      async set(grantId, accountId, requestedOrganization) {
+        if (!management || !requestedOrganization) return undefined;
+        const organizations = await management.listUserOrganizations(realm, accountId);
+        const organization = organizations.find((candidate) => (
+          candidate.id === requestedOrganization || candidate.alias === requestedOrganization
+        ));
+        if (!organization) throw new errors.AccessDenied('The account is not a member of the requested organization');
+        await organizationContextAdapter.upsert(grantId, {
+          grantId,
+          accountId,
+          organizationId: organization.id,
+        }, 14 * 24 * 60 * 60);
+        return organization.id;
+      },
+      async find(grantId) {
+        return organizationContextAdapter.find(grantId);
+      },
+    }),
+  });
   Object.defineProperty(provider, 'authmeCiba', {
     value: Object.freeze({
       complete: completeCiba,

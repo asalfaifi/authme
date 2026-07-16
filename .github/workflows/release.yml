@@ -1,0 +1,40 @@
+name: Signed release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out exact tag
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install exact dependency tree
+        run: npm ci --no-audit --no-fund
+      - name: Validate source and tests
+        run: npm run check && npm test
+      - name: Load release signing key
+        env:
+          RELEASE_KEY: ${{ secrets.AUTHME_RELEASE_SIGNING_KEY_B64 }}
+        run: |
+          test -n "$RELEASE_KEY"
+          printf '%s' "$RELEASE_KEY" | base64 --decode > "$RUNNER_TEMP/authme-release-key.pem"
+          chmod 600 "$RUNNER_TEMP/authme-release-key.pem"
+          echo "AUTHME_RELEASE_SIGNING_KEY=$RUNNER_TEMP/authme-release-key.pem" >> "$GITHUB_ENV"
+      - name: Build signed archive, SBOM, and checksums
+        run: npm run release:artifacts
+      - name: Publish immutable tag artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes

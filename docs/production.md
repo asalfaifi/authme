@@ -2,7 +2,7 @@
 
 ## Production status
 
-AuthMe v0.3 is a production-oriented identity foundation with OAuth/OIDC, SAML/OIDC federation, LDAP/AD authentication and synchronization, SCIM provisioning, strong credentials, and a realm-scoped administration console. It is not a declaration of complete Keycloak parity or an independently certified identity product. A deployment is production-ready only after the exact build, configuration, proxy, external-provider trust, database adapter, interactions, and operational controls pass the release gates below.
+AuthMe v1.0.0-rc.1 is code-complete for the autonomous v1.0 milestones. It is not a declaration of complete Keycloak parity or an independently certified identity product. A deployment is production-ready only after the exact build, configuration, proxy, external-provider trust, database adapter, interactions, and operational controls pass the release gates below; X1–X3 in `MILESTONES.md` remain external evidence requirements.
 
 The protocol engine is [`oidc-provider` 9.9.1](https://oidc-provider.dev/changelog/#_9-9-1-2026-07-07), whose upstream project publishes OpenID/FAPI certifications and supported profiles. That certification does not automatically extend to AuthMe or a particular deployment.
 
@@ -20,7 +20,7 @@ PostgreSQL primary with managed backup/standby
 optional Redis: shared rate-limit counters only
 ```
 
-v0.3 supports a single writable PostgreSQL authority. Multi-site active/active writes are not supported. Do not distribute realms across independent databases behind one issuer without a designed consistency and failover model.
+AuthMe supports one writable PostgreSQL authority with platform-managed standby/failover. Multi-site active/active writes are not supported. Do not distribute realms across independent databases behind one issuer without a designed consistency and failover model.
 
 ## Base requirements
 
@@ -56,14 +56,15 @@ Production configuration must define, using the names supported by the current e
 
 Secrets belong in a secret manager or mounted secret file with restrictive permissions. Avoid environment-variable exposure where the platform includes environments in diagnostics, but never commit secrets to files or images. Fail startup when an example/default secret is detected.
 
-The v0.3 executable recognizes these security-critical inputs:
+The executable recognizes these security-critical inputs:
 
 | Setting | Production requirement |
 |---|---|
 | `AUTHME_PUBLIC_URL` | Exact externally visible HTTPS origin |
 | `AUTHME_REALMS` | Comma-separated immutable realm slugs |
 | `DATABASE_URL` | Required PostgreSQL connection |
-| `AUTHME_JWKS_DIR` | Read-only directory containing realm JWK sets |
+| `AUTHME_JWKS_DIR` | Read-only directory containing realm JWK sets for realms using the `file` signing provider |
+| `AUTHME_SIGNING_KEY_PROVIDERS_JSON` | Per-realm provider (`file`, `aws-kms`, `gcp-kms`, `azure-key-vault`, or `pkcs11`), algorithm, non-secret material reference, rotation days, and public-key overlap. External provider deployments must register a compatible signing adapter. |
 | `AUTHME_COOKIE_KEYS` | At least two independent values, newest first, each at least 32 bytes |
 | `AUTHME_CSRF_SECRET` | Independent random value of at least 32 bytes |
 | `AUTHME_PASSWORD_PEPPER` | Independent random value of at least 32 bytes |
@@ -143,6 +144,7 @@ Operational rules:
 - The migrator preflights applied names and checksums before applying pending files, then AuthMe verifies the exact release manifest again before production startup. A missing `schema_migrations` table, pending or modified migration, or migration unknown to the running image fails startup before realm state is touched. Run `npm run db:migrate` with the target image first; do not hand-edit migration history.
 - Migration `006_ciba.sql` adds durable CIBA polling deadline columns to `oidc_records`; apply it before enabling a release that accepts CIBA requests on any replica.
 - Migration `007_ldap_sync.sql` adds per-run reconciliation markers to immutable external-identity links; apply it before running `ldap:sync`.
+- Migration `009_v1_management.sql` adds realm/client authorization policy, organizations, authentication flows, claim mappers, signing-key inventory, and unbounded CIBA poll backoff; apply it before starting this release candidate.
 - Back up before schema changes and verify that the target application can run against the migrated schema.
 - Bound each AuthMe replica's connection pool so the combined maximum remains below database capacity with headroom for migrations and operations.
 - Configure statement, lock, and idle transaction timeouts.
@@ -158,7 +160,7 @@ If PostgreSQL RLS is enabled as defense-in-depth, use a runtime role that cannot
 
 ## Redis
 
-Redis is optional for shared rate limiting. It must not contain canonical sessions, grants, authorization codes, tokens, users, clients, or signing keys in v0.3.
+Redis is optional for shared rate limiting. It must not contain canonical sessions, grants, authorization codes, tokens, users, clients, or signing keys.
 
 For multi-replica deployments:
 
@@ -171,11 +173,29 @@ For multi-replica deployments:
 
 ## Signing keys and secrets
 
-### Initial provisioning
+### Provider configuration and initial provisioning
 
-Generate signing keys using a reputable cryptographic tool or managed key service. Inject private JWK material through protected deployment secrets. Only public members appear in JWKS responses. Use distinct key material per environment and preferably per realm.
+The default `file` provider loads private JWK material from `AUTHME_JWKS_DIR`. External provider names select a deployment-supplied adapter with `loadJwks()` and `rotate()` operations; AuthMe fails startup if that adapter is absent or returns an invalid private signing set. Keep KMS/HSM credentials in the platform identity/secret boundary and store only provider references and public JWKs in PostgreSQL. Only public members appear in discovery JWKS and administration inventory. Use distinct key material per environment and realm.
+
+Example provider policy:
+
+```json
+{
+  "master": {
+    "provider": "pkcs11",
+    "algorithm": "ES256",
+    "material_reference": "pkcs11:token=authme;object=realm-master",
+    "rotation_days": 30,
+    "overlap_seconds": 86400
+  }
+}
+```
+
+An external adapter still needs an operator-tested KMS/HSM integration. The repository supplies the validated lifecycle boundary and fails closed; it does not pretend that cloud credentials or physical hardware are present.
 
 ### Rotation runbook
+
+For file keys, run `npm run keys:rotate -- --realm master --jwks-dir /protected/jwks [--algorithm RS256]`; the command atomically installs a new active key, retains the prior key, and reports that a rolling restart is required. For external providers, use `POST /admin/v1/realms/{realm}/signing-keys/rotate` through a reviewed administration channel.
 
 1. Generate/import the new key and unique `kid` without removing the old public key.
 2. Publish both keys and verify JWKS from every replica/public ingress.
@@ -191,13 +211,13 @@ Rotate database, Redis, cookie, client, and administrative secrets independently
 
 ### Password and MFA secrets
 
-v0.3 hashes passwords with Argon2id using 64 MiB memory, three iterations, parallelism one, a 32-byte hash, a per-password salt supplied by the library, and `AUTHME_PASSWORD_PEPPER`. Recalibrate resource cost on deployment hardware without weakening it silently. The implementation follows the Argon2id family standardized in [RFC 9106](https://www.rfc-editor.org/rfc/rfc9106.html).
+AuthMe hashes passwords with Argon2id using 64 MiB memory, three iterations, parallelism one, a 32-byte hash, a per-password salt supplied by the library, and `AUTHME_PASSWORD_PEPPER`. Recalibrate resource cost on deployment hardware without weakening it silently. The implementation follows the Argon2id family standardized in [RFC 9106](https://www.rfc-editor.org/rfc/rfc9106.html).
 
 TOTP secrets are encrypted with AES-256-GCM using `AUTHME_FIELD_ENCRYPTION_KEY` and contextual associated data. Recovery codes are keyed digests and are consumed once. Protect the encryption key and password pepper separately from the PostgreSQL backup. Restore drills must include both.
 
 Passkey credential public keys, signature counters, transports, and descriptive backup/device metadata are stored in PostgreSQL. They are not secrets, but credential IDs and user handles are authentication data and belong in protected backups. Passkey challenges are random, short-lived, server-side records consumed atomically on the first verification attempt. The RP ID is the exact `AUTHME_PUBLIC_URL` hostname and verification accepts only the exact configured origin. Changing that hostname makes existing credentials unusable; rehearse issuer/origin migration as passkey re-enrollment.
 
-v0.3 accepts one active password pepper and one active field-encryption key. Replacing either value without migrating the dependent records locks users out: the pepper participates in password verification and recovery-code digests, while the field key decrypts TOTP secrets. Use a tested offline rehash/re-encryption or credential re-enrollment plan; do not rotate these values as an uncoordinated ordinary restart.
+AuthMe accepts one active password pepper and one active field-encryption key. Replacing either value without migrating the dependent records locks users out: the pepper participates in password verification and recovery-code digests, while the field key decrypts TOTP secrets. Use a tested offline rehash/re-encryption or credential re-enrollment plan; do not rotate these values as an uncoordinated ordinary restart.
 
 ## Administration and dynamic registration
 
@@ -213,7 +233,7 @@ The independent `AUTHME_ADMIN_TOKEN` protects root automation under `/admin/v1` 
 
 Do not use the root bearer as a console login mechanism and do not copy it into HTML, browser JavaScript, local storage, or operator screenshots. Restrict both management paths at ingress; the in-browser console then applies its realm and permission grant in addition to that network boundary.
 
-Initial access tokens must be short-lived and delivered out of band. AuthMe v0.3 does not attach fine-grained policies to these tokens, so treat each one as permission to submit any client metadata accepted by the protocol engine. Review every dynamically registered redirect/logout URI and authentication method. Revoke suspicious clients immediately.
+Initial access tokens must be short-lived and delivered out of band. AuthMe does not attach fine-grained policies to these tokens, so treat each one as permission to submit any client metadata accepted by the protocol engine. Review every dynamically registered redirect/logout URI and authentication method. Revoke suspicious clients immediately.
 
 ## Cookies and browser security
 
@@ -288,9 +308,35 @@ Back up:
 - immutable deployment configuration and secret-manager metadata;
 - migration tooling/version and release image digest.
 
-Encrypt backups, isolate backup credentials, define retention/deletion, and test restoration into an isolated environment. A database backup without the corresponding signing keys cannot resume the same issuer cleanly; signing keys without the database are insufficient to restore grants and sessions.
+AuthMe's backup command uses `pg_dump` custom format and encrypts the database dump and every file-provider JWK independently with AES-256-GCM. The manifest binds file sizes, SHA-256 checksums, package version, and the exact migration manifest. Supply a base64url-encoded 32-byte `AUTHME_BACKUP_ENCRYPTION_KEY` from a backup-specific secret boundary:
+
+```sh
+npm run backup -- --output /protected/backups/authme-2026-07-17 --jwks-dir /protected/jwks
+npm run restore -- --input /protected/backups/authme-2026-07-17 --jwks-dir /restore/jwks --confirm-destructive-restore
+```
+
+Restore verifies every checksum, validates the migration manifest, authenticates/decrypts every payload before invoking `pg_restore`, and refuses to overwrite an existing signing-key file. Run it only against an isolated/empty recovery target first. Encrypt backups, isolate backup credentials, define retention/deletion, and test restoration. A database backup without the corresponding signing keys or KMS references cannot resume the same issuer cleanly; signing keys without the database are insufficient to restore grants and sessions.
 
 Recovery objectives must state whether active sessions must survive. If not, deliberately revoke/invalidate them rather than accidentally accepting inconsistent state.
+
+For a single-region rolling-availability rehearsal, first run plan mode and inspect the public health result, then allow the command to perform and observe a Kubernetes rollout:
+
+```sh
+npm run ha:rehearse -- --base-url https://auth.example.com
+npm run ha:rehearse -- --base-url https://auth.example.com --execute --namespace authme --deployment authme
+```
+
+This proves the scripted single-region rollout path only. Database standby promotion, dependency outage, physical HSM behavior, disaster recovery, and regional failover must be executed in the operator's real infrastructure and attached as external X3 evidence.
+
+## Performance target and rehearsal
+
+The default release-candidate service target for the public discovery read path is zero errors and p95 latency at or below 500 ms for 500 requests at concurrency 25 in the target environment. Run:
+
+```sh
+npm run perf:rehearse -- --base-url https://auth.example.com --requests 500 --concurrency 25 --p95-ms 500
+```
+
+This is a reproducible minimum gate, not a capacity claim for login or token traffic. Each production deployment must define and validate representative authorization, token, refresh, federation, SCIM, cleanup, and outage workloads, then record throughput, p95/p99, database saturation, error rate, and recovery time.
 
 ## Upgrade procedure
 

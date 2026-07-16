@@ -2,7 +2,7 @@
 
 AuthMe is a standalone, multi-realm OpenID Connect identity server with Keycloak-shaped OIDC URLs. It provides a secure OIDC foundation—users, clients, sessions, consent, MFA, administration, audit, and deployment—without running or wrapping Keycloak.
 
-> **Current status:** v0.3 is production-oriented, but it is not yet a complete replacement for every Keycloak feature and is not an independently OpenID-certified product. Read the exact [compatibility matrix](docs/keycloak-compatibility.md) before migrating a production realm.
+> **Current status:** v1.0.0-rc.1 is code-complete for the milestones in [MILESTONES.md](MILESTONES.md). It is a release candidate, not an independently OpenID-certified or externally penetration-tested final release; X1–X3 remain external gates. Read the exact [compatibility matrix](docs/keycloak-compatibility.md) before migrating a production realm.
 
 AuthMe uses the current OpenID/FAPI-certified [`oidc-provider`](https://github.com/panva/node-oidc-provider) engine for standards-sensitive protocol and cryptographic behavior. The realm model, PostgreSQL adapter, identity store, interaction UI, MFA, administration API, audit system, hardening, deployment, and Keycloak migration layer are AuthMe.
 
@@ -12,19 +12,23 @@ AuthMe uses the current OpenID/FAPI-certified [`oidc-provider`](https://github.c
 - Authorization Code with mandatory PKCE `S256`; implicit and password grants are excluded.
 - Short-lived access tokens, rotating refresh tokens, and token-family revocation on replay.
 - Client Credentials, Device Authorization, PAR, DPoP, UserInfo, introspection, revocation, RP-initiated logout, and back-channel logout.
+- JAR, JARM, signed UserInfo/introspection, mTLS-bound tokens, CIBA poll mode, and per-client FAPI 2.0 security policy.
 - PostgreSQL-backed provider state with atomic one-use artifact consumption and realm isolation.
 - Argon2id passwords, account lockout, TOTP replay prevention, one-use recovery codes, and user-verified WebAuthn passkeys.
 - Realm-scoped LDAP/Active Directory authentication with LDAPS/StartTLS, bounded searches, configurable mappings, and collision-safe JIT provisioning.
 - Upstream OpenID Connect federation with Authorization Code + PKCE and strict state, nonce, issuer, signature, audience, and callback validation.
 - SAML 2.0 SP federation with signed Response/Assertion validation, exact audience/recipient/request binding, durable replay protection, and generated metadata.
-- PostgreSQL-backed SCIM 2.0 Users/Groups provisioning with discovery, PATCH/PUT/CRUD, core `eq` filters, pagination, ETags, and session invalidation.
-- Realm/client roles, groups, and Keycloak-shaped `realm_access` and `resource_access` claims.
+- PostgreSQL-backed SCIM 2.0 Users/Groups provisioning with discovery, Bulk, sorting, full core filter grammar, PATCH/PUT/CRUD, pagination, ETags, and session invalidation.
+- Mutable realms and clients, nested groups, composite roles, reusable client scopes, claim mappers, and Keycloak-shaped authorization claims.
+- Organizations with verified domains, invitations, memberships, organization-specific IdP policy, and token context.
+- Configurable authentication flows with required/alternative/conditional steps and `acr`/`amr`/`max_age` enforcement.
 - Explicit RFC 8707 API audiences with signed JWT access tokens, audience-filtered claims, and optional opaque-token introspection.
-- Secure administration console at `/admin/`, realm-scoped administrator grants, a separately bearer-protected automation API, structured audit events, health endpoints, and Prometheus metrics.
+- Secure administration console at `/admin/`, self-service account console, realm-scoped administrator grants, a separately bearer-protected automation API, structured audit events, health endpoints, and Prometheus metrics.
+- Encrypted database/JWKS backup and verified restore, HA/load rehearsal commands, signed release artifacts with SBOM, and file/KMS/HSM signing-provider rotation paths.
 - Optional Redis-backed shared rate limiting, non-root container, read-only runtime filesystem, and fail-closed production configuration.
 - Dynamic registration only when explicitly enabled and protected by an independent initial-access token.
 
-The v0.3 boundary still excludes Kerberos/SPNEGO, RADIUS, X.509 login, inbound LDAP synchronization, encrypted/IdP-initiated SAML, SAML IdP operation, SCIM Bulk and the complete filter grammar, UMA, configurable authentication flows, a self-service account console, complete mutable realm/client/group/role policy administration, and Keycloak Admin REST compatibility. Passkeys support fresh AuthMe enrollment and sign-in, but not imported Keycloak WebAuthn credentials or attestation-policy enforcement. See [federation and provisioning](docs/federation-and-provisioning.md) and the [roadmap](docs/roadmap.md).
+The v1.0 boundary still excludes Kerberos/SPNEGO, RADIUS, X.509 end-user login, SAML artifact binding and broker-side assertion decryption, UMA/Authorization Services, Keycloak Admin REST/SPI/theme compatibility, multi-region active/active writes, imported Keycloak WebAuthn credentials, and WebAuthn attestation-policy enforcement. See [federation and provisioning](docs/federation-and-provisioning.md) and the [roadmap](docs/roadmap.md).
 
 ## Run locally
 
@@ -152,6 +156,7 @@ Create the runtime and per-realm JWKS Secrets before installation. The migration
 | `DATABASE_URL` | PostgreSQL connection URL; required in production. |
 | `REDIS_URL` | Optional shared rate-limit backend. |
 | `AUTHME_JWKS_DIR` | Directory containing private `{realm}.json` JWK sets. |
+| `AUTHME_SIGNING_KEY_PROVIDERS_JSON` | Per-realm `file`, `aws-kms`, `gcp-kms`, `azure-key-vault`, or `pkcs11` provider, key reference, rotation period, and overlap policy. External providers require a deployment adapter. |
 | `AUTHME_COOKIE_KEYS` | At least two comma-separated 32-byte-or-longer rotation keys. |
 | `AUTHME_CSRF_SECRET` | Independent 32-byte-or-longer CSRF signing secret. |
 | `AUTHME_PASSWORD_PEPPER` | Independent password/recovery-code pepper. |
@@ -191,9 +196,10 @@ Browser CORS access is denied unless the client has an exact origin in
 `web_origins`; redirect and post-logout URIs are never treated as implicit CORS
 permissions. Production web origins must use HTTPS and contain no path, query,
 fragment, credentials, or wildcard.
-The v0.3 client-authentication profile supports `client_secret_basic` for
-confidential clients and `none` for public clients. Public clients still use
-PKCE `S256`; staged methods such as `private_key_jwt` are not advertised.
+The client-authentication profile supports `client_secret_basic`,
+`client_secret_jwt`, `private_key_jwt`, `tls_client_auth`,
+`self_signed_tls_client_auth`, and `none` according to client and trusted-proxy
+policy. Public clients still use PKCE `S256`.
 
 API access tokens require an explicit resource-server entry and a matching
 `resource` authorization parameter. For example:
@@ -229,7 +235,7 @@ The browser receives an opaque `HttpOnly`, `SameSite=Strict` cookie that is `Sec
 
 The console grant is separate from `AUTHME_ADMIN_TOKEN`. Never copy the root token into browser code, HTML, local storage, or a console configuration. Bootstrap creates the first durable wildcard grant; subsequent grant provisioning remains an operator-controlled lifecycle action. The safe read-only configuration catalog at `/admin/v1/realms/{realm}/configuration` reports clients, resource servers, federation, SCIM identifiers, extensions, storage mode, and TTLs without returning client secrets, bind credentials, SCIM tokens, private keys, or deployment secrets.
 
-The current console manages the implemented user, credential, session-revocation, federated-identity, registration-token, audit, and configuration-catalog surfaces. It is not a complete Keycloak-style policy editor: client configuration is primarily deployment configuration, group/role definition CRUD is not complete, administrator approvals and organization delegation are staged, and there is no self-service account console.
+The console manages users, credentials, sessions, federation, registration tokens, audit, mutable clients, roles, nested groups, client scopes, claim mappers, authentication flows, organizations, and signing-key rotation. The account console provides profile, password, email-verification/recovery, TOTP, passkey, session, and organization-invitation workflows. AuthMe remains an AuthMe-native administration model, not a clone of the Keycloak console or Admin REST API.
 
 ### Root automation API
 
@@ -252,7 +258,7 @@ When dynamic registration is enabled, issue a short-lived initial access token t
 
 ## Migrating from Keycloak
 
-Start with the [compatibility matrix](docs/keycloak-compatibility.md), then follow the staged [migration guide](docs/keycloak-migration.md). Do not point AuthMe at a Keycloak database, assume credential formats are portable, or cut over a realm that depends on a staged feature.
+Start with the [compatibility matrix](docs/keycloak-compatibility.md), then follow the [migration guide](docs/keycloak-migration.md). Do not point AuthMe at a Keycloak database, assume credential formats are portable, or cut over a realm that depends on an unsupported feature or an unproven external release gate.
 
 ## Security and contributing
 

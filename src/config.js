@@ -33,6 +33,7 @@ const rawSchema = z.object({
   AUTHME_FIELD_ENCRYPTION_KEY: z.string().optional(),
   AUTHME_ADMIN_TOKEN: z.string().optional(),
   AUTHME_JWKS_DIR: z.string().optional(),
+  AUTHME_SIGNING_KEY_PROVIDERS_JSON: z.string().optional(),
   AUTHME_CLIENTS_JSON: z.string().optional(),
   AUTHME_RESOURCE_SERVERS_JSON: z.string().optional(),
   AUTHME_LDAP_PROVIDERS_JSON: z.string().optional(),
@@ -202,6 +203,37 @@ function clientsByRealm(value, realms) {
   return deepFreeze(result);
 }
 
+function signingKeyProvidersByRealm(value, realms) {
+  if (!value) return deepFreeze(Object.fromEntries(realms.map((realm) => [realm, {
+    provider: 'file', algorithm: 'RS256', materialReference: `${realm}.json`, rotationDays: 30, overlapSeconds: 2_592_000,
+  }])));
+  let parsed;
+  try { parsed = JSON.parse(value); } catch (error) { throw new Error('AUTHME_SIGNING_KEY_PROVIDERS_JSON must contain valid JSON', { cause: error }); }
+  if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') throw new Error('AUTHME_SIGNING_KEY_PROVIDERS_JSON must be an object keyed by realm');
+  const result = {};
+  for (const realm of realms) {
+    const input = parsed[realm];
+    if (!input || Array.isArray(input) || typeof input !== 'object') throw new Error(`AUTHME_SIGNING_KEY_PROVIDERS_JSON.${realm} is required`);
+    const known = new Set(['provider', 'algorithm', 'material_reference', 'rotation_days', 'overlap_seconds']);
+    for (const field of Object.keys(input)) if (!known.has(field)) throw new Error(`AUTHME_SIGNING_KEY_PROVIDERS_JSON.${realm}.${field} is not supported`);
+    if (!['file', 'aws-kms', 'gcp-kms', 'azure-key-vault', 'pkcs11'].includes(input.provider)) throw new Error(`AUTHME_SIGNING_KEY_PROVIDERS_JSON.${realm}.provider is unsupported`);
+    if (!['RS256', 'PS256', 'ES256'].includes(input.algorithm ?? 'RS256')) throw new Error(`AUTHME_SIGNING_KEY_PROVIDERS_JSON.${realm}.algorithm is unsupported`);
+    if (typeof input.material_reference !== 'string' || input.material_reference.length < 1 || input.material_reference.length > 4096 || /[\r\n]/u.test(input.material_reference)) throw new Error(`AUTHME_SIGNING_KEY_PROVIDERS_JSON.${realm}.material_reference is required`);
+    const rotationDays = input.rotation_days ?? 30;
+    const overlapSeconds = input.overlap_seconds ?? 2_592_000;
+    if (!Number.isInteger(rotationDays) || rotationDays < 1 || rotationDays > 365) throw new Error(`AUTHME_SIGNING_KEY_PROVIDERS_JSON.${realm}.rotation_days must be between 1 and 365`);
+    if (!Number.isInteger(overlapSeconds) || overlapSeconds < 3600 || overlapSeconds > 31_536_000) throw new Error(`AUTHME_SIGNING_KEY_PROVIDERS_JSON.${realm}.overlap_seconds must be between 3600 and 31536000`);
+    result[realm] = {
+      provider: input.provider,
+      algorithm: input.algorithm ?? 'RS256',
+      materialReference: input.material_reference,
+      rotationDays,
+      overlapSeconds,
+    };
+  }
+  return deepFreeze(result);
+}
+
 const oauthScope = /^[\x21\x23-\x5b\x5d-\x7e]+$/;
 
 function stringArray(value, name, { required = false } = {}) {
@@ -321,7 +353,11 @@ export function loadConfig(environment = process.env) {
     throw new Error('AUTHME_COOKIE_KEYS still contains an example placeholder');
   }
   if (!devMode && !raw.DATABASE_URL) throw new Error('DATABASE_URL is required outside development mode');
-  if (!devMode && !raw.AUTHME_JWKS_DIR) throw new Error('AUTHME_JWKS_DIR is required outside development mode');
+  const signingKeyProviders = signingKeyProvidersByRealm(raw.AUTHME_SIGNING_KEY_PROVIDERS_JSON, realms);
+  if (!devMode && !raw.AUTHME_JWKS_DIR
+    && Object.values(signingKeyProviders).some((provider) => provider.provider === 'file')) {
+    throw new Error('AUTHME_JWKS_DIR is required outside development mode for file-backed signing keys');
+  }
 
   const clients = clientsByRealm(raw.AUTHME_CLIENTS_JSON, realms);
   const normalizedPublicUrl = publicUrl.toString().replace(/\/$/, '');
@@ -339,6 +375,7 @@ export function loadConfig(environment = process.env) {
     fieldEncryptionKey: encryptionKey(raw.AUTHME_FIELD_ENCRYPTION_KEY, devMode),
     adminToken: secret(raw.AUTHME_ADMIN_TOKEN, 'AUTHME_ADMIN_TOKEN', devMode),
     jwksDir: raw.AUTHME_JWKS_DIR,
+    signingKeyProvidersByRealm: signingKeyProviders,
     clientsByRealm: clients,
     resourceServersByRealm: resourceServersByRealm(raw.AUTHME_RESOURCE_SERVERS_JSON, realms, devMode),
     ldapProvidersByRealm: parseLdapProviders(raw.AUTHME_LDAP_PROVIDERS_JSON, { realms, devMode }),

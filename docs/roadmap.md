@@ -4,6 +4,8 @@
 
 This roadmap separates shipped behavior from intent. It contains no delivery-date promise.
 
+The v0.1–v0.4 sections are historical release snapshots; a capability described there as staged may be implemented by the later v1.0 section. `MILESTONES.md` is the concise completion ledger.
+
 - **Implemented**: present in the release, documented, and tested.
 - **Release-gated**: code may exist, but the required security/conformance/operations evidence is incomplete.
 - **Staged**: designed or planned, not a supported product capability.
@@ -12,7 +14,7 @@ The upstream [`oidc-provider`](https://github.com/panva/node-oidc-provider#imple
 
 ## v0.1: standards-based OIDC foundation
 
-### Implemented product contract
+### Implemented release-candidate contract
 
 - Node.js 22 standalone service.
 - `oidc-provider` 9.9.1 protocol engine.
@@ -183,14 +185,20 @@ v1.0 means an organization can replace Keycloak for a documented set of OIDC, SA
   The tool fails closed on malformed input, omits source credentials/keys, and
   remains a reviewed planning artifact rather than an automatic database
   cutover.
+- SCIM 2.0 Bulk, sorting, and the supported full core filter grammar.
+- LDAP/AD import, synchronization, and deterministic reconciliation.
+- Downstream SAML 2.0 IdP metadata, signed/encrypted assertions, IdP initiation, and redirect SLO.
+- End-user account console for profile, password, email recovery/verification, TOTP, recovery codes, passkeys, sessions, and organization invitations.
+- AuthMe-native mutable realm/client/role/group administration API and console.
+- Nested groups, composite roles, reusable client scopes, and configurable claim mappers.
+- Organizations with domain, invitation, membership, organization IdP, and token context policy.
+- Configurable authentication flows with client/ACR selection, required/alternative/conditional steps, AMR verification, and maximum-age step-up.
+- AES-256-GCM encrypted database/JWKS backup, manifest-verified destructive restore, single-region HA and load rehearsal commands.
+- File and external KMS/HSM signing-provider lifecycle, public-only inventory, scheduled/forced rotation, and public-key overlap.
+- Reproducible npm archives, CycloneDX SBOM, SHA-256 manifests, mandatory release signing, and tag release workflow.
+- H1–H4 security follow-ups: redirect-location redaction, audience non-widening regression coverage, unbounded CIBA slow-down, and retained `expired_token` semantics.
 
-### Target scope
-
-- Stable, versioned administration and account APIs/UIs.
-- Migration support for users, clients, groups, roles, selected credential formats, IdPs, and claim mappers.
-- OIDC, SAML, LDAP/AD, SCIM, organizations, strong authentication, brokering, delegated administration, auditing, and lifecycle workflows.
-- Production KMS/HSM, HA, backup/restore, rolling upgrades, and disaster-recovery runbooks.
-- Extension points with isolation, versioning, and security review boundaries.
+The code is complete for K1–K11. Final `1.0.0` release declaration remains blocked by external OpenID certification, independent penetration/architecture review, and hardware/DR/regional drills.
 
 ### Explicitly optional or later parity
 

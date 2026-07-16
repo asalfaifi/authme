@@ -5,7 +5,7 @@ import { exportJWK, generateKeyPair, importJWK } from 'jose';
 
 const allowedAlgorithms = new Set(['RS256', 'PS256', 'ES256', 'EdDSA']);
 
-async function validateJwks(jwks, source) {
+export async function validateJwks(jwks, source) {
   if (!jwks || !Array.isArray(jwks.keys) || !jwks.keys.length) throw new Error(`${source} must contain a non-empty JWK Set`);
   const kids = new Set();
   for (const key of jwks.keys) {
