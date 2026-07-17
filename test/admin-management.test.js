@@ -37,6 +37,13 @@ test('managed clients are validated, live immediately, listed without secrets, a
   await api('put', '/admin/v1/realms/master/clients/managed-native/roles/read', {
     description: 'Read', composites: [], attributes: {},
   }).expect(201);
+  await api('post', '/admin/v1/realms/master/authentication-flows', {
+    alias: 'managed-native-only', enabled: true, priority: 5, clientIds: ['managed-native'],
+    acr: 'urn:authme:managed-native', maxAgeSeconds: 300,
+    steps: [{ type: 'password', requirement: 'required' }],
+  }).expect(201);
+  assert((await request(runtime.app).get('/realms/master/.well-known/openid-configuration')
+    .set('host', host).expect(200)).body.acr_values_supported.includes('urn:authme:managed-native'));
   const assigned = await api('post', '/admin/v1/realms/master/users', {
     username: 'managed-client-role', email: 'managed-client-role@example.test', password: 'Correct-Horse-Battery-Staple-2026!',
     roles: [], groups: [], clientRoles: { 'managed-native': ['read'] },
@@ -49,10 +56,63 @@ test('managed clients are validated, live immediately, listed without secrets, a
   assert.deepEqual(await runtime.data.management.listClientScopeAssignments('master', 'managed-native'), []);
   assert.deepEqual(await runtime.data.management.listClaimMappers('master', 'client', 'managed-native'), []);
   assert.deepEqual(await runtime.data.management.listClientRoles('master', 'managed-native'), []);
+  assert.equal((await runtime.data.management.listAuthenticationFlows('master'))
+    .some(({ acr }) => acr === 'urn:authme:managed-native'), false);
+  assert.equal((await request(runtime.app).get('/realms/master/.well-known/openid-configuration')
+    .set('host', host).expect(200)).body.acr_values_supported.includes('urn:authme:managed-native'), false);
   const reconciled = await runtime.store.findUserById('master', assigned.body.id);
   assert.deepEqual(reconciled.clientRoles, {});
   assert(reconciled.securityVersion > assignedVersion);
   await api('post', '/admin/v1/realms/master/clients', { ...metadata, client_id: 'authme-admin-console' }).expect(409);
+});
+
+test('policy writes fail closed when their managed client disappears mid-request', async () => {
+  const nativeClient = (clientId, port) => ({
+    client_id: clientId,
+    application_type: 'native',
+    token_endpoint_auth_method: 'none',
+    redirect_uris: [`http://127.0.0.1:${port}/callback`],
+    response_types: ['code'],
+    grant_types: ['authorization_code'],
+  });
+  const scopeClientId = 'scope-lifecycle-client';
+  const mapperClientId = 'mapper-lifecycle-client';
+  await api('post', '/admin/v1/realms/master/clients', nativeClient(scopeClientId, 49011)).expect(201);
+  const scope = await runtime.data.management.createClientScope('master', {
+    name: 'lifecycle-scope', description: '', protocol: 'openid-connect', attributes: {},
+  });
+  const setAssignment = runtime.data.management.setClientScopeAssignment
+    .bind(runtime.data.management);
+  runtime.data.management.setClientScopeAssignment = async (...arguments_) => {
+    const result = await setAssignment(...arguments_);
+    await runtime.data.deleteManagedClient('master', scopeClientId);
+    return result;
+  };
+  try {
+    await api('put', `/admin/v1/realms/master/clients/${scopeClientId}/client-scopes/${scope.id}`, {
+      assignmentType: 'default',
+    }).expect(409);
+  } finally {
+    runtime.data.management.setClientScopeAssignment = setAssignment;
+  }
+  assert.deepEqual(await runtime.data.management.listClientScopeAssignments('master', scopeClientId), []);
+
+  await api('post', '/admin/v1/realms/master/clients', nativeClient(mapperClientId, 49012)).expect(201);
+  const createMapper = runtime.data.management.createClaimMapper.bind(runtime.data.management);
+  runtime.data.management.createClaimMapper = async (...arguments_) => {
+    const mapper = await createMapper(...arguments_);
+    await runtime.data.deleteManagedClient('master', mapperClientId);
+    return mapper;
+  };
+  try {
+    await api('post', '/admin/v1/realms/master/claim-mappers', {
+      ownerType: 'client', ownerId: mapperClientId, name: 'lifecycle-mapper',
+      mapperType: 'hardcoded', config: { claim: 'lifecycle', value: true },
+    }).expect(409);
+  } finally {
+    runtime.data.management.createClaimMapper = createMapper;
+  }
+  assert.deepEqual(await runtime.data.management.listClaimMappers('master', 'client', mapperClientId), []);
 });
 
 test('realm, role, nested group, scope, mapper, flow, and organization APIs are mutable and realm-scoped', async () => {
@@ -85,12 +145,18 @@ test('realm, role, nested group, scope, mapper, flow, and organization APIs are 
   await api('post', '/admin/v1/realms/master/claim-mappers', { ownerType: 'client-scope', ownerId: '00000000-0000-4000-8000-000000000000', name: 'orphan', mapperType: 'hardcoded', config: { claim: 'orphan', value: true } }).expect(404);
   await api('put', `/admin/v1/realms/master/clients/missing-client/client-scopes/${scope.body.id}`, { assignmentType: 'optional' }).expect(404);
   await api('post', '/admin/v1/realms/master/authentication-flows', { alias: 'strong', enabled: true, priority: 10, clientIds: [], acr: 'urn:authme:strong', maxAgeSeconds: 300, steps: [{ type: 'password', requirement: 'required' }] }).expect(201);
+  assert.equal(await runtime.data.management.resolveAuthenticationFlow('master', {
+    clientId: 'authme-admin-console', requestedAcrs: ['urn:authme:loa:2'],
+  }), undefined);
   await api('post', '/admin/v1/realms/master/authentication-flows', { alias: 'impossible', enabled: true, priority: 11, clientIds: [], acr: 'urn:authme:impossible', maxAgeSeconds: 300, steps: [{ type: 'passkey', requirement: 'required' }, { type: 'totp', requirement: 'required' }] }).expect(400);
   const discovery = await request(runtime.app).get('/realms/master/.well-known/openid-configuration').set('host', host).expect(200);
   assert(discovery.body.scopes_supported.includes('profile-extra'));
   assert(discovery.body.acr_values_supported.includes('urn:authme:strong'));
   const organization = await api('post', '/admin/v1/realms/master/organizations', { name: 'Example', alias: 'example', enabled: true, domains: [{ domain: 'example.test', verified: false }], identityProviderIds: [], attributes: {} }).expect(201);
   assert.equal(organization.body.alias, 'example');
+  await api('post', '/admin/v1/realms/master/organizations', {
+    name: 'Ambiguous alias', alias: organization.body.id, enabled: true, domains: [], identityProviderIds: [], attributes: {},
+  }).expect(400);
   await api('get', '/admin/v1/realms/master/organizations/00000000-0000-4000-8000-000000000000/members').expect(404);
   await api('put', `/admin/v1/realms/master/organizations/${organization.body.id}/members/${managedUser.body.id}`, { roles: ['owner'] }).expect(200);
   const invitation = await api('post', `/admin/v1/realms/master/organizations/${organization.body.id}/invitations`, {

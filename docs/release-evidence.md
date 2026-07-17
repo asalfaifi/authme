@@ -11,7 +11,7 @@ This document maps every autonomous milestone to executable evidence. A green un
 | K5 | Downstream SAML IdP metadata, signed Response/Assertion, encryption, IdP initiation, redirect SLO | `test/saml-idp.test.js` |
 | K6 | LDAP/AD authentication, bounded import/sync/reconciliation, immutable external identity, outage thresholds | `test/ldap.test.js`; `test/ldap-sync.test.js`; PostgreSQL LDAP tests |
 | K7 | SCIM Bulk, stable sorting, full supported core filter grammar, ETags and realm isolation | `test/scim-bulk.test.js`; `test/scim-filter-grammar.test.js`; `test/scim-sorting.test.js`; `test/scim-protocol.test.js`; `test/postgres-scim.test.js` |
-| K8 | Executable required/alternative/conditional flow policy; client/ACR/AMR/max-age selection; existing-session revalidation | `test/organization-flow.test.js`; `test/management-store.test.js`; admin negative tests |
+| K8 | Executable required/alternative/conditional flow policy; exact client/ACR/AMR/max-age selection; browser, federation, CIBA, and existing-session enforcement | `test/organization-flow.test.js`; `test/ciba.test.js`; `test/management-store.test.js`; admin negative tests |
 | K9 | Realm/client composite role graphs, Keycloak-shaped token claims, nested path lifecycle, existing-reference validation, reusable scopes, mapper ownership | `test/organization-flow.test.js`; `test/admin-management.test.js`; `test/management-store.test.js`; `test/postgres-management.test.js` |
 | K10 | Authenticated encrypted backup/restore, manifest/checksum verification, continuous zero-error rollout probe, representative protocol load driver | `test/backup.test.js`; `test/availability-rehearsal.test.js`; `test/load-rehearsal.test.js`; `scripts/ha-rehearsal.mjs` |
 | K11 | Public-only KMS/HSM inventory, `oidc-provider` external signing, deployable adapter modules, fail-closed overlap rotation | `test/signing-key-manager.test.js`; `docs/production.md` signing contract |
@@ -50,13 +50,14 @@ Until all three records are attached, the accurate product label is **v1.0 relea
 ## Latest autonomous verification
 
 The repository was re-audited on 2026-07-17 after the client-role, migration,
-flow/federation, account-delivery, and backup-manifest corrections:
+flow/federation/CIBA, account-delivery, policy-lifecycle, and backup-manifest
+corrections:
 
 - clean Node.js 22 container: source check passed for 150 JavaScript files;
-  ordinary suite 329 tests, 308 passed, 21 PostgreSQL-only skips, 0 failures;
+  ordinary suite 332 tests, 311 passed, 21 PostgreSQL-only skips, 0 failures;
 - clean Node.js 22 container against migrated PostgreSQL 17: 43/43 release
-  tests passed with 0 skips, including concurrent composite-role writes and
-  migration `010_client_roles.sql`;
+  tests passed with 0 skips, including concurrent role/group graphs, managed
+  client policy cleanup, and migration `010_client_roles.sql`;
 - PostgreSQL protocol smoke passed, including OIDC/RFC 8414, PKCE, token
   audience/claims, refresh replay, device flow, MFA/recovery, SCIM, and audit;
 - real `pg_dump` v2 backup and destructive restore into an isolated database
@@ -67,7 +68,7 @@ flow/federation, account-delivery, and backup-manifest corrections:
 - signed archive, CycloneDX SBOM, and checksum signatures verified; a second
   artifact run was byte-for-byte identical;
 - realm HA baseline probe and a 40-request/8-worker discovery rehearsal passed
-  with zero failures and 81.38 ms p95 on the local audit target.
+  with zero failures and 167.41 ms p95 on the rebuilt local audit image.
 
 These are reproducible autonomous checks, not substitutes for X1 certification,
 X2 independent review, or X3 target-infrastructure/hardware drill records.

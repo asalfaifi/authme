@@ -57,6 +57,9 @@ const paginationSchema = z.object({
 const RECENT_ADMIN_AUTHENTICATION_MS = 15 * 60 * 1000;
 const managementId = z.uuid();
 const policyName = z.string().trim().min(1).max(128).regex(/^[a-zA-Z0-9:._/-]+$/);
+const organizationAlias = policyName.refine((value) => !z.uuid().safeParse(value).success, {
+  message: 'organization aliases cannot be UUIDs because organization context also accepts IDs',
+});
 const attributes = z.record(z.string().min(1).max(128), z.union([
   z.string().max(4096), z.number().finite(), z.boolean(), z.array(z.string().max(4096)).max(100),
 ])).default({});
@@ -118,7 +121,7 @@ const domainSchema = z.object({
 }).strict();
 const organizationCreateSchema = z.object({
   name: z.string().trim().min(1).max(255),
-  alias: policyName,
+  alias: organizationAlias,
   enabled: z.boolean().optional().default(true),
   domains: z.array(domainSchema).max(100).optional().default([]),
   identityProviderIds: z.array(federatedProviderId).max(100).optional().default([]),
@@ -303,6 +306,19 @@ export function createAdminRouter({
     await providers.get(realm)?.authmeManagementMetadata?.synchronize();
   }
 
+  function authenticationFlowDefinition(flow) {
+    return {
+      alias: flow.alias,
+      description: flow.description,
+      enabled: flow.enabled,
+      priority: flow.priority,
+      clientIds: flow.clientIds,
+      acr: flow.acr,
+      maxAgeSeconds: flow.maxAgeSeconds,
+      steps: flow.steps,
+    };
+  }
+
   async function validateUserRelationships(realm, input) {
     if (input.roles) {
       const roles = new Set((await management.listRoles(realm)).map((item) => item.name));
@@ -323,6 +339,11 @@ export function createAdminRouter({
       }
     }
     return undefined;
+  }
+
+  async function claimMapperOwnerExists(realm, ownerType, ownerId) {
+    if (ownerType === 'client') return clientExists(realm, ownerId);
+    return (await management.listClientScopes(realm)).some((scope) => scope.id === ownerId);
   }
 
   async function mutateRealmUsers(realm, mutation) {
@@ -658,6 +679,7 @@ export function createAdminRouter({
         delete clientRoles[req.params.clientId];
         return { clientRoles };
       });
+      await synchronizeProviderMetadata(req.params.realm);
       await audit(store, req, 'admin.client.deleted', undefined, { clientId: req.params.clientId });
       return res.status(204).end();
     } catch (error) { return next(error); }
@@ -760,7 +782,21 @@ export function createAdminRouter({
     try { return res.json({ assignments: await management.listClientScopeAssignments(req.params.realm, req.params.clientId) }); } catch (error) { return next(error); }
   });
   router.put('/v1/realms/:realm/clients/:clientId/client-scopes/:scopeId', async (req, res, next) => {
-    try { const input = parse(z.object({ assignmentType: z.enum(['default', 'optional']) }).strict(), req, res); if (!input) return undefined; if (!await clientExists(req.params.realm, req.params.clientId)) return problem(res, 404, 'Client not found', 'The requested client does not exist.'); if (!await management.setClientScopeAssignment(req.params.realm, req.params.clientId, req.params.scopeId, input.assignmentType)) return problem(res, 404, 'Client scope not found', 'The requested client scope does not exist.'); await audit(store, req, 'admin.client_scope.assigned', undefined, { clientId: req.params.clientId, scopeId: req.params.scopeId, assignmentType: input.assignmentType }); return res.status(204).end(); } catch (error) { return managementFailure(error, res, next); }
+    try {
+      const input = parse(z.object({ assignmentType: z.enum(['default', 'optional']) }).strict(), req, res);
+      if (!input) return undefined;
+      if (!await clientExists(req.params.realm, req.params.clientId)) return problem(res, 404, 'Client not found', 'The requested client does not exist.');
+      if (!await management.setClientScopeAssignment(req.params.realm, req.params.clientId, req.params.scopeId, input.assignmentType)) return problem(res, 404, 'Client scope not found', 'The requested client scope does not exist.');
+      const clientStillExists = await clientExists(req.params.realm, req.params.clientId);
+      const scopeStillExists = (await management.listClientScopes(req.params.realm))
+        .some((scope) => scope.id === req.params.scopeId);
+      if (!clientStillExists || !scopeStillExists) {
+        await management.deleteClientScopeAssignment(req.params.realm, req.params.clientId, req.params.scopeId);
+        return problem(res, 409, 'Policy lifecycle changed', 'The client or client scope was removed while the assignment was being updated.');
+      }
+      await audit(store, req, 'admin.client_scope.assigned', undefined, { clientId: req.params.clientId, scopeId: req.params.scopeId, assignmentType: input.assignmentType });
+      return res.status(204).end();
+    } catch (error) { return managementFailure(error, res, next); }
   });
   router.delete('/v1/realms/:realm/clients/:clientId/client-scopes/:scopeId', async (req, res, next) => {
     try { if (!await management.deleteClientScopeAssignment(req.params.realm, req.params.clientId, req.params.scopeId)) return problem(res, 404, 'Client-scope assignment not found', 'The requested assignment does not exist.'); await audit(store, req, 'admin.client_scope.unassigned', undefined, { clientId: req.params.clientId, scopeId: req.params.scopeId }); return res.status(204).end(); } catch (error) { return next(error); }
@@ -769,7 +805,17 @@ export function createAdminRouter({
     try { const ownerType = req.query.ownerType; const ownerId = req.query.ownerId; if ((ownerType || ownerId) && (!['client', 'client-scope'].includes(ownerType) || typeof ownerId !== 'string')) return problem(res, 400, 'Invalid mapper filter', 'ownerType and ownerId must be provided together.'); return res.json({ claimMappers: await management.listClaimMappers(req.params.realm, ownerType, ownerId) }); } catch (error) { return next(error); }
   });
   router.post('/v1/realms/:realm/claim-mappers', async (req, res, next) => {
-    try { const input = parse(claimMapperCreateSchema, req, res); if (!input) return undefined; const ownerExists = input.ownerType === 'client' ? await clientExists(req.params.realm, input.ownerId) : (await management.listClientScopes(req.params.realm)).some((scope) => scope.id === input.ownerId); if (!ownerExists) return problem(res, 404, 'Mapper owner not found', 'The requested client or client scope does not exist.'); const mapper = await management.createClaimMapper(req.params.realm, input); await audit(store, req, 'admin.claim_mapper.created', undefined, { mapperId: mapper.id, ownerType: mapper.ownerType, ownerId: mapper.ownerId }); return res.status(201).json(mapper); } catch (error) { return managementFailure(error, res, next); }
+    try {
+      const input = parse(claimMapperCreateSchema, req, res); if (!input) return undefined;
+      if (!await claimMapperOwnerExists(req.params.realm, input.ownerType, input.ownerId)) return problem(res, 404, 'Mapper owner not found', 'The requested client or client scope does not exist.');
+      const mapper = await management.createClaimMapper(req.params.realm, input);
+      if (!await claimMapperOwnerExists(req.params.realm, input.ownerType, input.ownerId)) {
+        await management.deleteClaimMapper(req.params.realm, mapper.id);
+        return problem(res, 409, 'Mapper owner lifecycle changed', 'The client or client scope was removed while the mapper was being created.');
+      }
+      await audit(store, req, 'admin.claim_mapper.created', undefined, { mapperId: mapper.id, ownerType: mapper.ownerType, ownerId: mapper.ownerId });
+      return res.status(201).json(mapper);
+    } catch (error) { return managementFailure(error, res, next); }
   });
   router.patch('/v1/realms/:realm/claim-mappers/:mapperId', async (req, res, next) => {
     try { const input = parse(claimMapperUpdateSchema, req, res); if (!input) return undefined; const mapper = await management.updateClaimMapper(req.params.realm, req.params.mapperId, input); if (!mapper) return problem(res, 404, 'Claim mapper not found', 'The requested claim mapper does not exist.'); await audit(store, req, 'admin.claim_mapper.updated', undefined, { mapperId: mapper.id }); return res.json(mapper); } catch (error) { return managementFailure(error, res, next); }
@@ -782,10 +828,40 @@ export function createAdminRouter({
     try { return res.json({ authenticationFlows: await management.listAuthenticationFlows(req.params.realm) }); } catch (error) { return next(error); }
   });
   router.post('/v1/realms/:realm/authentication-flows', async (req, res, next) => {
-    try { const input = parse(authenticationFlowCreateSchema, req, res); if (!input) return undefined; for (const clientId of input.clientIds) if (!await clientExists(req.params.realm, clientId)) return problem(res, 404, 'Flow client not found', `Client ${clientId} does not exist.`); const flow = await management.createAuthenticationFlow(req.params.realm, input); await synchronizeProviderMetadata(req.params.realm); await audit(store, req, 'admin.authentication_flow.created', undefined, { flowId: flow.id, alias: flow.alias }); return res.status(201).json(flow); } catch (error) { return managementFailure(error, res, next); }
+    try {
+      const input = parse(authenticationFlowCreateSchema, req, res); if (!input) return undefined;
+      for (const clientId of input.clientIds) if (!await clientExists(req.params.realm, clientId)) return problem(res, 404, 'Flow client not found', `Client ${clientId} does not exist.`);
+      const flow = await management.createAuthenticationFlow(req.params.realm, input);
+      for (const clientId of flow.clientIds) {
+        if (await clientExists(req.params.realm, clientId)) continue;
+        await management.deleteAuthenticationFlow(req.params.realm, flow.id);
+        await synchronizeProviderMetadata(req.params.realm);
+        return problem(res, 409, 'Client lifecycle changed', `Client ${clientId} was removed while the authentication flow was being created.`);
+      }
+      await synchronizeProviderMetadata(req.params.realm);
+      await audit(store, req, 'admin.authentication_flow.created', undefined, { flowId: flow.id, alias: flow.alias });
+      return res.status(201).json(flow);
+    } catch (error) { return managementFailure(error, res, next); }
   });
   router.patch('/v1/realms/:realm/authentication-flows/:flowId', async (req, res, next) => {
-    try { const input = parse(authenticationFlowUpdateSchema, req, res); if (!input) return undefined; for (const clientId of input.clientIds ?? []) if (!await clientExists(req.params.realm, clientId)) return problem(res, 404, 'Flow client not found', `Client ${clientId} does not exist.`); const flow = await management.updateAuthenticationFlow(req.params.realm, req.params.flowId, input); if (!flow) return problem(res, 404, 'Authentication flow not found', 'The requested authentication flow does not exist.'); await synchronizeProviderMetadata(req.params.realm); await audit(store, req, 'admin.authentication_flow.updated', undefined, { flowId: flow.id }); return res.json(flow); } catch (error) { return managementFailure(error, res, next); }
+    try {
+      const input = parse(authenticationFlowUpdateSchema, req, res); if (!input) return undefined;
+      for (const clientId of input.clientIds ?? []) if (!await clientExists(req.params.realm, clientId)) return problem(res, 404, 'Flow client not found', `Client ${clientId} does not exist.`);
+      const previous = (await management.listAuthenticationFlows(req.params.realm))
+        .find(({ id }) => id === req.params.flowId);
+      if (!previous) return problem(res, 404, 'Authentication flow not found', 'The requested authentication flow does not exist.');
+      const flow = await management.updateAuthenticationFlow(req.params.realm, req.params.flowId, input);
+      if (!flow) return problem(res, 409, 'Authentication flow lifecycle changed', 'The authentication flow was removed while it was being updated.');
+      for (const clientId of flow.clientIds) {
+        if (await clientExists(req.params.realm, clientId)) continue;
+        await management.updateAuthenticationFlow(req.params.realm, flow.id, authenticationFlowDefinition(previous));
+        await synchronizeProviderMetadata(req.params.realm);
+        return problem(res, 409, 'Client lifecycle changed', `Client ${clientId} was removed while the authentication flow was being updated.`);
+      }
+      await synchronizeProviderMetadata(req.params.realm);
+      await audit(store, req, 'admin.authentication_flow.updated', undefined, { flowId: flow.id });
+      return res.json(flow);
+    } catch (error) { return managementFailure(error, res, next); }
   });
   router.delete('/v1/realms/:realm/authentication-flows/:flowId', async (req, res, next) => {
     try { if (!await management.deleteAuthenticationFlow(req.params.realm, req.params.flowId)) return problem(res, 404, 'Authentication flow not found', 'The requested authentication flow does not exist.'); await synchronizeProviderMetadata(req.params.realm); await audit(store, req, 'admin.authentication_flow.deleted', undefined, { flowId: req.params.flowId }); return res.status(204).end(); } catch (error) { return next(error); }

@@ -74,15 +74,15 @@ The configuration catalog returns the realm issuer, deployment/storage mode, Red
 | `/realms/{realm}/client-scopes[/{scopeId}]` | `GET`, collection `POST`, item `PATCH`/`DELETE` | Reusable OIDC client scopes. |
 | `/realms/{realm}/clients/{clientId}/client-scopes[/{scopeId}]` | `GET`, item `PUT`/`DELETE` | Assign an existing scope to an existing client as `default` or `optional`. |
 | `/realms/{realm}/claim-mappers[/{mapperId}]` | `GET`, collection `POST`, item `PATCH`/`DELETE` | Existing-client- or existing-client-scope-owned hardcoded/user-attribute/role/group/organization mappers. |
-| `/realms/{realm}/authentication-flows[/{flowId}]` | `GET`, collection `POST`, item `PATCH`/`DELETE` | Required password/passkey/federation primary method; optional password+TOTP required/conditional composition; or alternative primary methods. Client, `acr`, AMR, and maximum-age policy are enforced on new and existing sessions. Unexecutable mixed definitions are rejected. |
+| `/realms/{realm}/authentication-flows[/{flowId}]` | `GET`, collection `POST`, item `PATCH`/`DELETE` | Required password/passkey/federation primary method; optional password+TOTP required/conditional composition; or alternative primary methods. Requested ACR preference order selects an exact matching custom flow; otherwise the priority default applies only when no ACR was requested, preserving built-in LoA values. Client, AMR, and maximum-age policy are enforced on new and existing sessions. Unexecutable mixed definitions are rejected. |
 
-All paths in this table are below `/admin/v1`. Mutations are realm-scoped and audited. User realm-role, client-role, and group assignments, mapper owners, scope assignments, and flow client references must resolve within the same realm. A newly stored client is visible to the protocol provider without a restart; deleting it invalidates further client use immediately and removes its role assignments. Client-scope and authentication-flow mutations update discovery metadata immediately.
+All paths in this table are below `/admin/v1`. Mutations are realm-scoped and audited. User realm-role, client-role, and group assignments, mapper owners, scope assignments, and flow client references must resolve within the same realm. A newly stored client is visible to the protocol provider without a restart; deleting it invalidates further client use immediately and atomically removes its scopes, mappers, roles, client-only flow bindings, user role assignments, and affected account grants in PostgreSQL. Concurrent role, scope-assignment, mapper, and flow writes are serialized with their owner lifecycle and fail closed if the owner disappears. Multi-client flow bindings drop the deleted client without becoming global. Client-scope and authentication-flow mutations update discovery metadata immediately.
 
 ## Organization and signing-key operations
 
 | Method | Path | Result |
 |---|---|---|
-| `GET`/`POST` | `/admin/v1/realms/{realm}/organizations` | List or create organizations with aliases, domains, IdP allowlists, and attributes |
+| `GET`/`POST` | `/admin/v1/realms/{realm}/organizations` | List or create organizations with non-UUID aliases, domains, IdP allowlists, and attributes |
 | `GET`/`PATCH`/`DELETE` | `/admin/v1/realms/{realm}/organizations/{organizationId}` | Read, update, or remove one organization |
 | `GET` | `/admin/v1/realms/{realm}/organizations/{organizationId}/members` | List memberships |
 | `PUT`/`DELETE` | `/admin/v1/realms/{realm}/organizations/{organizationId}/members/{userId}` | Set membership roles or remove membership |

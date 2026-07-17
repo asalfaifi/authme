@@ -141,6 +141,8 @@ test('CIBA returns an auth_req_id, remains pending, and issues tokens only after
     bindingMessage: undefined,
     expiresAt: triggeredRequest.expiresAt,
     scopes: ['openid', 'profile', 'email'],
+    requestedAcrs: [],
+    authenticationFlow: null,
   });
 
   const pending = await poll('master', initiated.body.auth_req_id, 400);
@@ -261,4 +263,65 @@ test('signed CIBA Request Object jti values are one-use', async () => {
   await authenticatedPost('master', 'ext/ciba/auth', { request: requestObject }, 200);
   const replay = await authenticatedPost('master', 'ext/ciba/auth', { request: requestObject }, 400);
   assert.equal(replay.body.error, 'invalid_request');
+});
+
+test('CIBA device completion enforces requested client authentication flows', async () => {
+  const provider = runtime.providers.get('master');
+  const user = await runtime.store.findUserByLogin('master', 'admin');
+  const flow = await runtime.data.management.createAuthenticationFlow('master', {
+    alias: 'ciba-password',
+    description: 'CIBA password authentication',
+    enabled: true,
+    priority: 1,
+    clientIds: [clientId],
+    acr: 'urn:authme:ciba:password',
+    maxAgeSeconds: 1,
+    steps: [{ type: 'password', requirement: 'required' }],
+  });
+
+  try {
+    const initiated = await authenticatedPost('master', 'ext/ciba/auth', {
+      scope: 'openid profile',
+      login_hint: 'admin',
+      acr_values: 'urn:authme:ciba:password',
+    }, 200);
+    assert.deepEqual(triggeredRequest.requestedAcrs, ['urn:authme:ciba:password']);
+    assert.deepEqual(triggeredRequest.authenticationFlow, {
+      alias: 'ciba-password',
+      acr: 'urn:authme:ciba:password',
+      maxAgeSeconds: 1,
+      steps: [{ type: 'password', requirement: 'required' }],
+    });
+
+    const evidence = {
+      authReqId: initiated.body.auth_req_id,
+      accountId: user.id,
+      approved: true,
+      authTime: Math.floor(Date.now() / 1000),
+    };
+    await assert.rejects(
+      provider.authmeCiba.complete({ ...evidence, acr: 'urn:authme:loa:1', amr: ['pwd'] }),
+      (error) => error.error === 'access_denied'
+        && /does not satisfy the requested authentication flow/u.test(error.error_description),
+    );
+    await assert.rejects(
+      provider.authmeCiba.complete({ ...evidence, acr: flow.acr, amr: ['dev-ciba'] }),
+      (error) => error.error === 'access_denied'
+        && /does not satisfy the requested authentication flow/u.test(error.error_description),
+    );
+    await assert.rejects(
+      provider.authmeCiba.complete({ ...evidence, authTime: evidence.authTime - 2, acr: flow.acr, amr: ['pwd'] }),
+      (error) => error.error === 'access_denied'
+        && /does not satisfy the requested authentication flow/u.test(error.error_description),
+    );
+    assert.equal((await provider.BackchannelAuthenticationRequest.find(initiated.body.auth_req_id)).grantId, undefined);
+
+    await provider.authmeCiba.complete({ ...evidence, acr: flow.acr, amr: ['pwd'] });
+    await delay(1_050);
+    const tokens = await poll('master', initiated.body.auth_req_id, 200);
+    assert.equal(typeof tokens.body.access_token, 'string');
+  } finally {
+    await runtime.data.management.deleteAuthenticationFlow('master', flow.id);
+    await provider.authmeManagementMetadata.synchronize();
+  }
 });

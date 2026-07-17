@@ -531,6 +531,28 @@ export async function createRealmProvider({ realm, config, store, data, manageme
     validateClientSecurity(client, { development: config.devMode, mtlsEnabled: config.mtls.enabled });
   }
 
+  function cibaRequestedAcrs(request) {
+    return String(request.params?.acr_values ?? '').split(' ').filter(Boolean);
+  }
+
+  async function cibaAuthenticationFlow(request) {
+    if (!management) return undefined;
+    return management.resolveAuthenticationFlow(realm, {
+      clientId: request.clientId,
+      requestedAcrs: cibaRequestedAcrs(request),
+    });
+  }
+
+  function publicCibaAuthenticationFlow(flow) {
+    if (!flow) return null;
+    return Object.freeze({
+      alias: flow.alias,
+      acr: flow.acr,
+      maxAgeSeconds: flow.maxAgeSeconds,
+      steps: Object.freeze(flow.steps.map((step) => Object.freeze({ ...step }))),
+    });
+  }
+
   async function managedIdentityClaims(user, clientId, organizationContext, grantedScopes = []) {
     if (!management) return accountClaims(user);
     const scopeNames = grantedScopes instanceof Set
@@ -727,6 +749,8 @@ export async function createRealmProvider({ realm, config, store, data, manageme
         async triggerAuthenticationDevice(ctx, request, account, client) {
           ctx.body.interval = cibaPollInterval;
           if (cibaAuthenticationDeviceHandler) {
+            const requestedAcrs = cibaRequestedAcrs(request);
+            const authenticationFlow = await cibaAuthenticationFlow(request);
             await cibaAuthenticationDeviceHandler(Object.freeze({
               realm,
               authReqId: request.jti,
@@ -735,6 +759,8 @@ export async function createRealmProvider({ realm, config, store, data, manageme
               bindingMessage: request.params.binding_message,
               expiresAt: request.exp ?? Math.floor(Date.now() / 1000) + request.remainingTTL,
               scopes: Object.freeze(request.scope.split(' ')),
+              requestedAcrs: Object.freeze(requestedAcrs),
+              authenticationFlow: publicCibaAuthenticationFlow(authenticationFlow),
             }));
           }
         },
@@ -1048,6 +1074,17 @@ export async function createRealmProvider({ realm, config, store, data, manageme
     const user = await store.findUserById(realm, accountId);
     const locked = user?.lockedUntil && new Date(user.lockedUntil).getTime() > Date.now();
     if (!user?.enabled || locked) throw new errors.AccessDenied('The account cannot authorize this request');
+    const requestedAcrs = cibaRequestedAcrs(request);
+    const authenticationFlow = await cibaAuthenticationFlow(request);
+    const staleAuthentication = authenticationFlow?.maxAgeSeconds !== null
+      && authenticationFlow?.maxAgeSeconds !== undefined
+      && Math.floor(Date.now() / 1000) - authTime > authenticationFlow.maxAgeSeconds;
+    if ((requestedAcrs.length > 0 && !requestedAcrs.includes(acr))
+      || (authenticationFlow && (acr !== authenticationFlow.acr
+        || !authenticationSatisfiesFlow(authenticationFlow, amr, user)
+        || staleAuthentication))) {
+      throw new errors.AccessDenied('CIBA authentication evidence does not satisfy the requested authentication flow');
+    }
 
     const grant = new provider.Grant({ accountId, clientId: request.clientId });
     grant.addOIDCScope(request.scope);

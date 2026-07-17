@@ -220,11 +220,14 @@ export function applyClaimMappers({ user, organizations = [], mappers = [] }) {
   return claims;
 }
 
-async function withPostgresRoleGraphLock(pool, namespace, operation) {
+async function withPostgresAdvisoryTransaction(pool, namespace, operation) {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [namespace]);
+    const namespaces = [...new Set(Array.isArray(namespace) ? namespace : [namespace])].sort();
+    for (const lock of namespaces) {
+      await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [lock]);
+    }
     const result = await operation(client);
     await client.query('COMMIT');
     return result;
@@ -344,7 +347,9 @@ export class MemoryManagementStore {
 
   async createGroup(realm, input) {
     const id = input.id ?? randomUUID();
-    const existing = await this.listGroups(realm);
+    const existing = groupPaths([...this.groups.entries()]
+      .filter(([entry]) => entry.startsWith(`${realm}\u0000`))
+      .map(([, group]) => publicGroup(group)));
     if (input.parentId && !existing.some((group) => group.id === input.parentId)) throw Object.assign(new Error('Parent group not found'), { code: 'GROUP_PARENT_NOT_FOUND' });
     if (existing.some((group) => group.parentId === (input.parentId ?? null) && group.name.toLowerCase() === input.name.toLowerCase())) throw Object.assign(new Error('A sibling group already uses this name'), { code: 'GROUP_EXISTS' });
     const timestamp = nowIso();
@@ -356,7 +361,9 @@ export class MemoryManagementStore {
   async updateGroup(realm, id, patch) {
     const current = this.groups.get(key(realm, id));
     if (!current) return undefined;
-    const groups = await this.listGroups(realm);
+    const groups = groupPaths([...this.groups.entries()]
+      .filter(([entry]) => entry.startsWith(`${realm}\u0000`))
+      .map(([, group]) => publicGroup(group)));
     const parentId = patch.parentId === undefined ? current.parentId : patch.parentId;
     if (parentId === id) throw Object.assign(new Error('A group cannot be its own parent'), { code: 'GROUP_CYCLE' });
     if (parentId && !groups.some((group) => group.id === parentId)) throw Object.assign(new Error('Parent group not found'), { code: 'GROUP_PARENT_NOT_FOUND' });
@@ -374,13 +381,17 @@ export class MemoryManagementStore {
   }
 
   async deleteGroup(realm, id) {
-    if ((await this.listGroups(realm)).some((group) => group.parentId === id)) throw Object.assign(new Error('Move or delete child groups first'), { code: 'GROUP_NOT_EMPTY' });
+    if ([...this.groups.entries()].some(([entry, group]) => (
+      entry.startsWith(`${realm}\u0000`) && group.parentId === id
+    ))) throw Object.assign(new Error('Move or delete child groups first'), { code: 'GROUP_NOT_EMPTY' });
     return this.groups.delete(key(realm, id));
   }
 
   async listClientScopes(realm) { return [...this.clientScopes.entries()].filter(([entry]) => entry.startsWith(`${realm}\u0000`)).map(([, item]) => publicClientScope(item)).sort((a, b) => a.name.localeCompare(b.name)); }
   async createClientScope(realm, input) {
-    if ((await this.listClientScopes(realm)).some((scope) => scope.name.toLowerCase() === input.name.toLowerCase())) throw Object.assign(new Error('Client scope already exists'), { code: 'CLIENT_SCOPE_EXISTS' });
+    if ([...this.clientScopes.entries()].some(([entry, scope]) => (
+      entry.startsWith(`${realm}\u0000`) && scope.name.toLowerCase() === input.name.toLowerCase()
+    ))) throw Object.assign(new Error('Client scope already exists'), { code: 'CLIENT_SCOPE_EXISTS' });
     const timestamp = nowIso();
     const scope = { ...clone(input), id: input.id ?? randomUUID(), createdAt: timestamp, updatedAt: timestamp };
     this.clientScopes.set(key(realm, scope.id), scope);
@@ -390,7 +401,10 @@ export class MemoryManagementStore {
     const current = this.clientScopes.get(key(realm, id));
     if (!current) return undefined;
     const next = { ...current, ...clone(patch), id, updatedAt: nowIso() };
-    if ((await this.listClientScopes(realm)).some((scope) => scope.id !== id && scope.name.toLowerCase() === next.name.toLowerCase())) throw Object.assign(new Error('Client scope already exists'), { code: 'CLIENT_SCOPE_EXISTS' });
+    if ([...this.clientScopes.entries()].some(([entry, scope]) => (
+      entry.startsWith(`${realm}\u0000`) && scope.id !== id
+        && scope.name.toLowerCase() === next.name.toLowerCase()
+    ))) throw Object.assign(new Error('Client scope already exists'), { code: 'CLIENT_SCOPE_EXISTS' });
     this.clientScopes.set(key(realm, id), next);
     return publicClientScope(next);
   }
@@ -412,7 +426,10 @@ export class MemoryManagementStore {
 
   async listClaimMappers(realm, ownerType, ownerId) { return [...this.claimMappers.entries()].filter(([entry, mapper]) => entry.startsWith(`${realm}\u0000`) && (!ownerType || (mapper.ownerType === ownerType && mapper.ownerId === ownerId))).map(([, mapper]) => publicMapper(mapper)).sort((a, b) => a.name.localeCompare(b.name)); }
   async createClaimMapper(realm, input) {
-    if ((await this.listClaimMappers(realm, input.ownerType, input.ownerId)).some((mapper) => mapper.name.toLowerCase() === input.name.toLowerCase())) throw Object.assign(new Error('Claim mapper already exists'), { code: 'CLAIM_MAPPER_EXISTS' });
+    if ([...this.claimMappers.entries()].some(([entry, mapper]) => (
+      entry.startsWith(`${realm}\u0000`) && mapper.ownerType === input.ownerType
+        && mapper.ownerId === input.ownerId && mapper.name.toLowerCase() === input.name.toLowerCase()
+    ))) throw Object.assign(new Error('Claim mapper already exists'), { code: 'CLAIM_MAPPER_EXISTS' });
     const timestamp = nowIso();
     const mapper = { ...clone(input), id: input.id ?? randomUUID(), createdAt: timestamp, updatedAt: timestamp };
     this.claimMappers.set(key(realm, mapper.id), mapper);
@@ -422,8 +439,10 @@ export class MemoryManagementStore {
     const current = this.claimMappers.get(key(realm, id));
     if (!current) return undefined;
     const next = { ...current, ...clone(patch), id, updatedAt: nowIso() };
-    if ((await this.listClaimMappers(realm, current.ownerType, current.ownerId)).some((mapper) => (
-      mapper.id !== id && mapper.name.toLowerCase() === next.name.toLowerCase()
+    if ([...this.claimMappers.entries()].some(([entry, mapper]) => (
+      entry.startsWith(`${realm}\u0000`) && mapper.ownerType === current.ownerType
+        && mapper.ownerId === current.ownerId && mapper.id !== id
+        && mapper.name.toLowerCase() === next.name.toLowerCase()
     ))) throw Object.assign(new Error('Claim mapper already exists'), { code: 'CLAIM_MAPPER_EXISTS' });
     this.claimMappers.set(key(realm, id), next);
     return publicMapper(next);
@@ -433,6 +452,7 @@ export class MemoryManagementStore {
     let assignments = 0;
     let claimMappers = 0;
     let clientRoles = 0;
+    let authenticationFlows = 0;
     for (const entry of this.scopeAssignments.keys()) {
       if (entry.startsWith(`${realm}\u0000${clientId}\u0000`)) {
         this.scopeAssignments.delete(entry);
@@ -451,7 +471,15 @@ export class MemoryManagementStore {
         clientRoles += 1;
       }
     }
-    return { assignments, claimMappers, clientRoles };
+    for (const [entry, flow] of this.flows) {
+      if (!entry.startsWith(`${realm}\u0000`) || !flow.clientIds.includes(clientId)) continue;
+      if (flow.clientIds.length === 1) this.flows.delete(entry);
+      else this.flows.set(entry, {
+        ...flow, clientIds: flow.clientIds.filter((id) => id !== clientId), updatedAt: nowIso(),
+      });
+      authenticationFlows += 1;
+    }
+    return { assignments, claimMappers, clientRoles, authenticationFlows };
   }
   async effectiveClaimMappers(realm, clientId, grantedScopes = []) {
     const direct = await this.listClaimMappers(realm, 'client', clientId);
@@ -469,7 +497,9 @@ export class MemoryManagementStore {
   async listAuthenticationFlows(realm) { return [...this.flows.entries()].filter(([entry]) => entry.startsWith(`${realm}\u0000`)).map(([, flow]) => publicFlow(flow)).sort((a, b) => a.priority - b.priority || a.alias.localeCompare(b.alias)); }
   async createAuthenticationFlow(realm, input) {
     assertAuthenticationFlowConfiguration(input.steps);
-    if ((await this.listAuthenticationFlows(realm)).some((flow) => flow.alias.toLowerCase() === input.alias.toLowerCase())) throw Object.assign(new Error('Authentication flow already exists'), { code: 'AUTH_FLOW_EXISTS' });
+    if ([...this.flows.entries()].some(([entry, flow]) => (
+      entry.startsWith(`${realm}\u0000`) && flow.alias.toLowerCase() === input.alias.toLowerCase()
+    ))) throw Object.assign(new Error('Authentication flow already exists'), { code: 'AUTH_FLOW_EXISTS' });
     const timestamp = nowIso();
     const flow = { ...clone(input), id: input.id ?? randomUUID(), createdAt: timestamp, updatedAt: timestamp };
     this.flows.set(key(realm, flow.id), flow);
@@ -480,8 +510,9 @@ export class MemoryManagementStore {
     if (!current) return undefined;
     const next = { ...current, ...clone(patch), id, updatedAt: nowIso() };
     assertAuthenticationFlowConfiguration(next.steps);
-    if ((await this.listAuthenticationFlows(realm)).some((flow) => (
-      flow.id !== id && flow.alias.toLowerCase() === next.alias.toLowerCase()
+    if ([...this.flows.entries()].some(([entry, flow]) => (
+      entry.startsWith(`${realm}\u0000`) && flow.id !== id
+        && flow.alias.toLowerCase() === next.alias.toLowerCase()
     ))) throw Object.assign(new Error('Authentication flow already exists'), { code: 'AUTH_FLOW_EXISTS' });
     this.flows.set(key(realm, id), next);
     return publicFlow(next);
@@ -489,13 +520,26 @@ export class MemoryManagementStore {
   async deleteAuthenticationFlow(realm, id) { return this.flows.delete(key(realm, id)); }
   async resolveAuthenticationFlow(realm, { clientId, requestedAcrs = [] } = {}) {
     const flows = (await this.listAuthenticationFlows(realm)).filter((flow) => flow.enabled && (!flow.clientIds.length || flow.clientIds.includes(clientId)));
-    return clone(flows.find((flow) => requestedAcrs.includes(flow.acr)) ?? flows[0]);
+    if (!requestedAcrs.length) return clone(flows[0]);
+    for (const acr of requestedAcrs) {
+      const flow = flows.find((candidate) => candidate.acr === acr);
+      if (flow) return clone(flow);
+    }
+    return undefined;
   }
 
   async listOrganizations(realm) { return [...this.organizations.entries()].filter(([entry]) => entry.startsWith(`${realm}\u0000`)).map(([, organization]) => publicOrganization(organization, this.organizationDomains.get(key(realm, organization.id)) ?? [])).sort((a, b) => a.name.localeCompare(b.name)); }
-  async findOrganization(realm, idOrAlias) { return (await this.listOrganizations(realm)).find((organization) => organization.id === idOrAlias || organization.alias === idOrAlias); }
-  async createOrganization(realm, input) {
+  async findOrganization(realm, idOrAlias) {
     const organizations = await this.listOrganizations(realm);
+    return organizations.find((organization) => organization.id === idOrAlias)
+      ?? organizations.find((organization) => organization.alias === idOrAlias);
+  }
+  async createOrganization(realm, input) {
+    const organizations = [...this.organizations.entries()]
+      .filter(([entry]) => entry.startsWith(`${realm}\u0000`))
+      .map(([, organization]) => publicOrganization(
+        organization, this.organizationDomains.get(key(realm, organization.id)) ?? [],
+      ));
     if (organizations.some((organization) => organization.alias.toLowerCase() === input.alias.toLowerCase())) throw Object.assign(new Error('Organization alias already exists'), { code: 'ORGANIZATION_EXISTS' });
     const claimed = new Set(organizations.flatMap((organization) => organization.domains.map(({ domain }) => domain)));
     if (input.domains.some(({ domain }) => claimed.has(domain))) throw Object.assign(new Error('Organization domain already exists'), { code: 'ORGANIZATION_DOMAIN_EXISTS' });
@@ -508,7 +552,11 @@ export class MemoryManagementStore {
   async updateOrganization(realm, id, patch) {
     const current = this.organizations.get(key(realm, id));
     if (!current) return undefined;
-    const organizations = (await this.listOrganizations(realm)).filter((organization) => organization.id !== id);
+    const organizations = [...this.organizations.entries()]
+      .filter(([entry, organization]) => entry.startsWith(`${realm}\u0000`) && organization.id !== id)
+      .map(([, organization]) => publicOrganization(
+        organization, this.organizationDomains.get(key(realm, organization.id)) ?? [],
+      ));
     const alias = patch.alias ?? current.alias;
     if (organizations.some((organization) => organization.alias.toLowerCase() === alias.toLowerCase())) {
       throw Object.assign(new Error('Organization alias already exists'), { code: 'ORGANIZATION_EXISTS' });
@@ -569,8 +617,7 @@ export class MemoryManagementStore {
     const match = [...this.invitations.entries()].find(([entry, invitation]) => entry.startsWith(`${realm}\u0000`) && invitation.tokenDigest === tokenDigest && !invitation.acceptedAt && new Date(invitation.expiresAt).getTime() > Date.now());
     if (!match || match[1].email.toLowerCase() !== user.email.toLowerCase()) return undefined;
     const [entry, invitation] = match;
-    const organization = await this.findOrganization(realm, invitation.organizationId);
-    if (!organization?.enabled) return undefined;
+    if (!this.organizations.get(key(realm, invitation.organizationId))?.enabled) return undefined;
     invitation.acceptedAt = nowIso();
     this.invitations.set(entry, invitation);
     await this.upsertOrganizationMembership(realm, invitation.organizationId, user.id, invitation.roles);
@@ -606,7 +653,7 @@ export class PostgresManagementStore {
   }
   async listRoles(realm) { return (await this.pool.query('SELECT * FROM realm_roles WHERE realm_name=$1 ORDER BY name', [realm])).rows.map(publicRole); }
   async putRole(realm, input) {
-    return withPostgresRoleGraphLock(this.pool, `authme:realm-roles:${realm}`, async (client) => {
+    return withPostgresAdvisoryTransaction(this.pool, `authme:realm-roles:${realm}`, async (client) => {
       const roles = (await client.query('SELECT * FROM realm_roles WHERE realm_name=$1 ORDER BY name', [realm])).rows.map(publicRole);
       validateRoleGraph(input, roles);
       const result = await client.query(
@@ -618,7 +665,7 @@ export class PostgresManagementStore {
     });
   }
   async deleteRole(realm, name) {
-    return withPostgresRoleGraphLock(this.pool, `authme:realm-roles:${realm}`, async (client) => {
+    return withPostgresAdvisoryTransaction(this.pool, `authme:realm-roles:${realm}`, async (client) => {
       const result = await client.query(
         `WITH deleted AS (DELETE FROM realm_roles WHERE realm_name=$1 AND name=$2 RETURNING name),
          roles_updated AS (UPDATE realm_roles SET composites=array_remove(composites,$2) WHERE realm_name=$1 AND $2=ANY(composites)),
@@ -631,7 +678,7 @@ export class PostgresManagementStore {
   }
   async listClientRoles(realm, clientId) { return (await this.pool.query('SELECT * FROM client_roles WHERE realm_name=$1 AND client_id=$2 ORDER BY name', [realm, clientId])).rows.map(publicClientRole); }
   async putClientRole(realm, clientId, input) {
-    return withPostgresRoleGraphLock(this.pool, `authme:client-roles:${realm}:${clientId}`, async (client) => {
+    return withPostgresAdvisoryTransaction(this.pool, `authme:client-roles:${realm}:${clientId}`, async (client) => {
       const definitions = (await client.query(
         'SELECT * FROM client_roles WHERE realm_name=$1 AND client_id=$2 ORDER BY name', [realm, clientId],
       )).rows.map(publicClientRole);
@@ -644,7 +691,7 @@ export class PostgresManagementStore {
     });
   }
   async deleteClientRole(realm, clientId, name) {
-    return withPostgresRoleGraphLock(this.pool, `authme:client-roles:${realm}:${clientId}`, async (client) => {
+    return withPostgresAdvisoryTransaction(this.pool, `authme:client-roles:${realm}:${clientId}`, async (client) => {
       const result = await client.query(
         `WITH deleted AS (DELETE FROM client_roles WHERE realm_name=$1 AND client_id=$2 AND name=$3 RETURNING name),
          updated AS (UPDATE client_roles SET composites=array_remove(composites,$3) WHERE realm_name=$1 AND client_id=$2 AND $3=ANY(composites))
@@ -656,80 +703,200 @@ export class PostgresManagementStore {
   }
   async listGroups(realm) { return groupPaths((await this.pool.query('SELECT * FROM realm_groups WHERE realm_name=$1', [realm])).rows.map(publicGroup)).sort((a, b) => a.path.localeCompare(b.path)); }
   async createGroup(realm, input) {
-    const result = await this.pool.query(
-      `INSERT INTO realm_groups (realm_name,id,name,parent_id,roles,attributes) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
-      [realm, input.id ?? randomUUID(), input.name, input.parentId ?? null, input.roles, input.attributes],
-    );
-    return (await this.listGroups(realm)).find((group) => group.id === String(result.rows[0].id));
+    return withPostgresAdvisoryTransaction(this.pool, `authme:groups:${realm}`, async (client) => {
+      const result = await client.query(
+        `INSERT INTO realm_groups (realm_name,id,name,parent_id,roles,attributes) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+        [realm, input.id ?? randomUUID(), input.name, input.parentId ?? null, input.roles, input.attributes],
+      );
+      const groups = groupPaths((await client.query(
+        'SELECT * FROM realm_groups WHERE realm_name=$1', [realm],
+      )).rows.map(publicGroup));
+      return groups.find((group) => group.id === String(result.rows[0].id));
+    });
   }
   async updateGroup(realm, id, patch) {
-    if (patch.parentId) {
-      const groups = await this.listGroups(realm);
-      const descendants = new Set();
-      const queue = [id];
-      while (queue.length) { const parent = queue.shift(); for (const group of groups.filter((candidate) => candidate.parentId === parent)) { descendants.add(group.id); queue.push(group.id); } }
-      if (patch.parentId === id || descendants.has(patch.parentId)) throw Object.assign(new Error('Group hierarchy would contain a cycle'), { code: 'GROUP_CYCLE' });
-    }
-    const result = await this.pool.query(
-      `UPDATE realm_groups SET name=COALESCE($3,name), parent_id=CASE WHEN $4 THEN $5::uuid ELSE parent_id END,
-         roles=COALESCE($6::text[],roles), attributes=COALESCE($7::jsonb,attributes)
-       WHERE realm_name=$1 AND id=$2 RETURNING *`,
-      [realm, id, patch.name ?? null, Object.hasOwn(patch, 'parentId'), patch.parentId ?? null, patch.roles ?? null, patch.attributes ?? null],
-    );
-    if (!result.rows[0]) return undefined;
-    return (await this.listGroups(realm)).find((group) => group.id === id);
+    return withPostgresAdvisoryTransaction(this.pool, `authme:groups:${realm}`, async (client) => {
+      const rows = (await client.query('SELECT * FROM realm_groups WHERE realm_name=$1', [realm])).rows;
+      const current = rows.find((row) => String(row.id) === id);
+      if (!current) return undefined;
+      const groups = groupPaths(rows.map(publicGroup));
+      const parentId = Object.hasOwn(patch, 'parentId') ? patch.parentId : current.parent_id && String(current.parent_id);
+      if (parentId) {
+        if (!groups.some((group) => group.id === parentId)) {
+          throw Object.assign(new Error('Parent group not found'), { code: 'GROUP_PARENT_NOT_FOUND' });
+        }
+        const descendants = new Set();
+        const queue = [id];
+        while (queue.length) {
+          const parent = queue.shift();
+          for (const group of groups.filter((candidate) => candidate.parentId === parent)) {
+            descendants.add(group.id);
+            queue.push(group.id);
+          }
+        }
+        if (parentId === id || descendants.has(parentId)) {
+          throw Object.assign(new Error('Group hierarchy would contain a cycle'), { code: 'GROUP_CYCLE' });
+        }
+      }
+      const result = await client.query(
+        `UPDATE realm_groups SET name=COALESCE($3,name), parent_id=CASE WHEN $4 THEN $5::uuid ELSE parent_id END,
+           roles=COALESCE($6::text[],roles), attributes=COALESCE($7::jsonb,attributes)
+         WHERE realm_name=$1 AND id=$2 RETURNING *`,
+        [realm, id, patch.name ?? null, Object.hasOwn(patch, 'parentId'), patch.parentId ?? null, patch.roles ?? null, patch.attributes ?? null],
+      );
+      const updated = groupPaths((await client.query(
+        'SELECT * FROM realm_groups WHERE realm_name=$1', [realm],
+      )).rows.map(publicGroup));
+      return updated.find((group) => group.id === String(result.rows[0].id));
+    });
   }
-  async deleteGroup(realm, id) { return (await this.pool.query('DELETE FROM realm_groups WHERE realm_name=$1 AND id=$2', [realm, id])).rowCount === 1; }
+  async deleteGroup(realm, id) {
+    return withPostgresAdvisoryTransaction(this.pool, `authme:groups:${realm}`, async (client) => (
+      (await client.query('DELETE FROM realm_groups WHERE realm_name=$1 AND id=$2', [realm, id])).rowCount === 1
+    ));
+  }
   async listClientScopes(realm) { return (await this.pool.query('SELECT * FROM client_scopes WHERE realm_name=$1 ORDER BY name', [realm])).rows.map(publicClientScope); }
   async createClientScope(realm, input) { return publicClientScope((await this.pool.query('INSERT INTO client_scopes (realm_name,id,name,description,protocol,attributes) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *', [realm, input.id ?? randomUUID(), input.name, input.description, input.protocol, input.attributes])).rows[0]); }
   async updateClientScope(realm, id, patch) { return publicClientScope((await this.pool.query('UPDATE client_scopes SET name=COALESCE($3,name), description=COALESCE($4,description), attributes=COALESCE($5::jsonb,attributes) WHERE realm_name=$1 AND id=$2 RETURNING *', [realm, id, patch.name ?? null, patch.description ?? null, patch.attributes ?? null])).rows[0]); }
   async deleteClientScope(realm, id) {
-    const result = await this.pool.query(
-      `WITH deleted_scope AS (
-         DELETE FROM client_scopes WHERE realm_name=$1 AND id=$2 RETURNING id
-       ), deleted_mappers AS (
-         DELETE FROM claim_mappers
-         WHERE realm_name=$1 AND owner_type='client-scope' AND owner_id=$2::text
-           AND EXISTS (SELECT 1 FROM deleted_scope)
-       ) SELECT id FROM deleted_scope`,
-      [realm, id],
-    );
-    return result.rowCount === 1;
+    return withPostgresAdvisoryTransaction(this.pool, `authme:client-scope:${realm}:${id}`, async (client) => {
+      const result = await client.query(
+        `WITH deleted_scope AS (
+           DELETE FROM client_scopes WHERE realm_name=$1 AND id=$2 RETURNING id
+         ), deleted_mappers AS (
+           DELETE FROM claim_mappers
+           WHERE realm_name=$1 AND owner_type='client-scope' AND owner_id=$2::text
+             AND EXISTS (SELECT 1 FROM deleted_scope)
+         ) SELECT id FROM deleted_scope`,
+        [realm, id],
+      );
+      return result.rowCount === 1;
+    });
   }
-  async setClientScopeAssignment(realm, clientId, scopeId, assignmentType) { return (await this.pool.query(`INSERT INTO client_scope_assignments (realm_name,client_id,scope_id,assignment_type) VALUES ($1,$2,$3,$4) ON CONFLICT (realm_name,client_id,scope_id) DO UPDATE SET assignment_type=EXCLUDED.assignment_type`, [realm, clientId, scopeId, assignmentType])).rowCount === 1; }
+  async setClientScopeAssignment(realm, clientId, scopeId, assignmentType) {
+    return withPostgresAdvisoryTransaction(this.pool, [
+      `authme:client-roles:${realm}:${clientId}`,
+      `authme:client-scope:${realm}:${scopeId}`,
+    ], async (client) => (await client.query(
+      `INSERT INTO client_scope_assignments (realm_name,client_id,scope_id,assignment_type)
+       VALUES ($1,$2,$3,$4)
+       ON CONFLICT (realm_name,client_id,scope_id)
+       DO UPDATE SET assignment_type=EXCLUDED.assignment_type`,
+      [realm, clientId, scopeId, assignmentType],
+    )).rowCount === 1);
+  }
   async deleteClientScopeAssignment(realm, clientId, scopeId) { return (await this.pool.query('DELETE FROM client_scope_assignments WHERE realm_name=$1 AND client_id=$2 AND scope_id=$3', [realm, clientId, scopeId])).rowCount === 1; }
   async listClientScopeAssignments(realm, clientId) { return (await this.pool.query('SELECT client_id AS "clientId", scope_id AS "scopeId", assignment_type AS "assignmentType" FROM client_scope_assignments WHERE realm_name=$1 AND client_id=$2 ORDER BY assignment_type,scope_id', [realm, clientId])).rows; }
   async listClaimMappers(realm, ownerType, ownerId) {
     const result = ownerType ? await this.pool.query('SELECT * FROM claim_mappers WHERE realm_name=$1 AND owner_type=$2 AND owner_id=$3 ORDER BY name', [realm, ownerType, ownerId]) : await this.pool.query('SELECT * FROM claim_mappers WHERE realm_name=$1 ORDER BY owner_type,owner_id,name', [realm]);
     return result.rows.map(publicMapper);
   }
-  async createClaimMapper(realm, input) { return publicMapper((await this.pool.query('INSERT INTO claim_mappers (realm_name,id,owner_type,owner_id,name,mapper_type,config) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *', [realm, input.id ?? randomUUID(), input.ownerType, input.ownerId, input.name, input.mapperType, input.config])).rows[0]); }
-  async updateClaimMapper(realm, id, patch) { return publicMapper((await this.pool.query('UPDATE claim_mappers SET name=COALESCE($3,name), mapper_type=COALESCE($4,mapper_type), config=COALESCE($5::jsonb,config) WHERE realm_name=$1 AND id=$2 RETURNING *', [realm, id, patch.name ?? null, patch.mapperType ?? null, patch.config ?? null])).rows[0]); }
+  async createClaimMapper(realm, input) {
+    const namespace = input.ownerType === 'client'
+      ? `authme:client-roles:${realm}:${input.ownerId}`
+      : `authme:client-scope:${realm}:${input.ownerId}`;
+    return withPostgresAdvisoryTransaction(this.pool, namespace, async (client) => publicMapper((await client.query(
+      `INSERT INTO claim_mappers (realm_name,id,owner_type,owner_id,name,mapper_type,config)
+       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+      [realm, input.id ?? randomUUID(), input.ownerType, input.ownerId, input.name, input.mapperType, input.config],
+    )).rows[0]));
+  }
+  async updateClaimMapper(realm, id, patch) {
+    const current = (await this.pool.query(
+      'SELECT owner_type,owner_id FROM claim_mappers WHERE realm_name=$1 AND id=$2', [realm, id],
+    )).rows[0];
+    if (!current) return undefined;
+    const namespace = current.owner_type === 'client'
+      ? `authme:client-roles:${realm}:${current.owner_id}`
+      : `authme:client-scope:${realm}:${current.owner_id}`;
+    return withPostgresAdvisoryTransaction(this.pool, namespace, async (client) => publicMapper((await client.query(
+      `UPDATE claim_mappers SET name=COALESCE($3,name), mapper_type=COALESCE($4,mapper_type),
+         config=COALESCE($5::jsonb,config) WHERE realm_name=$1 AND id=$2 RETURNING *`,
+      [realm, id, patch.name ?? null, patch.mapperType ?? null, patch.config ?? null],
+    )).rows[0]));
+  }
   async deleteClaimMapper(realm, id) { return (await this.pool.query('DELETE FROM claim_mappers WHERE realm_name=$1 AND id=$2', [realm, id])).rowCount === 1; }
   async deleteClientPolicy(realm, clientId) {
-    const result = await this.pool.query(
-      `WITH deleted_assignments AS (
-         DELETE FROM client_scope_assignments WHERE realm_name=$1 AND client_id=$2 RETURNING 1
-       ), deleted_mappers AS (
-         DELETE FROM claim_mappers WHERE realm_name=$1 AND owner_type='client' AND owner_id=$2 RETURNING 1
-       ), deleted_roles AS (
-         DELETE FROM client_roles WHERE realm_name=$1 AND client_id=$2 RETURNING 1
-       )
-       SELECT (SELECT count(*)::integer FROM deleted_assignments) AS assignments,
-              (SELECT count(*)::integer FROM deleted_mappers) AS claim_mappers,
-              (SELECT count(*)::integer FROM deleted_roles) AS client_roles`,
-      [realm, clientId],
-    );
-    return { assignments: result.rows[0].assignments, claimMappers: result.rows[0].claim_mappers, clientRoles: result.rows[0].client_roles };
+    return withPostgresAdvisoryTransaction(this.pool, `authme:client-roles:${realm}:${clientId}`, async (client) => {
+      const result = await client.query(
+        `WITH deleted_assignments AS (
+           DELETE FROM client_scope_assignments WHERE realm_name=$1 AND client_id=$2 RETURNING 1
+         ), deleted_mappers AS (
+           DELETE FROM claim_mappers WHERE realm_name=$1 AND owner_type='client' AND owner_id=$2 RETURNING 1
+         ), deleted_roles AS (
+           DELETE FROM client_roles WHERE realm_name=$1 AND client_id=$2 RETURNING 1
+         ), updated_flows AS (
+           UPDATE authentication_flows SET client_ids=array_remove(client_ids,$2)
+           WHERE realm_name=$1 AND $2=ANY(client_ids) AND cardinality(client_ids)>1 RETURNING 1
+         ), deleted_flows AS (
+           DELETE FROM authentication_flows
+           WHERE realm_name=$1 AND $2=ANY(client_ids) AND cardinality(client_ids)=1 RETURNING 1
+         )
+         SELECT (SELECT count(*)::integer FROM deleted_assignments) AS assignments,
+                (SELECT count(*)::integer FROM deleted_mappers) AS claim_mappers,
+                (SELECT count(*)::integer FROM deleted_roles) AS client_roles,
+                (SELECT count(*)::integer FROM updated_flows)
+                  + (SELECT count(*)::integer FROM deleted_flows) AS authentication_flows`,
+        [realm, clientId],
+      );
+      return {
+        assignments: result.rows[0].assignments,
+        claimMappers: result.rows[0].claim_mappers,
+        clientRoles: result.rows[0].client_roles,
+        authenticationFlows: result.rows[0].authentication_flows,
+      };
+    });
   }
   async effectiveClaimMappers(realm, clientId, grantedScopes = []) { return (await this.pool.query(`SELECT DISTINCT m.* FROM claim_mappers m LEFT JOIN client_scope_assignments a ON a.realm_name=m.realm_name AND m.owner_type='client-scope' AND m.owner_id=a.scope_id::text LEFT JOIN client_scopes s ON s.realm_name=a.realm_name AND s.id=a.scope_id WHERE m.realm_name=$1 AND ((m.owner_type='client' AND m.owner_id=$2) OR (a.client_id=$2 AND (a.assignment_type='default' OR s.name=ANY($3::text[])))) ORDER BY m.name`, [realm, clientId, [...grantedScopes]])).rows.map(publicMapper); }
   async listAuthenticationFlows(realm) { return (await this.pool.query('SELECT * FROM authentication_flows WHERE realm_name=$1 ORDER BY priority,alias', [realm])).rows.map(publicFlow); }
-  async createAuthenticationFlow(realm, input) { assertAuthenticationFlowConfiguration(input.steps); return publicFlow((await this.pool.query('INSERT INTO authentication_flows (realm_name,id,alias,description,enabled,priority,client_ids,acr,max_age_seconds,steps) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb) RETURNING *', [realm, input.id ?? randomUUID(), input.alias, input.description, input.enabled, input.priority, input.clientIds, input.acr, input.maxAgeSeconds, JSON.stringify(input.steps)])).rows[0]); }
-  async updateAuthenticationFlow(realm, id, patch) { const current = (await this.pool.query('SELECT * FROM authentication_flows WHERE realm_name=$1 AND id=$2', [realm, id])).rows[0]; if (!current) return undefined; assertAuthenticationFlowConfiguration(patch.steps ?? current.steps); return publicFlow((await this.pool.query(`UPDATE authentication_flows SET alias=COALESCE($3,alias),description=COALESCE($4,description),enabled=COALESCE($5,enabled),priority=COALESCE($6,priority),client_ids=COALESCE($7::text[],client_ids),acr=COALESCE($8,acr),max_age_seconds=CASE WHEN $9 THEN $10::integer ELSE max_age_seconds END,steps=COALESCE($11::jsonb,steps) WHERE realm_name=$1 AND id=$2 RETURNING *`, [realm, id, patch.alias ?? null, patch.description ?? null, patch.enabled ?? null, patch.priority ?? null, patch.clientIds ?? null, patch.acr ?? null, Object.hasOwn(patch, 'maxAgeSeconds'), patch.maxAgeSeconds ?? null, patch.steps ? JSON.stringify(patch.steps) : null])).rows[0]); }
+  async createAuthenticationFlow(realm, input) {
+    assertAuthenticationFlowConfiguration(input.steps);
+    const locks = input.clientIds.map((clientId) => `authme:client-roles:${realm}:${clientId}`);
+    return withPostgresAdvisoryTransaction(this.pool, locks, async (client) => publicFlow((await client.query(
+      `INSERT INTO authentication_flows
+        (realm_name,id,alias,description,enabled,priority,client_ids,acr,max_age_seconds,steps)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb) RETURNING *`,
+      [realm, input.id ?? randomUUID(), input.alias, input.description, input.enabled, input.priority,
+        input.clientIds, input.acr, input.maxAgeSeconds, JSON.stringify(input.steps)],
+    )).rows[0]));
+  }
+  async updateAuthenticationFlow(realm, id, patch) {
+    const current = (await this.pool.query(
+      'SELECT * FROM authentication_flows WHERE realm_name=$1 AND id=$2', [realm, id],
+    )).rows[0];
+    if (!current) return undefined;
+    assertAuthenticationFlowConfiguration(patch.steps ?? current.steps);
+    const locks = [...new Set([
+      ...current.client_ids,
+      ...(patch.clientIds ?? current.client_ids),
+    ])].map((clientId) => `authme:client-roles:${realm}:${clientId}`);
+    return withPostgresAdvisoryTransaction(this.pool, locks, async (client) => publicFlow((await client.query(
+      `UPDATE authentication_flows SET alias=COALESCE($3,alias),description=COALESCE($4,description),
+         enabled=COALESCE($5,enabled),priority=COALESCE($6,priority),client_ids=COALESCE($7::text[],client_ids),
+         acr=COALESCE($8,acr),max_age_seconds=CASE WHEN $9 THEN $10::integer ELSE max_age_seconds END,
+         steps=COALESCE($11::jsonb,steps) WHERE realm_name=$1 AND id=$2 RETURNING *`,
+      [realm, id, patch.alias ?? null, patch.description ?? null, patch.enabled ?? null,
+        patch.priority ?? null, patch.clientIds ?? null, patch.acr ?? null,
+        Object.hasOwn(patch, 'maxAgeSeconds'), patch.maxAgeSeconds ?? null,
+        patch.steps ? JSON.stringify(patch.steps) : null],
+    )).rows[0]));
+  }
   async deleteAuthenticationFlow(realm, id) { return (await this.pool.query('DELETE FROM authentication_flows WHERE realm_name=$1 AND id=$2', [realm, id])).rowCount === 1; }
-  async resolveAuthenticationFlow(realm, { clientId, requestedAcrs = [] } = {}) { const flows = (await this.listAuthenticationFlows(realm)).filter((flow) => flow.enabled && (!flow.clientIds.length || flow.clientIds.includes(clientId))); return clone(flows.find((flow) => requestedAcrs.includes(flow.acr)) ?? flows[0]); }
+  async resolveAuthenticationFlow(realm, { clientId, requestedAcrs = [] } = {}) {
+    const flows = (await this.listAuthenticationFlows(realm)).filter((flow) => flow.enabled && (!flow.clientIds.length || flow.clientIds.includes(clientId)));
+    if (!requestedAcrs.length) return clone(flows[0]);
+    for (const acr of requestedAcrs) {
+      const flow = flows.find((candidate) => candidate.acr === acr);
+      if (flow) return clone(flow);
+    }
+    return undefined;
+  }
   async listOrganizations(realm) { const organizations = (await this.pool.query('SELECT * FROM organizations WHERE realm_name=$1 ORDER BY name', [realm])).rows; const domains = (await this.pool.query('SELECT * FROM organization_domains WHERE realm_name=$1 ORDER BY domain', [realm])).rows; return organizations.map((organization) => publicOrganization(organization, domains.filter((domain) => String(domain.organization_id) === String(organization.id)))); }
-  async findOrganization(realm, idOrAlias) { return (await this.listOrganizations(realm)).find((organization) => organization.id === idOrAlias || organization.alias === idOrAlias); }
+  async findOrganization(realm, idOrAlias) {
+    const organizations = await this.listOrganizations(realm);
+    return organizations.find((organization) => organization.id === idOrAlias)
+      ?? organizations.find((organization) => organization.alias === idOrAlias);
+  }
   async createOrganization(realm, input) {
     const client = await this.pool.connect();
     try { await client.query('BEGIN'); const organization = (await client.query('INSERT INTO organizations (realm_name,id,name,alias,enabled,identity_provider_ids,attributes) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *', [realm, input.id ?? randomUUID(), input.name, input.alias, input.enabled, input.identityProviderIds, input.attributes])).rows[0]; for (const domain of input.domains) await client.query('INSERT INTO organization_domains (realm_name,organization_id,domain,verified) VALUES ($1,$2,$3,$4)', [realm, organization.id, domain.domain, domain.verified]); await client.query('COMMIT'); return publicOrganization(organization, input.domains); } catch (error) { await client.query('ROLLBACK').catch(() => {}); throw error; } finally { client.release(); }

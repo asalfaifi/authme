@@ -222,6 +222,9 @@ test('maps realm, client, roles, nested groups, users, and group-derived assignm
     scope: 'email groups offline_access openid profile roles',
   }]);
   assert.deepEqual(config.roles.realm.map(({ name }) => name), ['employee', 'member']);
+  assert.deepEqual(config.roles.realm.find(({ name }) => name === 'employee'), {
+    name: 'employee', description: '', composites: ['member'], attributes: {},
+  });
   assert.deepEqual(config.roles.clients['orders-api'].map(({ name }) => name), ['orders.read', 'orders.refund']);
   assert.deepEqual(config.groups.map(({ path }) => path), ['/engineering', '/engineering/platform']);
   assert.equal(config.groups[1].parentPath, '/engineering');
@@ -248,6 +251,46 @@ test('maps realm, client, roles, nested groups, users, and group-derived assignm
   assert.ok(report.summary.unsupportedOrSkipped > 0);
   assert.equal(Object.isFrozen(config), true);
   assert.equal(Object.isFrozen(report), true);
+});
+
+test('maps same-namespace composite graphs and omits cross-namespace, missing, or cyclic edges', () => {
+  const { config, report } = transformKeycloakRealm(realmExport({
+    roles: {
+      realm: [{
+        name: 'analyst', composite: true, composites: { realm: ['reader'] },
+      }, {
+        name: 'reader', composite: true, composites: { realm: ['analyst'] },
+      }, {
+        name: 'cross-namespace', composite: true,
+        composites: { realm: ['reader', 'missing'], client: { orders: ['read'] } },
+      }],
+      client: {
+        orders: [{ name: 'read' }, {
+          name: 'admin', composite: true, composites: { client: { orders: ['read'] } },
+        }, {
+          name: 'cross-client', composite: true,
+          composites: { realm: ['reader'], client: { billing: ['charge'] } },
+        }],
+      },
+    },
+  }), { publicUrl: 'https://login.example.test' });
+
+  assert.deepEqual(config.roles.realm.map(({ name, composites }) => [name, composites]), [
+    ['analyst', ['reader']],
+    ['cross-namespace', ['reader']],
+    ['reader', []],
+  ]);
+  assert.deepEqual(config.roles.clients.orders.map(({ name, composites }) => [name, composites]), [
+    ['admin', ['read']],
+    ['cross-client', []],
+    ['read', []],
+  ]);
+  const compositeBlockers = report.unsupportedOrSkipped.filter(({ category }) => category === 'role-composite');
+  assert(compositeBlockers.some(({ item, reason }) => item === 'reader:analyst' && /cycle/iu.test(reason)));
+  assert(compositeBlockers.some(({ item, reason }) => item === 'cross-namespace:missing' && /not present/iu.test(reason)));
+  assert(compositeBlockers.some(({ item, reason }) => item === 'cross-namespace:orders:read' && /cross/iu.test(reason)));
+  assert(compositeBlockers.some(({ item, reason }) => item === 'cross-client:realm:reader' && /cross/iu.test(reason)));
+  assert(report.mapped.some(({ category, item }) => category === 'role-composite' && item === 'admin'));
 });
 
 test('maps OIDC and LDAP federation without copying source secrets', () => {
@@ -440,8 +483,24 @@ test('declared OIDC, workforce, and federation-hub reference profiles have no tr
   };
   const profiles = [{
     name: 'OIDC application estate',
-    source: { realm: 'oidc-reference', clients: [oidcClient] },
-    assertConfig(config) { assert.equal(config.clients[0].client_id, 'reference-browser'); },
+    source: {
+      realm: 'oidc-reference', clients: [oidcClient],
+      roles: {
+        realm: [{ name: 'reader' }, {
+          name: 'administrator', composite: true, composites: { realm: ['reader'] },
+        }],
+        client: {
+          'reference-browser': [{ name: 'view' }, {
+            name: 'edit', composite: true, composites: { client: { 'reference-browser': ['view'] } },
+          }],
+        },
+      },
+    },
+    assertConfig(config) {
+      assert.equal(config.clients[0].client_id, 'reference-browser');
+      assert.deepEqual(config.roles.realm.find(({ name }) => name === 'administrator').composites, ['reader']);
+      assert.deepEqual(config.roles.clients['reference-browser'].find(({ name }) => name === 'edit').composites, ['view']);
+    },
   }, {
     name: 'enterprise workforce',
     source: {

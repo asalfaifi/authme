@@ -40,6 +40,14 @@ test('PostgreSQL management policy is durable, mutable, nested, and realm-scoped
   const parent = await management.createGroup(realm, { name: 'engineering', parentId: null, roles: ['reader'], attributes: {} });
   const child = await management.createGroup(realm, { name: 'platform', parentId: parent.id, roles: ['editor'], attributes: {} });
   assert.equal(child.path, '/engineering/platform');
+  const cycleLeft = await management.createGroup(realm, { name: 'cycle-left', parentId: null, roles: [], attributes: {} });
+  const cycleRight = await management.createGroup(realm, { name: 'cycle-right', parentId: null, roles: [], attributes: {} });
+  const groupCycle = await Promise.allSettled([
+    management.updateGroup(realm, cycleLeft.id, { parentId: cycleRight.id }),
+    management.updateGroup(realm, cycleRight.id, { parentId: cycleLeft.id }),
+  ]);
+  assert.equal(groupCycle.filter(({ status }) => status === 'rejected').length, 1);
+  assert.equal((await management.listGroups(realm)).length >= 4, true);
 
   const scope = await management.createClientScope(realm, { name: 'tenant', description: '', protocol: 'openid-connect', attributes: {} });
   await management.setClientScopeAssignment(realm, 'portal', scope.id, 'default');
@@ -66,13 +74,33 @@ test('PostgreSQL management policy is durable, mutable, nested, and realm-scoped
   const clientRoles = await management.listClientRoles(realm, 'portal');
   assert.doesNotThrow(() => expandCompositeRoles(clientRoles.map(({ name }) => name), clientRoles));
   assert.deepEqual((await management.listClientRoles(realm, 'portal')).find((role) => role.name === 'admin').composites, ['read']);
+  await management.createAuthenticationFlow(realm, {
+    alias: 'deleted-client-flow', description: '', enabled: true, priority: 5, clientIds: ['portal'],
+    acr: 'urn:test:deleted-client', maxAgeSeconds: 300,
+    steps: [{ type: 'password', requirement: 'required' }],
+  });
+  await management.createAuthenticationFlow(realm, {
+    alias: 'shared-client-flow', description: '', enabled: true, priority: 6, clientIds: ['portal', 'other'],
+    acr: 'urn:test:shared-client', maxAgeSeconds: 300,
+    steps: [{ type: 'password', requirement: 'required' }],
+  });
   await management.deleteClientPolicy(realm, 'portal');
   assert.deepEqual(await management.listClientScopeAssignments(realm, 'portal'), []);
   assert.deepEqual(await management.listClaimMappers(realm, 'client', 'portal'), []);
   assert.deepEqual(await management.listClientRoles(realm, 'portal'), []);
+  const remainingFlows = await management.listAuthenticationFlows(realm);
+  assert.equal(remainingFlows.some(({ clientIds }) => clientIds.includes('portal')), false);
+  assert.deepEqual(remainingFlows.find(({ alias }) => alias === 'shared-client-flow').clientIds, ['other']);
 
   const flow = await management.createAuthenticationFlow(realm, { alias: 'strong', description: '', enabled: true, priority: 10, clientIds: ['portal'], acr: 'urn:test:strong', maxAgeSeconds: 300, steps: [{ type: 'password', requirement: 'required' }] });
   assert.equal((await management.resolveAuthenticationFlow(realm, { clientId: 'portal' })).id, flow.id);
+  const preferred = await management.createAuthenticationFlow(realm, { alias: 'preferred', description: '', enabled: true, priority: 20, clientIds: ['portal'], acr: 'urn:test:preferred', maxAgeSeconds: 300, steps: [{ type: 'passkey', requirement: 'required' }] });
+  assert.equal((await management.resolveAuthenticationFlow(realm, {
+    clientId: 'portal', requestedAcrs: ['urn:test:preferred', 'urn:test:strong'],
+  })).id, preferred.id);
+  assert.equal(await management.resolveAuthenticationFlow(realm, {
+    clientId: 'portal', requestedAcrs: ['urn:authme:loa:2'],
+  }), undefined);
 
   const user = await identities.createUser({ realm, username: 'member', email: 'member@example.test', passwordHash: 'hash' });
   const organization = await management.createOrganization(realm, { name: 'Example', alias: 'example', enabled: true, domains: [{ domain: 'example.test', verified: true }], identityProviderIds: [], attributes: {} });

@@ -37,7 +37,7 @@ Keycloak's current feature inventory includes OIDC/OAuth, SAML, identity brokeri
 | WebAuthn/passkeys | Implemented baseline | Fresh AuthMe registration and login; no Keycloak credential import or attestation policy |
 | Administration console | Implemented, AuthMe-native | Realm-scoped OIDC login, grants, users, credentials, audit, client registration, and safe configuration; not the Keycloak console or theme system |
 | Administration API | Implemented, AuthMe-native | Separate root bearer for automation; not Keycloak Admin REST compatible |
-| Realm/client role claims | Implemented | Keycloak-shaped JSON claims |
+| Realm/client role claims | Implemented | Keycloak-shaped JSON claims; portable same-namespace composite graphs are transformed and expanded |
 | Groups and roles | Implemented | Stable nested group paths, group roles, composite realm-role expansion, reusable client scopes, and configured claim mappers |
 | API audiences/JWT access tokens | Implemented | Exact configured RFC 8707 audiences; per-client and multi-resource policy; `typ: at+jwt`; audience-filtered scopes and role/group claims |
 | Pairwise subjects | Implemented | Realm- and client/sector-bound identifiers |
@@ -53,7 +53,7 @@ Keycloak's current feature inventory includes OIDC/OAuth, SAML, identity brokeri
 | SCIM 2.0 | Implemented | Users/Groups CRUD/PATCH, discovery, Bulk, sorting, supported full core filter grammar, pagination, and ETags; arbitrary extension schemas are not promised |
 | Account console | Implemented, AuthMe-native | Profile, password/recovery, email verification, TOTP/recovery codes, passkeys, sessions, and organization invitation acceptance |
 | Organizations | Implemented, AuthMe-native | Domains, invitations, memberships/roles, organization IdP policy, and authorization token context |
-| Authentication flows | Implemented, AuthMe-native | Client/ACR-selected password, TOTP, passkey, and federation steps with AMR and maximum-age enforcement |
+| Authentication flows | Implemented, AuthMe-native | Client/ACR-selected password, TOTP, passkey, and federation steps with AMR and maximum-age enforcement across browser, federation, and CIBA completion paths |
 | Signing/operations | Implemented code path | Encrypted backup/restore, HA/load rehearsal, and file/KMS/HSM signing-provider rotation; real hardware/DR drills remain external evidence |
 | Kerberos/SPNEGO | Not supported | No implementation |
 

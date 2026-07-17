@@ -29,6 +29,13 @@ test('realm roles compose without cycles and nested groups retain stable paths',
   const parent = await store.createGroup('master', { name: 'engineering', parentId: null, roles: ['reader'], attributes: {} });
   const child = await store.createGroup('master', { name: 'platform', parentId: parent.id, roles: ['editor'], attributes: {} });
   assert.equal(child.path, '/engineering/platform');
+  const cycleLeft = await store.createGroup('master', { name: 'cycle-left', parentId: null, roles: [], attributes: {} });
+  const cycleRight = await store.createGroup('master', { name: 'cycle-right', parentId: null, roles: [], attributes: {} });
+  const concurrentGroupCycle = await Promise.allSettled([
+    store.updateGroup('master', cycleLeft.id, { parentId: cycleRight.id }),
+    store.updateGroup('master', cycleRight.id, { parentId: cycleLeft.id }),
+  ]);
+  assert.equal(concurrentGroupCycle.filter(({ status }) => status === 'rejected').length, 1);
   await assert.rejects(store.updateGroup('master', parent.id, { parentId: child.id }), /cycle/iu);
   assert.deepEqual(await store.listGroups('staff'), []);
 });
@@ -75,17 +82,42 @@ test('client scopes aggregate safe claim mappers and authentication flows resolv
   await store.createClaimMapper('master', {
     ownerType: 'client', ownerId: 'portal', name: 'direct', mapperType: 'hardcoded', config: { claim: 'direct', value: true },
   });
+  await store.createAuthenticationFlow('master', {
+    alias: 'deleted-client-flow', description: '', enabled: true, priority: 5, clientIds: ['portal'],
+    acr: 'urn:authme:deleted-client', maxAgeSeconds: 300,
+    steps: [{ type: 'password', requirement: 'required' }],
+  });
+  await store.createAuthenticationFlow('master', {
+    alias: 'shared-client-flow', description: '', enabled: true, priority: 6, clientIds: ['portal', 'other'],
+    acr: 'urn:authme:shared-client', maxAgeSeconds: 300,
+    steps: [{ type: 'password', requirement: 'required' }],
+  });
   await store.deleteClientPolicy('master', 'portal');
   assert.deepEqual(await store.listClientScopeAssignments('master', 'portal'), []);
   assert.deepEqual(await store.listClaimMappers('master', 'client', 'portal'), []);
+  const remainingFlows = await store.listAuthenticationFlows('master');
+  assert.equal(remainingFlows.some(({ clientIds }) => clientIds.includes('portal')), false);
+  assert.deepEqual(remainingFlows.find(({ alias }) => alias === 'shared-client-flow').clientIds, ['other']);
 
   await store.createAuthenticationFlow('master', {
     alias: 'portal-step-up', description: '', enabled: true, priority: 10, clientIds: ['portal'],
     acr: 'urn:authme:portal:loa2', maxAgeSeconds: 300,
     steps: [{ type: 'password', requirement: 'required' }, { type: 'totp', requirement: 'required' }],
   });
+  await store.createAuthenticationFlow('master', {
+    alias: 'portal-passkey', description: '', enabled: true, priority: 20, clientIds: ['portal'],
+    acr: 'urn:authme:portal:passkey', maxAgeSeconds: 300,
+    steps: [{ type: 'passkey', requirement: 'required' }],
+  });
   const flow = await store.resolveAuthenticationFlow('master', { clientId: 'portal', requestedAcrs: ['urn:authme:portal:loa2'] });
   assert.equal(flow.alias, 'portal-step-up');
+  assert.equal((await store.resolveAuthenticationFlow('master', {
+    clientId: 'portal', requestedAcrs: ['urn:authme:portal:passkey', 'urn:authme:portal:loa2'],
+  })).alias, 'portal-passkey');
+  assert.equal(await store.resolveAuthenticationFlow('master', {
+    clientId: 'portal', requestedAcrs: ['urn:authme:loa:2'],
+  }), undefined);
+  assert.equal((await store.resolveAuthenticationFlow('master', { clientId: 'portal' })).alias, 'portal-step-up');
   assert.equal(authenticationSatisfiesFlow(flow, ['pwd', 'otp'], { totpConfirmed: true }), true);
   assert.equal(authenticationSatisfiesFlow(flow, ['pwd'], { totpConfirmed: true }), false);
 });
@@ -131,6 +163,22 @@ test('organizations isolate domains, memberships, invitations, and signing-key l
   await assert.rejects(store.updateOrganization('master', second.id, {
     domains: [{ domain: 'example.test', verified: false }],
   }), /domain/iu);
+  const concurrentOrganizations = await Promise.allSettled([
+    store.createOrganization('master', {
+      name: 'Concurrent one', alias: 'concurrent', enabled: true,
+      domains: [{ domain: 'concurrent.test', verified: false }], identityProviderIds: [], attributes: {},
+    }),
+    store.createOrganization('master', {
+      name: 'Concurrent two', alias: 'concurrent', enabled: true,
+      domains: [{ domain: 'concurrent.test', verified: false }], identityProviderIds: [], attributes: {},
+    }),
+  ]);
+  assert.equal(concurrentOrganizations.filter(({ status }) => status === 'rejected').length, 1);
+  await store.createOrganization('master', {
+    name: 'Alias collision', alias: organization.id, enabled: true,
+    domains: [], identityProviderIds: [], attributes: {},
+  });
+  assert.equal((await store.findOrganization('master', organization.id)).alias, 'example', 'UUID lookup did not take precedence over an alias');
   await store.upsertOrganizationMembership('master', organization.id, '00000000-0000-4000-8000-000000000001', ['owner']);
   assert.equal((await store.listUserOrganizations('master', '00000000-0000-4000-8000-000000000001'))[0].alias, 'example');
   assert.deepEqual(await store.listUserOrganizations('staff', '00000000-0000-4000-8000-000000000001'), []);
@@ -147,9 +195,16 @@ test('organizations isolate domains, memberships, invitations, and signing-key l
     id: '00000000-0000-4000-8000-000000000002', email: 'invitee@example.test',
   }), undefined);
   await store.updateOrganization('master', organization.id, { enabled: true });
-  assert.equal((await store.consumeOrganizationInvitation('master', 'a'.repeat(43), {
-    id: '00000000-0000-4000-8000-000000000002', email: 'invitee@example.test',
-  })).id, invitation.id);
+  const accepted = await Promise.all([
+    store.consumeOrganizationInvitation('master', 'a'.repeat(43), {
+      id: '00000000-0000-4000-8000-000000000002', email: 'invitee@example.test',
+    }),
+    store.consumeOrganizationInvitation('master', 'a'.repeat(43), {
+      id: '00000000-0000-4000-8000-000000000002', email: 'invitee@example.test',
+    }),
+  ]);
+  assert.equal(accepted.filter(Boolean).length, 1);
+  assert.equal(accepted.find(Boolean).id, invitation.id);
   const revoked = await store.createOrganizationInvitation('master', {
     organizationId: organization.id,
     email: 'revoked@example.test',

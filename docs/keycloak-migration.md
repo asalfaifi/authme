@@ -158,7 +158,7 @@ missing source user UUIDs are explicit warnings.
 | Disabled, bearer-only, or reserved client | Not emitted as a static OIDC client | Unsupported/skipped; bearer APIs need explicit resource-server policy |
 | Enabled SAML client | Downstream `AUTHME_SAML_IDP_JSON` service-provider registration | Exact HTTPS ACS; signed-request/encryption requirements are preserved only with usable exported public certificates; unsupported NameID/mappers/bindings are reported |
 | Realm and client roles | Separate role inventories and user namespaces | Direct for portable role names |
-| Composite role | Role name retained; transformer does not emit the composite graph | Warning; create/reconcile the graph through the mutable role API before cutover |
+| Composite role | Same-namespace realm or client composite graph | Direct when every target exists in the exported namespace and the graph is acyclic; cross-namespace, missing-target, and cyclic edges are omitted and reported as blockers |
 | Nested group | Canonical flattened path such as `/engineering/platform` | Direct path mapping |
 | Group role mapping | Retained on group and materialized onto affected users, including ancestors | Warning; AuthMe emits flat user entitlements |
 | User profile and assignments | AuthMe user fields, safe attributes, roles, group paths, client roles | Direct; email required and normalized lowercase |
@@ -186,7 +186,7 @@ Do not import active authorization codes, access tokens, refresh tokens, browser
 
 ### Claim mapper transformation
 
-For each Keycloak protocol mapper, write the expected claim name, source, type, scope, inclusion in ID/access/UserInfo responses, and audience. Map hardcoded, user-attribute, role, group, and organization cases to AuthMe client/client-scope claim mappers. Recreate and test composite-role graphs separately. Mark scripts, custom SPIs, authorization-service permissions, and unsupported transforms as blockers.
+For each Keycloak protocol mapper, write the expected claim name, source, type, scope, inclusion in ID/access/UserInfo responses, and audience. Map hardcoded, user-attribute, role, group, and organization cases to AuthMe client/client-scope claim mappers. Apply the emitted portable composite-role graphs through the realm/client role APIs and test their expanded claims. Mark cross-namespace composites, scripts, custom SPIs, authorization-service permissions, and unsupported transforms as blockers.
 
 ## Phase 5: credentials
 

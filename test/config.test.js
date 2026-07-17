@@ -225,6 +225,21 @@ test('realm, client, key, URL, and TTL validation fail closed', () => {
     () => loadConfig({ AUTHME_DEV_MODE: 'true', AUTHME_RESOURCE_SERVERS_JSON: '{not-json' }),
     /must contain valid JSON/,
   );
+  assert.throws(() => loadConfig({
+    AUTHME_DEV_MODE: 'true',
+    AUTHME_PUBLIC_URL: 'https://login.example.test',
+    AUTHME_OIDC_PROVIDERS_JSON: JSON.stringify({ master: [{
+      id: 'shared-provider', display_name: 'OIDC provider', issuer: 'https://oidc.example.test',
+      authorization_endpoint: 'https://oidc.example.test/authorize',
+      token_endpoint: 'https://oidc.example.test/token', jwks_uri: 'https://oidc.example.test/jwks',
+      client_id: 'authme', client_secret: 'not-a-production-secret',
+    }] }),
+    AUTHME_SAML_PROVIDERS_JSON: JSON.stringify({ master: [{
+      id: 'shared-provider', display_name: 'SAML provider',
+      idp_entity_id: 'https://saml.example.test/metadata', idp_sso_url: 'https://saml.example.test/sso',
+      idp_signing_certificates: ['A'.repeat(128)],
+    }] }),
+  }), /duplicated across OIDC and SAML/iu);
   assert.throws(
     () => loadConfig({
       AUTHME_DEV_MODE: 'true',

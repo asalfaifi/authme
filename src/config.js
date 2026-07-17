@@ -21,6 +21,21 @@ const moduleSpecifier = z.preprocess(
   z.string().trim().min(1).max(2048).refine((value) => !/[\r\n\0]/u.test(value), 'module specifier contains invalid characters').optional(),
 );
 
+function assertFederationProviderIdsUnique(realms, catalogs) {
+  for (const realm of realms) {
+    const seen = new Map();
+    for (const [kind, providers] of catalogs) {
+      for (const provider of providers[realm] ?? []) {
+        const existing = seen.get(provider.id);
+        if (existing) {
+          throw new Error(`Realm ${realm} federation provider id ${provider.id} is duplicated across ${existing} and ${kind}`);
+        }
+        seen.set(provider.id, kind);
+      }
+    }
+  }
+}
+
 const rawSchema = z.object({
   AUTHME_PUBLIC_URL: z.string().url().optional(),
   AUTHME_PORT: z.coerce.number().int().min(1).max(65535).optional(),
@@ -386,6 +401,14 @@ export function loadConfig(environment = process.env) {
 
   const clients = clientsByRealm(raw.AUTHME_CLIENTS_JSON, realms);
   const normalizedPublicUrl = publicUrl.toString().replace(/\/$/, '');
+  const ldapProviders = parseLdapProviders(raw.AUTHME_LDAP_PROVIDERS_JSON, { realms, devMode });
+  const oidcProviders = parseOidcProviders(raw.AUTHME_OIDC_PROVIDERS_JSON, { realms, devMode });
+  const samlProviders = parseSamlProviders(raw.AUTHME_SAML_PROVIDERS_JSON, {
+    realms, publicUrl: normalizedPublicUrl,
+  });
+  assertFederationProviderIdsUnique(realms, [
+    ['LDAP', ldapProviders], ['OIDC', oidcProviders], ['SAML', samlProviders],
+  ]);
   const config = {
     devMode,
     trustProxy: raw.AUTHME_TRUST_PROXY,
@@ -405,9 +428,9 @@ export function loadConfig(environment = process.env) {
     accountEmailModule: raw.AUTHME_ACCOUNT_EMAIL_MODULE,
     clientsByRealm: clients,
     resourceServersByRealm: resourceServersByRealm(raw.AUTHME_RESOURCE_SERVERS_JSON, realms, devMode),
-    ldapProvidersByRealm: parseLdapProviders(raw.AUTHME_LDAP_PROVIDERS_JSON, { realms, devMode }),
-    oidcProvidersByRealm: parseOidcProviders(raw.AUTHME_OIDC_PROVIDERS_JSON, { realms, devMode }),
-    samlProvidersByRealm: parseSamlProviders(raw.AUTHME_SAML_PROVIDERS_JSON, { realms, publicUrl: normalizedPublicUrl }),
+    ldapProvidersByRealm: ldapProviders,
+    oidcProvidersByRealm: oidcProviders,
+    samlProvidersByRealm: samlProviders,
     samlIdentityProvidersByRealm: parseSamlIdentityProviders(raw.AUTHME_SAML_IDP_JSON, {
       realms, publicUrl: normalizedPublicUrl,
     }),

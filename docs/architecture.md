@@ -169,9 +169,9 @@ Scopes belonging only to another resource are not copied into the token.
 
 AuthMe v0.4 implements [OpenID CIBA Core 1.0](https://openid.net/specs/openid-client-initiated-backchannel-authentication-core-1_0.html) for confidential clients in poll mode. A CIBA client registers the `urn:openid:params:grant-type:ciba` grant, `backchannel_token_delivery_mode: poll`, and a non-`none` token endpoint authentication method. The backchannel authentication endpoint accepts the same confidential client authentication methods as the token endpoint, including `private_key_jwt`. Ping and push delivery are outside this release.
 
-Plain `login_hint` values resolve only inside the issuer realm through the canonical, uniqueness-constrained username/email namespace. Unknown, disabled, locked, malformed, and unsupported token hints fail with bounded generic protocol errors that do not echo the hint. Signed CIBA Request Objects require an expiring one-use `jti`. The resulting high-entropy `auth_req_id` is stored as a realm- and account-bound `BackchannelAuthenticationRequest`; disabled accounts, security-version changes, expiry, client mismatch, and cross-realm lookup invalidate it.
+Plain `login_hint` values resolve only inside the issuer realm through the canonical, uniqueness-constrained username/email namespace. Unknown, disabled, locked, malformed, and unsupported token hints fail with bounded generic protocol errors that do not echo the hint. Signed CIBA Request Objects require an expiring one-use `jti`. The resulting high-entropy `auth_req_id` is stored as a realm- and account-bound `BackchannelAuthenticationRequest`; disabled accounts, security-version changes, expiry, client mismatch, and cross-realm lookup invalidate it. The authentication-device callback receives the ordered requested ACRs and the applicable client authentication flow. Completion accepts only evidence whose ACR is requested, whose AMR satisfies that flow, and whose authentication time remains inside its maximum age.
 
-The provider persists the request before invoking the authentication-device hook. A trusted integration registers one handler through `authmeCiba.setAuthenticationDeviceHandler`; the handler receives only the realm, request/account/client identifiers, binding message, expiry, and requested scopes, then dispatches through the deployment's authentication-device channel. Production never auto-approves: after authenticating the user and obtaining authorization, the integration calls `authmeCiba.complete` with the account, decision, ACR, AMR, and authentication time. Development mode exposes `authmeCiba.approveForDevelopment` for deterministic integration tests; that helper is rejected outside development mode.
+The provider persists the request before invoking the authentication-device hook. A trusted integration registers one handler through `authmeCiba.setAuthenticationDeviceHandler`; the handler receives only the realm, request/account/client identifiers, binding message, expiry, requested scopes/ACRs, and the safe public authentication-flow requirement, then dispatches through the deployment's authentication-device channel. Production never auto-approves: after authenticating the user and obtaining authorization, the integration calls `authmeCiba.complete` with the account, decision, ACR, AMR, and authentication time. Development mode exposes `authmeCiba.approveForDevelopment` for deterministic integration tests; that helper is rejected outside development mode.
 
 Poll acknowledgements advertise a minimum interval. Each token poll atomically advances a PostgreSQL-backed per-request deadline; an early or overlapping request returns `slow_down` and increases the interval, while a timely incomplete request returns `authorization_pending`. Approval is a one-way compare-and-update transition, and successful redemption consumes the request once. PostgreSQL therefore enforces the same behavior across replicas; the memory adapter mirrors it only for development and tests.
 
@@ -373,6 +373,11 @@ definition catalog; their composites may reference only roles in the same
 client namespace and expand before the Keycloak-shaped `resource_access`
 filter is applied. Client- and client-scope-owned claim mappers add only their
 configured hardcoded, user-attribute, role, group, or organization claims.
+
+The Keycloak transformer preserves acyclic realm-to-realm and same-client
+composite edges in its role catalog. Cross-namespace, missing-target, and cyclic
+edges are omitted with compatibility blockers because the native role APIs
+would reject or cannot represent them.
 
 ## End-user account console
 

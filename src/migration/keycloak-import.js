@@ -330,40 +330,125 @@ function safeRoleNames(value, path, report, item, target) {
   return uniqueSorted(result);
 }
 
+function portableCompositeNames(input, path, report, namespace) {
+  const graph = optionalRecord(input.composites, `${path}.composites`);
+  const realmComposites = normalizeStringList(graph.realm, `${path}.composites.realm`);
+  const clientComposites = namespaceEntries(graph.client, `${path}.composites.client`)
+    .sort(([left], [right]) => compare(left, right));
+  const portable = namespace.type === 'realm'
+    ? realmComposites
+    : normalizeStringList(
+      Object.fromEntries(clientComposites)[namespace.clientId],
+      `${path}.composites.client.${namespace.clientId}`,
+    );
+  const rejected = namespace.type === 'realm'
+    ? clientComposites.flatMap(([clientId, names]) => normalizeStringList(
+      names, `${path}.composites.client.${clientId}`,
+    ).map((name) => `${clientId}:${name}`))
+    : [
+      ...realmComposites.map((name) => `realm:${name}`),
+      ...clientComposites.filter(([clientId]) => clientId !== namespace.clientId)
+        .flatMap(([clientId, names]) => normalizeStringList(
+          names, `${path}.composites.client.${clientId}`,
+        ).map((name) => `${clientId}:${name}`)),
+    ];
+  for (const name of rejected) {
+    report.unsupported('role-composite', `${path}.composites`, namespace.target, `${namespace.item}:${name}`,
+      'AuthMe composite roles cannot cross realm/client namespaces; this edge was omitted.');
+  }
+  const accepted = [];
+  for (const name of portable) {
+    if (!roleNamePattern.test(name)) {
+      report.unsupported('role-composite', `${path}.composites`, namespace.target, `${namespace.item}:${name}`,
+        'Composite role name is outside AuthMe\'s portable role-name profile.');
+    } else {
+      accepted.push(name);
+    }
+  }
+  const hasExportedGraph = realmComposites.length > 0
+    || clientComposites.some(([, names]) => normalizeStringList(names, `${path}.composites.client`).length > 0);
+  if (input.composite === true && !hasExportedGraph) {
+    report.unsupported('role-composite', `${path}.composites`, namespace.target, namespace.item,
+      'The role is marked composite but its export contains no composite graph.');
+  }
+  return uniqueSorted(accepted);
+}
+
 function mapRoleList(value, path, report, namespace) {
   const names = new Set();
-  const roles = [];
+  const candidates = [];
   for (const [index, raw] of optionalArray(value, path).entries()) {
-    const input = record(raw, `${path}[${index}]`);
-    optionalBooleans(input, `${path}[${index}]`, ['composite', 'clientRole']);
-    const name = requiredString(input.name, `${path}[${index}].name`);
+    const rolePath = `${path}[${index}]`;
+    const input = record(raw, rolePath);
+    optionalBooleans(input, rolePath, ['composite', 'clientRole']);
+    const name = requiredString(input.name, `${rolePath}.name`);
     if (!roleNamePattern.test(name)) {
-      report.unsupported('role', `${path}[${index}]`, `roles.${namespace}`, name,
+      report.unsupported('role', rolePath, namespace.target, name,
         'Role name is outside AuthMe\'s portable role-name profile.');
       continue;
     }
-    if (names.has(name)) invalid(`${path}[${index}].name`, `duplicates role ${name}`);
+    if (names.has(name)) invalid(`${rolePath}.name`, `duplicates role ${name}`);
     names.add(name);
-    roles.push({
-      name,
-      ...(optionalString(input.description, `${path}[${index}].description`) ? { description: input.description.trim() } : {}),
+    candidates.push({ input, name, path: rolePath });
+  }
+  const rolePaths = new Map(candidates.map(({ name, path: rolePath }) => [name, rolePath]));
+  const roles = candidates.map(({ input, name, path: rolePath }) => {
+    const composites = portableCompositeNames(input, rolePath, report, {
+      ...namespace, item: name,
     });
-    if (input.composite === true || (isRecord(input.composites) && Object.keys(input.composites).length)) {
-      report.warning('role', `${path}[${index}].composites`, `roles.${namespace}`, name,
-        'The role name was retained, but composite-role expansion is not supported and must be materialized explicitly.');
-    } else {
-      report.mapped('role', `${path}[${index}]`, `roles.${namespace}`, name);
+    const missing = composites.filter((composite) => !names.has(composite));
+    for (const composite of missing) {
+      report.unsupported('role-composite', `${rolePath}.composites`, namespace.target, `${name}:${composite}`,
+        'Composite target is not present in the same exported role namespace; this edge was omitted.');
+    }
+    const role = {
+      name,
+      description: optionalString(input.description, `${rolePath}.description`) ?? '',
+      composites: composites.filter((composite) => names.has(composite)),
+      attributes: normalizeAttributes(input.attributes, `${rolePath}.attributes`, report, name, {
+        category: 'role-attribute', target: `${namespace.target}[].attributes`,
+      }),
+    };
+    report.mapped('role', rolePath, namespace.target, name);
+    return role;
+  }).sort((left, right) => compare(left.name, right.name));
+  const acceptedGraph = new Map(roles.map(({ name }) => [name, []]));
+  const reaches = (start, target, visited = new Set()) => {
+    if (start === target) return true;
+    if (visited.has(start)) return false;
+    visited.add(start);
+    return (acceptedGraph.get(start) ?? []).some((next) => reaches(next, target, visited));
+  };
+  for (const role of roles) {
+    const accepted = [];
+    for (const composite of role.composites) {
+      if (reaches(composite, role.name)) {
+        report.unsupported('role-composite', `${rolePaths.get(role.name)}.composites`, namespace.target,
+          `${role.name}:${composite}`, 'Composite edge would create a cycle and was omitted.');
+      } else {
+        accepted.push(composite);
+        acceptedGraph.get(role.name).push(composite);
+      }
+    }
+    role.composites = accepted;
+    if (accepted.length) {
+      report.mapped('role-composite', `${rolePaths.get(role.name)}.composites`,
+        `${namespace.target}[].composites`, role.name);
     }
   }
-  return roles.sort((left, right) => compare(left.name, right.name));
+  return roles;
 }
 
 function mapRoles(source, report) {
   const input = optionalRecord(source.roles, 'roles');
-  const realm = mapRoleList(input.realm, 'roles.realm', report, 'realm');
+  const realm = mapRoleList(input.realm, 'roles.realm', report, {
+    type: 'realm', target: 'roles.realm',
+  });
   const clients = [];
   for (const [clientId, roles] of namespaceEntries(input.client, 'roles.client').sort(([left], [right]) => compare(left, right))) {
-    clients.push([clientId, mapRoleList(roles, `roles.client.${clientId}`, report, `clients.${clientId}`)]);
+    clients.push([clientId, mapRoleList(roles, `roles.client.${clientId}`, report, {
+      type: 'client', clientId, target: `roles.clients.${clientId}`,
+    })]);
   }
   return { realm, clients: sortedRecord(clients) };
 }

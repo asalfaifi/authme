@@ -228,7 +228,7 @@ test('account deletion atomically removes the user and realm-scoped provider sta
   }
 });
 
-test('managed client deletion atomically removes grants, tokens, scope assignments, mappers, and client roles', { skip: !databaseUrl }, async () => {
+test('managed client deletion atomically removes policy, user assignments, and affected account grants', { skip: !databaseUrl }, async () => {
   const data = await createDataLayer({ databaseUrl, devMode: false, realms: [realm] });
   try {
     const clientId = `managed-${randomUUID().slice(0, 8)}`;
@@ -244,22 +244,40 @@ test('managed client deletion atomically removes grants, tokens, scope assignmen
     await data.management.putClientRole(realm, clientId, {
       name: 'reader', description: '', composites: [], attributes: {},
     });
+    await data.management.createAuthenticationFlow(realm, {
+      alias: `flow-${randomUUID().slice(0, 8)}`, description: '', enabled: true, priority: 10,
+      clientIds: [clientId], acr: `urn:test:${clientId}`, maxAgeSeconds: 300,
+      steps: [{ type: 'password', requirement: 'required' }],
+    });
     const Adapter = data.adapterFor(realm);
     const grants = new Adapter('Grant');
     const tokens = new Adapter('AccessToken');
     const user = await data.store.createUser({
       realm, username: `managed-${randomUUID().slice(0, 8)}`, email: `${randomUUID()}@example.test`, passwordHash: 'hash',
+      clientRoles: { [clientId]: ['reader'] },
     });
+    const initialSecurityVersion = user.securityVersion;
     await grants.upsert('managed-delete-grant', { clientId, accountId: user.id }, 600);
     await tokens.upsert('managed-delete-token', { clientId, accountId: user.id, grantId: 'managed-delete-grant' }, 600);
+    await grants.upsert('managed-delete-account-grant', { clientId: 'other-client', accountId: user.id }, 600);
+    await tokens.upsert('managed-delete-account-token', {
+      clientId: 'other-client', accountId: user.id, grantId: 'managed-delete-account-grant',
+    }, 600);
 
     assert.equal(await data.deleteManagedClient(realm, clientId), true);
     assert.equal(await new Adapter('Client').find(clientId), undefined);
     assert.equal(await grants.find('managed-delete-grant'), undefined);
     assert.equal(await tokens.find('managed-delete-token'), undefined);
+    assert.equal(await grants.find('managed-delete-account-grant'), undefined);
+    assert.equal(await tokens.find('managed-delete-account-token'), undefined);
     assert.deepEqual(await data.management.listClientScopeAssignments(realm, clientId), []);
     assert.deepEqual(await data.management.listClaimMappers(realm, 'client', clientId), []);
     assert.deepEqual(await data.management.listClientRoles(realm, clientId), []);
+    assert.equal((await data.management.listAuthenticationFlows(realm))
+      .some((flow) => flow.clientIds.includes(clientId)), false);
+    const reconciledUser = await data.store.findUserById(realm, user.id);
+    assert.deepEqual(reconciledUser.clientRoles, {});
+    assert(reconciledUser.securityVersion > initialSecurityVersion);
     assert.equal(await data.deleteManagedClient(realm, clientId), false);
   } finally {
     await data.close();
