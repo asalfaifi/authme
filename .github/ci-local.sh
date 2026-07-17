@@ -10,6 +10,9 @@ docker() {
 suffix="${GITHUB_RUN_ID:-local}-$$"
 postgres_container="universal-ci-authme-postgres-${suffix}"
 redis_container="universal-ci-authme-redis-${suffix}"
+postgres_image="postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193"
+redis_image="redis:7.4-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99"
+startup_log="${RUNNER_TEMP:-/tmp}/authme-services-${suffix}.log"
 
 cleanup() {
   docker rm -f "$postgres_container" "$redis_container" >/dev/null 2>&1 || true
@@ -17,21 +20,25 @@ cleanup() {
 trap cleanup EXIT
 
 started=false
-for _ in {1..5}; do
+for _ in {1..10}; do
   cleanup
   if docker run --pull=never --detach --rm --name "$postgres_container" \
       --env POSTGRES_DB=authme_test \
       --env POSTGRES_USER=authme \
       --env POSTGRES_PASSWORD=authme-ci-only \
-      --publish 127.0.0.1::5432 postgres:17-alpine >/dev/null && \
+      --publish 127.0.0.1::5432 "$postgres_image" >>"$startup_log" 2>&1 && \
     docker run --pull=never --detach --rm --name "$redis_container" \
-      --publish 127.0.0.1::6379 redis:7.4-alpine >/dev/null; then
+      --publish 127.0.0.1::6379 "$redis_image" >>"$startup_log" 2>&1; then
     started=true
     break
   fi
-  sleep 2
+  sleep 3
 done
-[[ "$started" == "true" ]]
+if [[ "$started" != "true" ]]; then
+  printf 'Unable to start AuthMe integration services after 10 attempts:\n' >&2
+  cat "$startup_log" >&2
+  exit 1
+fi
 
 for _ in {1..60}; do
   if docker exec "$postgres_container" pg_isready -U authme -d authme_test >/dev/null 2>&1 && \
