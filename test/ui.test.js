@@ -6,6 +6,7 @@ import {
   renderDeviceInput,
   renderDeviceSuccess,
   renderLogin,
+  renderRegistration,
   renderLogoutConfirmation,
   renderLogoutSuccess,
 } from '../src/ui/render.js';
@@ -44,6 +45,18 @@ test('authentication pages escape client-controlled display values', () => {
   assert.match(federated, /value="provider-bound-csrf"/);
   assert.match(federated, /Continue with &lt;Corporate SSO&gt;/);
   assert.doesNotMatch(federated, /Continue with <Corporate SSO>/);
+
+  const registrationLogin = renderLogin({
+    realm: 'master', uid: 'signup', csrfToken: 'csrf', clientName: attack, allowRegistration: true,
+  });
+  assert.match(registrationLogin, /interaction\/signup\/register/u);
+  assert.doesNotMatch(registrationLogin, /New to <img/u);
+  const registration = renderRegistration({
+    realm: 'master', uid: 'signup', csrfToken: 'csrf', clientName: attack,
+    username: attack, email: 'user@example.test', name: attack,
+  });
+  assert.doesNotMatch(registration, /<img src=x/u);
+  assert.match(registration, /name="passwordConfirmation"/u);
 });
 
 test('device input embeds only the provider-generated form slot', () => {

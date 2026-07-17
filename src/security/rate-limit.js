@@ -22,6 +22,7 @@ export function createRateLimits(config, logger) {
   const passwordResetIp = limiter(redis, { keyPrefix: 'authme:password-reset:ip', points: 10, duration: 3600, blockDuration: 3600 });
   const passwordResetAccount = limiter(redis, { keyPrefix: 'authme:password-reset:account', points: 3, duration: 3600, blockDuration: 3600 });
   const registration = limiter(redis, { keyPrefix: 'authme:registration', points: 30, duration: 60, blockDuration: 60 });
+  const userRegistration = limiter(redis, { keyPrefix: 'authme:user-registration', points: 5, duration: 900, blockDuration: 900 });
   const deviceVerification = limiter(redis, { keyPrefix: 'authme:device:verify', points: 30, duration: 60, blockDuration: 60 });
 
   function opaqueKey(domain, value) {
@@ -48,6 +49,9 @@ export function createRateLimits(config, logger) {
     },
     async consumeRegistration(ip) {
       await registration.consume(opaqueKey('registration-ip', ip));
+    },
+    async consumeUserRegistration(ip) {
+      await userRegistration.consume(opaqueKey('user-registration-ip', ip));
     },
     async consumeDeviceVerification(ip) {
       await deviceVerification.consume(opaqueKey('device-ip', ip));

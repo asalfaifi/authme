@@ -24,6 +24,7 @@ import { createWebAuthn } from './security/webauthn.js';
 import { renderError } from './ui/render.js';
 
 const cssPath = fileURLToPath(new URL('./ui/authme.css', import.meta.url));
+const registrationCssPath = fileURLToPath(new URL('./ui/authme-registration.css', import.meta.url));
 const passkeyCssPath = fileURLToPath(new URL('./ui/authme-passkeys.css', import.meta.url));
 const passkeyScriptPath = fileURLToPath(new URL('./ui/authme-passkeys.js', import.meta.url));
 const packageVersion = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')).version;
@@ -245,6 +246,11 @@ export async function createAuthMeApp(config, overrides = {}) {
     app.get('/assets/authme.css', async (_req, res, next) => {
       try {
         res.set('Cache-Control', 'public, max-age=3600').type('text/css').send(await readFile(cssPath, 'utf8'));
+      } catch (error) { next(error); }
+    });
+    app.get('/assets/authme-registration.css', async (_req, res, next) => {
+      try {
+        res.type('text/css').set('Cache-Control', 'public, max-age=3600').send(await readFile(registrationCssPath, 'utf8'));
       } catch (error) { next(error); }
     });
     app.get('/assets/authme-passkeys.css', async (_req, res, next) => {

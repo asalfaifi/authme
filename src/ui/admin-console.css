@@ -376,6 +376,13 @@ input:disabled, select:disabled, textarea:disabled { cursor: not-allowed; opacit
 .security-action span { display: block; margin-top: 2px; color: var(--muted); font-size: 9px; }
 
 .catalog-grid { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 13px; }
+.catalog-grid > .empty-state:only-child { grid-column: 1 / -1; }
+.federation-protocol-grid { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 18px; align-items: stretch; }
+.federation-protocol-grid > .content-card { height: 100%; }
+.federation-protocol-grid .catalog-grid { grid-template-columns: 1fr; }
+.federation-protocol-grid .catalog-card > p { min-height: 0; }
+.federation-support-grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 18px; align-items: start; }
+.federation-support-grid .catalog-grid { grid-template-columns: repeat(auto-fit,minmax(210px,1fr)); }
 .catalog-card { min-width: 0; padding: 17px; border: 1px solid var(--line); border-radius: 14px; background: var(--surface); box-shadow: var(--shadow-sm); }
 .catalog-card-header { display: flex; justify-content: space-between; gap: 12px; align-items: start; }
 .catalog-card-icon { width: 37px; height: 37px; display: grid; place-items: center; border-radius: 12px; background: var(--brand-soft); color: var(--brand); font-size: 12px; font-weight: 850; }
@@ -470,6 +477,7 @@ input:disabled, select:disabled, textarea:disabled { cursor: not-allowed; opacit
   .operator-avatar { display: none; }
   .stats-grid { grid-template-columns: repeat(2,minmax(0,1fr)); }
   .catalog-grid { grid-template-columns: repeat(2,minmax(0,1fr)); }
+  .federation-protocol-grid { grid-template-columns: repeat(2,minmax(0,1fr)); }
 }
 
 @media (max-width: 860px) {
@@ -477,6 +485,7 @@ input:disabled, select:disabled, textarea:disabled { cursor: not-allowed; opacit
   .admin-login-story { display: none; }
   .mobile-brand-mark { width: 38px; height: 38px; display: grid; place-items: center; margin-bottom: 18px; border-radius: 12px; background: linear-gradient(145deg,var(--brand),#4d40c8); color: #fff; font-weight: 850; }
   .content-grid, .content-grid.equal { grid-template-columns: 1fr; }
+  .federation-protocol-grid, .federation-support-grid { grid-template-columns: 1fr; }
   .security-actions { grid-template-columns: 1fr; }
   .detail-hero { grid-template-columns: auto minmax(0,1fr); }
   .detail-actions { grid-column: 1/-1; justify-content: flex-start; }

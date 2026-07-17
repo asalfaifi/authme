@@ -17,6 +17,7 @@ function shell({ title, realm, body, scripts = '' }) {
   <meta name="referrer" content="no-referrer">
   <title>${escapeHtml(title)} · AuthMe</title>
   <link rel="stylesheet" href="/assets/authme.css">
+  <link rel="stylesheet" href="/assets/authme-registration.css">
   <link rel="stylesheet" href="/assets/authme-passkeys.css">
 </head>
 <body>
@@ -43,6 +44,7 @@ export function renderLogin({
   login = '',
   error = '',
   federationProviders = [],
+  allowRegistration = false,
 }) {
   const federation = federationProviders.map((provider) => `
         <form method="post" action="/realms/${encodeURIComponent(realm)}/interaction/${encodeURIComponent(uid)}/federation/${encodeURIComponent(provider.extensionId)}/${encodeURIComponent(provider.providerId)}">
@@ -67,8 +69,39 @@ export function renderLogin({
         data-passkey-verify="/realms/${encodeURIComponent(realm)}/interaction/${encodeURIComponent(uid)}/passkey">Sign in with a passkey</button>
       <p class="passkey-status" data-passkey-status aria-live="polite"></p>
       ${federation ? `<div class="federation-options" aria-label="Federated sign-in options">${federation}</div>` : ''}
+      ${allowRegistration ? `<div class="registration-prompt"><span>New to ${escapeHtml(clientName)}?</span><a class="secondary" href="/realms/${encodeURIComponent(realm)}/interaction/${encodeURIComponent(uid)}/register">Create an account</a></div>` : ''}
       <p class="fine-print">Protected by PKCE, short-lived sessions, brute-force controls, and auditable access.</p>`,
     scripts: '<script type="module" src="/assets/authme-passkeys.js"></script>',
+  });
+}
+
+export function renderRegistration({
+  realm,
+  uid,
+  csrfToken,
+  clientName,
+  username = '',
+  email = '',
+  name = '',
+  error = '',
+}) {
+  const interactionPath = `/realms/${encodeURIComponent(realm)}/interaction/${encodeURIComponent(uid)}`;
+  return shell({
+    title: 'Create account',
+    realm,
+    body: `<div class="heading"><p class="eyebrow">Realm account</p><h1 id="page-title">Create your account</h1><p>Register in <strong>${escapeHtml(realm)}</strong> to continue to <strong>${escapeHtml(clientName)}</strong>.</p></div>
+      ${errorBanner(error)}
+      <form method="post" action="${interactionPath}/register" autocomplete="on">
+        <input type="hidden" name="csrf" value="${escapeHtml(csrfToken)}">
+        <label>Username<input name="username" value="${escapeHtml(username)}" autocomplete="username" maxlength="128" pattern="[a-zA-Z0-9._@+\\-]+" required autofocus></label>
+        <label>Email address<input name="email" type="email" value="${escapeHtml(email)}" autocomplete="email" maxlength="254" required></label>
+        <label>Display name <span class="optional">optional</span><input name="name" value="${escapeHtml(name)}" autocomplete="name" maxlength="255"></label>
+        <label>Password<input name="password" type="password" autocomplete="new-password" minlength="12" maxlength="1024" required></label>
+        <label>Confirm password<input name="passwordConfirmation" type="password" autocomplete="new-password" minlength="12" maxlength="1024" required></label>
+        <button class="primary" type="submit">Create account and continue</button>
+      </form>
+      <a class="back-link" href="${interactionPath}">Back to sign in</a>
+      <p class="fine-print">This account belongs only to the ${escapeHtml(realm)} realm. Other realms remain isolated.</p>`,
   });
 }
 

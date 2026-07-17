@@ -217,6 +217,15 @@ test('realm, client, key, URL, and TTL validation fail closed', () => {
     /must be an object keyed by realm/,
   );
   assert.throws(
+    () => loadConfig({
+      AUTHME_DEV_MODE: 'true',
+      AUTHME_CLIENTS_JSON: JSON.stringify({ master: [{
+        client_id: 'invalid-registration-policy', allow_user_registration: 'yes',
+      }] }),
+    }),
+    /allow_user_registration must be a boolean/,
+  );
+  assert.throws(
     () => loadConfig({ AUTHME_DEV_MODE: 'true', AUTHME_SIGNING_ADAPTER_MODULES_JSON: JSON.stringify({ unsupported: 'adapter' }) }),
     /not a supported external signing provider/,
   );

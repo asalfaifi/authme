@@ -63,6 +63,12 @@ Deletion is realm-scoped and idempotent. The first successful deletion writes `a
 
 The configuration catalog returns the realm issuer, deployment/storage mode, Redis and dynamic-registration status, TTLs, safe client/resource-server metadata, federation provider metadata, SCIM token identifiers, and extension capabilities. It deliberately excludes client secrets, LDAP bind credentials, upstream client secrets, SAML private keys, SCIM bearer values, private JWK members, cookie/CSRF/password/encryption secrets, and the root token. Treat even this sanitized catalog as privileged operational metadata.
 
+## Tenant realms and application registration
+
+`AUTHME_REALMS` defines the deployment's immutable issuer set. Every configured realm receives a separate provider, issuer, user namespace, client namespace, session/grant namespace, signing-key inventory, federation catalog, audit stream, and administrator login. The console lists all realms visible to the administrator and switching realms performs a new Authorization Code + PKCE login rather than reusing another realm's session.
+
+An OIDC client may set the AuthMe extension metadata `allow_user_registration: true`. During that client's login interaction, AuthMe then offers local account creation in the current realm. The option defaults to false, is not inherited between realms, and is suppressed when an organization context is requested. Registration requires an interaction-bound CSRF token, is independently rate-limited, applies the normal password policy and uniqueness constraints, records `identity.registration.succeeded`, and signs the new account in only when the client's authentication flow accepts password LoA1. AuthMe never silently creates an account from unverified client input.
+
 ## Client and authorization-model operations
 
 | Resource | Operations | Notes |

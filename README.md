@@ -9,6 +9,7 @@ AuthMe uses the current OpenID/FAPI-certified [`oidc-provider`](https://github.c
 ## What works
 
 - Realm issuers at `https://host/realms/{realm}` with Keycloak-compatible endpoint paths.
+- Strict tenant isolation across realm users, clients, sessions, grants, federation links, signing keys, audit records, and administrator sessions.
 - Authorization Code with mandatory PKCE `S256`; implicit and password grants are excluded.
 - Short-lived access tokens, rotating refresh tokens, and token-family revocation on replay.
 - Client Credentials, Device Authorization, PAR, DPoP, UserInfo, introspection, revocation, RP-initiated logout, and back-channel logout.
@@ -27,6 +28,7 @@ AuthMe uses the current OpenID/FAPI-certified [`oidc-provider`](https://github.c
 - Encrypted database/JWKS backup and verified restore, HA/load rehearsal commands, signed release artifacts with SBOM, and file/KMS/HSM signing-provider rotation paths.
 - Optional Redis-backed shared rate limiting, non-root container, read-only runtime filesystem, and fail-closed production configuration.
 - Dynamic registration only when explicitly enabled and protected by an independent initial-access token.
+- Per-client, opt-in local account creation with CSRF protection, dedicated rate limits, audit events, and immediate OIDC continuation.
 
 The v1.0 boundary still excludes Kerberos/SPNEGO, RADIUS, X.509 end-user login, SAML artifact binding and broker-side assertion decryption, UMA/Authorization Services, Keycloak Admin REST/SPI/theme compatibility, multi-region active/active writes, imported Keycloak WebAuthn credentials, and WebAuthn attestation-policy enforcement. See [federation and provisioning](docs/federation-and-provisioning.md) and the [roadmap](docs/roadmap.md).
 
@@ -38,6 +40,14 @@ Requirements: Node.js 22.12 or newer.
 npm ci
 AUTHME_DEV_MODE=true npm start
 ```
+
+To exercise tenant switching and realm isolation locally, start more than one realm:
+
+```bash
+AUTHME_DEV_MODE=true AUTHME_REALMS=master,acme,partners npm start
+```
+
+Each realm has an independent issuer below `/realms/{realm}` and an independent development administrator. The administration console realm selector starts a fresh OIDC session when switching realms.
 
 Then open the discovery document:
 

@@ -218,3 +218,63 @@ test('client scopes can be unassigned from a client in the admin console', async
   assert.equal(request.options.method, 'DELETE');
   assert.equal(request.options.headers.get('x-authme-csrf'), 'csrf-token');
 });
+
+test('federation catalog uses responsive protocol and provisioning groups', async () => {
+  const elements = new Map();
+  const element = (id) => {
+    if (!elements.has(id)) elements.set(id, new FakeElement(id));
+    return elements.get(id);
+  };
+  const document = {
+    title: '',
+    getElementById: element,
+    createElement: (tagName) => new FakeElement(tagName),
+    querySelectorAll: () => [],
+  };
+  const window = {
+    location: { origin: 'http://authme.test', hash: '', replace() {}, reload() {} },
+    history: { replaceState() {} },
+    addEventListener() {},
+    setTimeout() {},
+  };
+  const source = await readFile(new URL('../src/ui/admin-console.js', import.meta.url), 'utf8');
+  const context = {
+    AbortController,
+    Headers,
+    Response,
+    URL,
+    document,
+    fetch: async () => new Response(JSON.stringify({ title: 'Administrator sign-in required' }), {
+      status: 401,
+      headers: { 'content-type': 'application/problem+json' },
+    }),
+    navigator: {},
+    setTimeout,
+    window,
+  };
+  vm.runInNewContext(`${source}\nglobalThis.__renderFederation = renderFederation; globalThis.__state = state;`, context, {
+    filename: 'admin-console.js',
+  });
+  context.__state.realm = 'master';
+  context.__state.session = { permissions: ['configuration.read'] };
+  context.__state.configuration = {
+    federation: {
+      ldap: [{ id: 'directory', displayName: 'Directory', enabled: true, jitProvisioning: true }],
+      oidc: [],
+      saml: [],
+    },
+    scim: { enabled: false },
+    extensions: [{ id: 'builtin.ldap', kind: 'federation', capabilities: ['authenticate'] }],
+  };
+
+  await context.__renderFederation();
+  const descendants = (node) => [node, ...node.children.flatMap(descendants)];
+  const rendered = descendants(element('page-content'));
+  const protocolGrid = rendered.find((node) => node.className === 'federation-protocol-grid');
+  const supportGrid = rendered.find((node) => node.className === 'federation-support-grid');
+  assert(protocolGrid, 'Federation protocols are not grouped in the responsive grid');
+  assert.equal(protocolGrid.children.length, 3);
+  assert(supportGrid, 'Provisioning and extension cards are not grouped separately');
+  assert.equal(supportGrid.children.length, 2);
+  assert.equal(rendered.some((node) => node.textContent === 'Realm-isolated identity sources'), true);
+});

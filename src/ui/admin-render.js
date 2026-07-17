@@ -232,6 +232,7 @@ export function renderAdminConsole() {
           <label class="check-control"><input id="client-public" type="checkbox"><span>Public client (no secret)</span></label>
           <label class="check-control"><input id="client-refresh" type="checkbox" checked><span>Refresh tokens</span></label>
           <label class="check-control"><input id="client-device" type="checkbox"><span>Device flow</span></label>
+          <label class="check-control"><input id="client-registration" type="checkbox"><span>Allow user account creation</span></label>
         </div>
         <p id="client-form-error" class="form-error" role="alert" hidden></p>
       </div>

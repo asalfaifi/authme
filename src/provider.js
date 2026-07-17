@@ -205,6 +205,7 @@ function developmentClients(realm) {
     grant_types: ['authorization_code', 'refresh_token', 'urn:ietf:params:oauth:grant-type:device_code'],
     application_type: 'web',
     scope: 'openid profile email roles groups offline_access',
+    allow_user_registration: true,
   }, {
     client_id: 'authme-dev-service',
     client_name: 'AuthMe development service',
@@ -681,13 +682,16 @@ export async function createRealmProvider({ realm, config, store, data, manageme
     },
     subjectTypes: ['public', 'pairwise'],
     extraClientMetadata: {
-      properties: ['web_origins', 'fapi_profile'],
-      validator(_ctx, key, _value, metadata) {
+      properties: ['web_origins', 'fapi_profile', 'allow_user_registration'],
+      validator(_ctx, key, value, metadata) {
         try {
           if (key === 'web_origins') validateWebOrigins(metadata, { development: config.devMode });
           if (key === 'fapi_profile') {
             applyFapiClientProfile(metadata);
             validateFapiClientSecurity(metadata, { mtlsEnabled: config.mtls.enabled });
+          }
+          if (key === 'allow_user_registration' && value !== undefined && typeof value !== 'boolean') {
+            throw new Error('allow_user_registration must be a boolean');
           }
         } catch (error) {
           metadata.invalidate(error.message);

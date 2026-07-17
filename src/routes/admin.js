@@ -445,6 +445,7 @@ export function createAdminRouter({
     const clientFields = [
       'client_id', 'client_name', 'application_type', 'subject_type', 'token_endpoint_auth_method',
       'redirect_uris', 'post_logout_redirect_uris', 'web_origins', 'response_types', 'grant_types', 'scope',
+      'allow_user_registration',
     ];
     const staticClients = configuredClientsForRealm(config, realm).map((client) => Object.fromEntries(
       clientFields.filter((field) => client[field] !== undefined).map((field) => [field, structuredClone(client[field])]),

@@ -1,4 +1,5 @@
 import { Router, urlencoded } from 'express';
+import { z } from 'zod';
 import { resolveFederatedLogin } from '../authentication/federated-login.js';
 import { authenticationSatisfiesFlow, totpRequiredForFlow } from '../authentication/flow-policy.js';
 import { createCsrfToken, verifyCsrfToken } from '../crypto/csrf.js';
@@ -7,11 +8,18 @@ import { recoveryCodeDigest, totpStep } from '../crypto/mfa.js';
 import { hashPassword, needsPasswordRehash, verifyPassword } from '../crypto/password.js';
 import { createWebAuthn } from '../security/webauthn.js';
 import { createFederationInitiationCsrfToken } from './federation.js';
-import { renderConsent, renderLogin } from '../ui/render.js';
+import { renderConsent, renderLogin, renderRegistration } from '../ui/render.js';
 
 const form = urlencoded({ extended: false, limit: '16kb', parameterLimit: 20 });
 const passkeyForm = urlencoded({ extended: false, limit: '64kb', parameterLimit: 10 });
 const base64url = /^[A-Za-z0-9_-]+$/;
+const selfRegistrationSchema = z.object({
+  username: z.string().trim().min(1).max(128).regex(/^[a-zA-Z0-9._@+-]+$/),
+  email: z.email().max(254),
+  name: z.string().trim().max(255).optional().transform((value) => value || undefined),
+  password: z.string().min(12).max(1024),
+  passwordConfirmation: z.string().min(12).max(1024),
+}).strict();
 
 function noStore(_req, res, next) {
   res.set('Cache-Control', 'no-store');
@@ -21,6 +29,10 @@ function noStore(_req, res, next) {
 
 function interactionClientName(client) {
   return client.clientName || client.clientId;
+}
+
+function clientAllowsRegistration(client, details) {
+  return client?.allow_user_registration === true && !details?.params?.organization;
 }
 
 export { authenticationSatisfiesFlow } from '../authentication/flow-policy.js';
@@ -111,7 +123,7 @@ export function createInteractionRouter({
     ));
   }
 
-  function loginView({ uid, clientName, login = '', error = '' }) {
+  function loginView({ uid, clientName, login = '', error = '', allowRegistration = false }) {
     return renderLogin({
       realm,
       uid,
@@ -120,6 +132,20 @@ export function createInteractionRouter({
       login,
       error,
       federationProviders: federationProviders(uid),
+      allowRegistration,
+    });
+  }
+
+  function registrationView({ uid, clientName, username = '', email = '', name = '', error = '' }) {
+    return renderRegistration({
+      realm,
+      uid,
+      csrfToken: createCsrfToken(`${realm}:${uid}:register`, config.csrfSecret),
+      clientName,
+      username,
+      email,
+      name,
+      error,
     });
   }
 
@@ -131,6 +157,7 @@ export function createInteractionRouter({
         return res.send(loginView({
           uid: details.uid,
           clientName: interactionClientName(client),
+          allowRegistration: clientAllowsRegistration(client, details),
         }));
       }
       if (details.prompt.name === 'consent') {
@@ -148,6 +175,142 @@ export function createInteractionRouter({
       }
       return next(Object.assign(new Error(`Unsupported interaction prompt: ${details.prompt.name}`), { status: 400 }));
     } catch (error) {
+      return next(error);
+    }
+  });
+
+  router.get(`${base}/register`, noStore, async (req, res, next) => {
+    try {
+      const details = await interaction(provider, req, res, 'login');
+      const client = await provider.Client.find(details.params.client_id);
+      if (!clientAllowsRegistration(client, details)) {
+        throw Object.assign(new Error('Account creation is not enabled for this application.'), { status: 403, safe: true });
+      }
+      return res.send(registrationView({
+        uid: details.uid,
+        clientName: interactionClientName(client),
+      }));
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  router.post(`${base}/register`, noStore, form, async (req, res, next) => {
+    let details;
+    let client;
+    let createdUser;
+    try {
+      details = await interaction(provider, req, res, 'login');
+      client = await provider.Client.find(details.params.client_id);
+      if (!clientAllowsRegistration(client, details)) {
+        throw Object.assign(new Error('Account creation is not enabled for this application.'), { status: 403, safe: true });
+      }
+      if (!verifyCsrfToken(req.body.csrf, `${realm}:${details.uid}:register`, config.csrfSecret)) {
+        throw Object.assign(new Error('The account creation form expired. Please try again.'), { status: 403, safe: true });
+      }
+      await rateLimits.consumeUserRegistration(req.ip);
+      const input = selfRegistrationSchema.safeParse({
+        username: req.body.username,
+        email: req.body.email,
+        name: req.body.name,
+        password: req.body.password,
+        passwordConfirmation: req.body.passwordConfirmation,
+      });
+      const values = {
+        username: String(req.body.username ?? '').trim().slice(0, 128),
+        email: String(req.body.email ?? '').trim().slice(0, 254),
+        name: String(req.body.name ?? '').trim().slice(0, 255),
+      };
+      if (!input.success || input.data.password !== input.data.passwordConfirmation) {
+        return res.status(400).send(registrationView({
+          uid: details.uid,
+          clientName: interactionClientName(client),
+          ...values,
+          error: input.success
+            ? 'The password confirmation does not match.'
+            : 'Use a valid username, email address, and a password of at least 12 characters.',
+        }));
+      }
+
+      let user;
+      try {
+        user = await store.createUser({
+          realm,
+          username: input.data.username,
+          email: input.data.email,
+          emailVerified: false,
+          name: input.data.name,
+          enabled: true,
+          passwordHash: await hashPassword(input.data.password, config.passwordPepper),
+          roles: [],
+          groups: [],
+          clientRoles: {},
+        });
+        createdUser = user;
+      } catch (error) {
+        if (error?.code !== 'USER_EXISTS') throw error;
+        return res.status(409).send(registrationView({
+          uid: details.uid,
+          clientName: interactionClientName(client),
+          ...values,
+          error: 'An account could not be created with those details. Sign in or use different details.',
+        }));
+      }
+
+      const amr = ['pwd'];
+      const context = await authenticationContext(details, user, amr, 'urn:authme:loa:1');
+      if (!context.accepted) {
+        await store.deleteUser(realm, user.id);
+        createdUser = undefined;
+        return res.status(409).send(registrationView({
+          uid: details.uid,
+          clientName: interactionClientName(client),
+          ...values,
+          error: 'This application requires an authentication method that cannot be enrolled during account creation.',
+        }));
+      }
+      await store.recordLoginSuccess(realm, user.id);
+      await store.writeAudit({
+        realm,
+        type: 'identity.registration.succeeded',
+        subjectId: user.id,
+        clientId: details.params.client_id,
+        ip: req.ip,
+        userAgent: req.get('user-agent'),
+        metadata: { source: 'client_self_service' },
+      });
+      await store.writeAudit({
+        realm,
+        type: 'identity.login.succeeded',
+        subjectId: user.id,
+        clientId: details.params.client_id,
+        ip: req.ip,
+        userAgent: req.get('user-agent'),
+        metadata: { amr, registration: true },
+      });
+      return provider.interactionFinished(req, res, {
+        login: { accountId: user.id, acr: context.acr, amr, remember: true },
+      }, { mergeWithLastSubmission: false });
+    } catch (error) {
+      if (error?.msBeforeNext && details && client) {
+        res.set('Retry-After', String(Math.max(1, Math.ceil(error.msBeforeNext / 1000))));
+        return res.status(429).send(registrationView({
+          uid: details.uid,
+          clientName: interactionClientName(client),
+          username: String(req.body.username ?? '').trim().slice(0, 128),
+          email: String(req.body.email ?? '').trim().slice(0, 254),
+          name: String(req.body.name ?? '').trim().slice(0, 255),
+          error: 'Too many account creation attempts. Please wait and try again.',
+        }));
+      }
+      if (createdUser && !res.headersSent) {
+        try {
+          await store.deleteUser(realm, createdUser.id);
+        } catch (rollbackError) {
+          logger.error({ error: rollbackError, realm, userId: createdUser.id }, 'Account registration rollback failed');
+        }
+      }
+      logger.warn({ error, realm }, 'Account registration interaction failed');
       return next(error);
     }
   });
@@ -214,6 +377,7 @@ export function createInteractionRouter({
           clientName: interactionClientName(client),
           login,
           error: 'Sign-in failed. Check your credentials or wait before trying again.',
+          allowRegistration: clientAllowsRegistration(client, details),
         }));
       }
 
@@ -246,6 +410,7 @@ export function createInteractionRouter({
           clientName: interactionClientName(client),
           login,
           error: 'This application requires a stronger authentication method for this sign-in.',
+          allowRegistration: clientAllowsRegistration(client, details),
         }));
       }
       await store.recordLoginSuccess(realm, user.id);
@@ -262,6 +427,7 @@ export function createInteractionRouter({
           clientName: client ? interactionClientName(client) : 'this application',
           login: String(req.body.login ?? '').slice(0, 254),
           error: 'Too many sign-in attempts. Please wait and try again.',
+          allowRegistration: clientAllowsRegistration(client, details),
         }));
       }
       logger.warn({ error, realm }, 'Login interaction failed');
@@ -357,6 +523,7 @@ export function createInteractionRouter({
           uid: details.uid,
           clientName: interactionClientName(client),
           error: 'Passkey sign-in failed or expired. Try again or use your password.',
+          allowRegistration: clientAllowsRegistration(client, details),
         }));
       }
 
@@ -377,6 +544,7 @@ export function createInteractionRouter({
           uid: details.uid,
           clientName: interactionClientName(client),
           error: 'This application requires a different authentication method for this sign-in.',
+          allowRegistration: clientAllowsRegistration(client, details),
         }));
       }
       await store.recordLoginSuccess(realm, user.id);

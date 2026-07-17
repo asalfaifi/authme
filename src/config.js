@@ -219,6 +219,9 @@ function clientsByRealm(value, realms) {
       if (client.fapi_profile !== undefined && client.fapi_profile !== '2.0') {
         throw new Error(`${name}.fapi_profile must be 2.0 when provided`);
       }
+      if (client.allow_user_registration !== undefined && typeof client.allow_user_registration !== 'boolean') {
+        throw new Error(`${name}.allow_user_registration must be a boolean when provided`);
+      }
       return client;
     }));
   }

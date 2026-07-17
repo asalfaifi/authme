@@ -1101,6 +1101,7 @@ function clientCard(client) {
       element('li', {}, [element('span', { text: 'Grant types' }), element('strong', { text: grants.length ? grants.join(', ') : 'Default' })]),
       element('li', {}, [element('span', { text: 'Redirect URIs' }), element('strong', { text: redirects.length })]),
       element('li', {}, [element('span', { text: 'Authentication' }), element('strong', { text: method })]),
+      element('li', {}, [element('span', { text: 'User registration' }), element('strong', { text: client.allow_user_registration === true ? 'Allowed' : 'Disabled' })]),
     ]),
   ]);
   if (can('roles.manage')) {
@@ -1208,6 +1209,7 @@ async function submitClientForm(event) {
       grant_types: grants,
       token_endpoint_auth_method: document.getElementById('client-public').checked ? 'none' : 'client_secret_basic',
       scope: document.getElementById('client-scopes').value.trim(),
+      allow_user_registration: document.getElementById('client-registration').checked,
     };
 
     let registered;
@@ -1266,6 +1268,7 @@ async function renderClients(signal) {
       redirect_uris: ['https://app.example.com/oidc/callback'],
       response_types: ['code'],
       grant_types: ['authorization_code', 'refresh_token'],
+      allow_user_registration: false,
     });
     if (!metadata) return;
     await requestJson(`/admin/v1/realms/${encodeURIComponent(state.realm)}/clients`, { method: 'POST', body: metadata });
@@ -1609,13 +1612,20 @@ async function renderFederation(signal) {
   if (!extensions.length) extensionGrid.append(emptyState('No extension manifests', 'Enabled authentication and provisioning capabilities will appear here.'));
 
   setHeader('federation');
-  setPage(element('div', { className: 'page-stack' }, [
-    callout('Safe catalog view', 'Provider passwords, OAuth secrets, signing keys, certificates, and SCIM tokens are never rendered. Integration changes remain reviewed deployment operations.'),
+  const protocolGrid = element('section', { className: 'federation-protocol-grid' }, [
     integrationSection('LDAP & Active Directory', 'Directory authentication and optional just-in-time accounts', 'ldap', list(federation.ldap)),
     integrationSection('Upstream OpenID Connect', 'Authorization Code and PKCE federation', 'oidc', list(federation.oidc)),
     integrationSection('SAML identity providers', 'Signed SAML 2.0 service-provider trust', 'saml', list(federation.saml)),
+  ]);
+  const provisioningGrid = element('section', { className: 'federation-support-grid' }, [
     contentCard('SCIM provisioning', 'Realm-scoped user and group synchronization', scimCards(configuration.scim)),
     contentCard('Loaded extensions', 'Runtime capability manifests for this realm', extensionGrid),
+  ]);
+  setPage(element('div', { className: 'page-stack' }, [
+    callout('Realm-isolated identity sources', `Every provider and provisioned account shown here belongs only to the ${state.realm} realm. Credentials and signing material remain redacted.`),
+    protocolGrid,
+    provisioningGrid,
+    callout('Reviewed configuration', 'Federation trust and SCIM credentials are deployment-managed. Provider passwords, OAuth secrets, signing keys, certificates, and bearer tokens are never rendered.', 'warning'),
   ]));
 }
 
@@ -1761,6 +1771,14 @@ async function renderSystem(signal) {
     `${key.algorithm} · ${key.provider} · ${key.status}${key.retireAfter ? ` · retire after ${formatDate(key.retireAfter)}` : ''}`,
   ));
   if (!list(signingKeyData.signingKeys).length) signingKeys.append(emptyState('No key inventory', 'The signing provider has not synchronized its public key inventory.'));
+  const realmInventory = element('div', { className: 'card-body resource-list' });
+  for (const realm of state.realms) {
+    realmInventory.append(managementItem(
+      text(realm.displayName, realm.name),
+      `${realm.name} · ${text(realm.issuer, 'issuer unavailable')}`,
+      [badge(realm.name === state.realm ? 'Current' : realm.enabled === false ? 'Disabled' : 'Available', realm.name === state.realm ? 'info' : realm.enabled === false ? 'neutral' : 'success')],
+    ));
+  }
 
   const user = record(state.session.user);
   const discoveryPath = `/realms/${encodeURIComponent(state.realm)}/.well-known/openid-configuration`;
@@ -1784,6 +1802,7 @@ async function renderSystem(signal) {
         settingLink('Readiness probe', 'Dependency readiness', '/health/ready'),
       ])),
     ]),
+    contentCard('Tenant realms', `${state.realms.length} isolated issuer${state.realms.length === 1 ? '' : 's'} in this deployment`, realmInventory),
     contentCard('Token & session lifetimes', 'Values exposed by the safe configuration API', element('div', { className: 'card-body' }, [ttlGrid])),
     contentCard('Resource-server policy', 'Explicit protected audiences in this realm', resources),
     contentCard('Signing-key lifecycle', 'Public-only provider inventory; private key material is never returned', signingKeys),
