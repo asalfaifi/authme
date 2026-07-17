@@ -3,7 +3,11 @@ import { randomUUID } from 'node:crypto';
 import { after, before, test } from 'node:test';
 import pg from 'pg';
 import { PostgresIdentityStore } from '../src/repositories/identity-store.js';
-import { expandCompositeRoles, PostgresManagementStore } from '../src/repositories/management-store.js';
+import {
+  expandCompositeRoles,
+  organizationInvitationPreviousRoles,
+  PostgresManagementStore,
+} from '../src/repositories/management-store.js';
 
 const databaseUrl = process.env.DATABASE_URL;
 const realm = `mgmt-${randomUUID().slice(0, 8)}`;
@@ -26,6 +30,11 @@ after(async () => {
 });
 
 test('PostgreSQL management policy is durable, mutable, nested, and realm-scoped', { skip: !databaseUrl }, async () => {
+  const missingId = randomUUID();
+  assert.equal(await management.updateClientScope(realm, missingId, { name: 'missing' }), undefined);
+  assert.equal(await management.updateClaimMapper(realm, missingId, { name: 'missing' }), undefined);
+  assert.equal(await management.updateAuthenticationFlow(realm, missingId, { alias: 'missing' }), undefined);
+
   await management.putRole(realm, { name: 'reader', description: '', composites: [], attributes: {} });
   await management.putRole(realm, { name: 'editor', description: '', composites: ['reader'], attributes: {} });
   await management.putRole(realm, { name: 'concurrent-a', description: '', composites: [], attributes: {} });
@@ -106,6 +115,22 @@ test('PostgreSQL management policy is durable, mutable, nested, and realm-scoped
   const organization = await management.createOrganization(realm, { name: 'Example', alias: 'example', enabled: true, domains: [{ domain: 'example.test', verified: true }], identityProviderIds: [], attributes: {} });
   await management.upsertOrganizationMembership(realm, organization.id, user.id, ['owner']);
   assert.deepEqual((await management.listUserOrganizations(realm, user.id))[0].roles, ['owner']);
+  const invitation = await management.createOrganizationInvitation(realm, {
+    organizationId: organization.id, email: user.email, roles: ['member'],
+    tokenDigest: 'c'.repeat(43), expiresAt: new Date(Date.now() + 60_000),
+  });
+  const accepted = await management.consumeOrganizationInvitation(realm, 'c'.repeat(43), user);
+  assert.deepEqual(accepted[organizationInvitationPreviousRoles], ['owner']);
+  assert.deepEqual((await management.listUserOrganizations(realm, user.id))[0].roles, ['member']);
+  assert.equal(await management.rollbackOrganizationInvitationAcceptance(
+    realm,
+    organization.id,
+    invitation.id,
+    user.id,
+    { previousRoles: accepted[organizationInvitationPreviousRoles] },
+  ), true);
+  assert.deepEqual((await management.listUserOrganizations(realm, user.id))[0].roles, ['owner']);
+  assert.equal((await management.consumeOrganizationInvitation(realm, 'c'.repeat(43), user)).id, invitation.id);
 
   await management.putSigningKey(realm, { keyId: 'key-1', provider: 'pkcs11', status: 'active', algorithm: 'ES256', materialReference: 'pkcs11:test', publicJwk: { kty: 'EC', kid: 'key-1' }, activatedAt: new Date(), retireAfter: null });
   assert.equal((await management.listSigningKeys(realm))[0].status, 'active');

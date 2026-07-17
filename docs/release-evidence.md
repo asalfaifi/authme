@@ -50,25 +50,27 @@ Until all three records are attached, the accurate product label is **v1.0 relea
 ## Latest autonomous verification
 
 The repository was re-audited on 2026-07-17 after the client-role, migration,
-flow/federation/CIBA, account-delivery, policy-lifecycle, and backup-manifest
-corrections:
+flow/federation/CIBA, account-delivery, policy-lifecycle, organization,
+federated-link, and backup-manifest corrections:
 
 - clean Node.js 22 container: source check passed for 150 JavaScript files;
   ordinary suite 332 tests, 311 passed, 21 PostgreSQL-only skips, 0 failures;
 - clean Node.js 22 container against migrated PostgreSQL 17: 43/43 release
   tests passed with 0 skips, including concurrent role/group graphs, managed
-  client policy cleanup, and migration `010_client_roles.sql`;
+  client policy cleanup, invitation rollback, account-membership cascades, and
+  migration `010_client_roles.sql`;
 - PostgreSQL protocol smoke passed, including OIDC/RFC 8414, PKCE, token
   audience/claims, refresh replay, device flow, MFA/recovery, SCIM, and audit;
 - real `pg_dump` v2 backup and destructive restore into an isolated database
-  passed; the restored migration record and `client_roles` table were checked;
+  passed; all 10 migration records, the `client_roles` table, and recovered
+  signing keys were checked;
 - production dependency audit reported zero vulnerabilities, Helm strict lint
   and deterministic OpenShift-restricted renders passed, and the Node.js 22
   runtime image started with exact issuer discovery;
 - signed archive, CycloneDX SBOM, and checksum signatures verified; a second
   artifact run was byte-for-byte identical;
 - realm HA baseline probe and a 40-request/8-worker discovery rehearsal passed
-  with zero failures and 167.41 ms p95 on the rebuilt local audit image.
+  with zero failures and 273.43 ms p95 on the rebuilt local audit image.
 
 These are reproducible autonomous checks, not substitutes for X1 certification,
 X2 independent review, or X3 target-infrastructure/hardware drill records.

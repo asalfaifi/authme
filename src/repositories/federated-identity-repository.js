@@ -379,10 +379,14 @@ export class MemoryFederatedIdentityRepository {
       const user = await this.store.findUserById(identity.realm, input.userId);
       if (!user) return { status: 'not_found' };
       const existing = this.#links.get(key(identity));
-      if (existing) return { status: existing.userId === user.id ? 'linked' : 'conflict', link: publicLink(existing) };
+      if (existing) {
+        if (!await this.store.findUserById(identity.realm, existing.userId)) this.#links.delete(key(identity));
+        else return { status: existing.userId === user.id ? 'linked' : 'conflict', link: publicLink(existing) };
+      }
       const userProviderLink = [...this.#links.values()].find((candidate) => candidate.realm === identity.realm
         && candidate.userId === user.id && candidate.providerId === identity.providerId && candidate.issuer === identity.issuer);
       if (userProviderLink) return { status: 'conflict', link: publicLink(userProviderLink) };
+      if (!await this.store.findUserById(identity.realm, input.userId)) return { status: 'not_found' };
       const now = new Date().toISOString();
       const link = {
         ...identity, userId: user.id, createdAt: now, updatedAt: now, lastLoginAt: null,
@@ -397,6 +401,17 @@ export class MemoryFederatedIdentityRepository {
     return [...this.#links.values()]
       .filter((link) => link.realm === realm && link.userId === userId)
       .map(publicLink);
+  }
+
+  async deleteForUser(realm, userId) {
+    let deleted = 0;
+    for (const [linkKey, link] of this.#links) {
+      if (link.realm === realm && link.userId === userId) {
+        this.#links.delete(linkKey);
+        deleted += 1;
+      }
+    }
+    return deleted;
   }
 
   async unlink({ realm, userId, providerId, issuer }) {
@@ -801,6 +816,14 @@ export class PostgresFederatedIdentityRepository {
        ORDER BY provider_id,issuer`, [realm, userId],
     );
     return result.rows.map(rowLink);
+  }
+
+  async deleteForUser(realm, userId) {
+    const result = await this.pool.query(
+      'DELETE FROM federated_identities WHERE realm_name=$1 AND user_id=$2',
+      [realm, userId],
+    );
+    return result.rowCount;
   }
 
   async unlink({ realm, userId, providerId, issuer }) {

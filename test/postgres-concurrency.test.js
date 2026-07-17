@@ -184,6 +184,11 @@ test('account deletion atomically removes the user and realm-scoped provider sta
     const user = await data.store.createUser({
       realm, username: 'delete-account', email: 'delete-account@example.test', passwordHash: 'hash',
     });
+    const organization = await data.management.createOrganization(realm, {
+      name: 'Account deletion', alias: `account-deletion-${randomUUID().slice(0, 8)}`,
+      enabled: true, domains: [], identityProviderIds: [], attributes: {},
+    });
+    await data.management.upsertOrganizationMembership(realm, organization.id, user.id, ['member']);
     const Adapter = data.adapterFor(realm);
     const sessions = new Adapter('Session');
     const grants = new Adapter('Grant');
@@ -204,6 +209,10 @@ test('account deletion atomically removes the user and realm-scoped provider sta
     assert.notEqual(await sessions.find('delete-session'), undefined);
     assert.notEqual(await grants.find('delete-grant'), undefined);
     assert.notEqual(await tokens.find('delete-token'), undefined);
+    assert.deepEqual(
+      (await data.management.listOrganizationMemberships(realm, organization.id)).map(({ userId }) => userId),
+      [user.id],
+    );
 
     const deleted = await data.deleteAccount(realm, user.id, {
       realm,
@@ -216,6 +225,7 @@ test('account deletion atomically removes the user and realm-scoped provider sta
     assert.equal(await sessions.find('delete-session'), undefined);
     assert.equal(await grants.find('delete-grant'), undefined);
     assert.equal(await tokens.find('delete-token'), undefined);
+    assert.deepEqual(await data.management.listOrganizationMemberships(realm, organization.id), []);
     const deletionAudit = (await data.store.listAudit(realm))
       .filter(({ type }) => type === 'admin.user.deleted');
     assert.equal(deletionAudit.length, 1);
@@ -264,7 +274,14 @@ test('managed client deletion atomically removes policy, user assignments, and a
       clientId: 'other-client', accountId: user.id, grantId: 'managed-delete-account-grant',
     }, 600);
 
-    assert.equal(await data.deleteManagedClient(realm, clientId), true);
+    const [deleted, concurrentUpdate] = await Promise.all([
+      data.deleteManagedClient(realm, clientId),
+      data.upsertManagedClient(realm, {
+        client_id: clientId, redirect_uris: ['https://client.example/updated-callback'],
+      }, { mode: 'update' }),
+    ]);
+    assert.equal(deleted, true);
+    assert(concurrentUpdate === undefined || concurrentUpdate.client_id === clientId);
     assert.equal(await new Adapter('Client').find(clientId), undefined);
     assert.equal(await grants.find('managed-delete-grant'), undefined);
     assert.equal(await tokens.find('managed-delete-token'), undefined);
@@ -278,6 +295,10 @@ test('managed client deletion atomically removes policy, user assignments, and a
     const reconciledUser = await data.store.findUserById(realm, user.id);
     assert.deepEqual(reconciledUser.clientRoles, {});
     assert(reconciledUser.securityVersion > initialSecurityVersion);
+    assert.equal(await data.upsertManagedClient(realm, {
+      client_id: clientId, redirect_uris: ['https://client.example/resurrected-callback'],
+    }, { mode: 'update' }), undefined);
+    assert.equal(await new Adapter('Client').find(clientId), undefined);
     assert.equal(await data.deleteManagedClient(realm, clientId), false);
   } finally {
     await data.close();

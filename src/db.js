@@ -67,8 +67,11 @@ export async function createDataLayer(config) {
       async listManagedClients(realm) {
         return listMemoryAdapterRecords(realm, 'Client').map(({ id, payload }) => ({ id, metadata: payload }));
       },
-      async upsertManagedClient(realm, metadata) {
+      async upsertManagedClient(realm, metadata, { mode = 'upsert' } = {}) {
+        if (!['create', 'update', 'upsert'].includes(mode)) throw new TypeError('Managed client write mode is invalid');
         const Adapter = adapterFor(realm);
+        const exists = listMemoryAdapterRecords(realm, 'Client').some(({ id }) => id === metadata.client_id);
+        if ((mode === 'create' && exists) || (mode === 'update' && !exists)) return undefined;
         await new Adapter('Client').upsert(metadata.client_id, metadata);
         return cloneManagedClient(metadata);
       },
@@ -101,16 +104,25 @@ export async function createDataLayer(config) {
         return revokeMemorySession(realm, accountId, sessionId);
       },
       async deleteAccount(realm, accountId, auditEvent) {
-        const credentials = await store.listWebAuthnCredentials(realm, accountId);
-        const adminGrant = await store.findAdminGrant(realm, accountId);
+        const ownedState = await store.snapshotUserOwnedState(realm, accountId);
         const user = await store.deleteUser(realm, accountId);
         if (!user) return { found: false, user: null };
+        const memberships = await management.listOrganizationMembershipsForUser(realm, accountId);
+        await Promise.all(memberships.map(({ organizationId }) => (
+          management.deleteOrganizationMembership(realm, organizationId, accountId)
+        )));
         try {
           if (auditEvent) await store.writeAudit(auditEvent);
         } catch (error) {
-          await store.createUser(user);
-          if (adminGrant) await store.restoreAdminGrant(adminGrant);
-          await restoreMemoryWebAuthnCredentials(store, realm, accountId, credentials);
+          await store.restoreUserOwnedState(ownedState);
+          await Promise.all(memberships.map((membership) => (
+            management.upsertOrganizationMembership(
+              realm,
+              membership.organizationId,
+              accountId,
+              membership.roles,
+            )
+          )));
           throw error;
         }
         revokeMemoryAccount(realm, accountId);
@@ -181,10 +193,34 @@ export async function createDataLayer(config) {
       );
       return result.rows.map(({ id, payload }) => ({ id, metadata: structuredClone(payload) }));
     },
-    async upsertManagedClient(realm, metadata) {
-      const Adapter = createPostgresAdapter({ pool, realm });
-      await new Adapter('Client').upsert(metadata.client_id, metadata);
-      return cloneManagedClient(metadata);
+    async upsertManagedClient(realm, metadata, { mode = 'upsert' } = {}) {
+      if (!['create', 'update', 'upsert'].includes(mode)) throw new TypeError('Managed client write mode is invalid');
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [
+          `authme:client-roles:${realm}:${metadata.client_id}`,
+        ]);
+        const exists = (await client.query(
+          `SELECT 1 FROM oidc_records
+           WHERE realm_name=$1 AND model='Client' AND id=$2
+             AND (expires_at IS NULL OR expires_at>CURRENT_TIMESTAMP)`,
+          [realm, metadata.client_id],
+        )).rowCount === 1;
+        if ((mode === 'create' && exists) || (mode === 'update' && !exists)) {
+          await client.query('COMMIT');
+          return undefined;
+        }
+        const Adapter = createPostgresAdapter({ pool: client, realm });
+        await new Adapter('Client').upsert(metadata.client_id, metadata);
+        await client.query('COMMIT');
+        return cloneManagedClient(metadata);
+      } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw error;
+      } finally {
+        client.release();
+      }
     },
     async deleteManagedClient(realm, clientId) {
       const client = await pool.connect();

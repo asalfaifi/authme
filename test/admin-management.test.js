@@ -113,6 +113,101 @@ test('policy writes fail closed when their managed client disappears mid-request
     runtime.data.management.createClaimMapper = createMapper;
   }
   assert.deepEqual(await runtime.data.management.listClaimMappers('master', 'client', mapperClientId), []);
+  assert.equal(await runtime.data.upsertManagedClient('master', nativeClient(mapperClientId, 49013), {
+    mode: 'update',
+  }), undefined);
+  assert.equal(await runtime.providers.get('master').Client.find(mapperClientId), undefined);
+
+  const member = await runtime.store.createUser({
+    realm: 'master', username: 'membership-race', email: 'membership-race@example.test', passwordHash: 'hash',
+  });
+  const membershipOrganization = await runtime.data.management.createOrganization('master', {
+    name: 'Membership race', alias: 'membership-race', enabled: true,
+    domains: [], identityProviderIds: [], attributes: {},
+  });
+  const upsertMembership = runtime.data.management.upsertOrganizationMembership
+    .bind(runtime.data.management);
+  runtime.data.management.upsertOrganizationMembership = async (...arguments_) => {
+    const membership = await upsertMembership(...arguments_);
+    await runtime.store.deleteUser('master', member.id);
+    return membership;
+  };
+  try {
+    await api('put', `/admin/v1/realms/master/organizations/${membershipOrganization.id}/members/${member.id}`, {
+      roles: ['member'],
+    }).expect(409);
+  } finally {
+    runtime.data.management.upsertOrganizationMembership = upsertMembership;
+  }
+  assert.deepEqual(
+    await runtime.data.management.listOrganizationMemberships('master', membershipOrganization.id),
+    [],
+  );
+
+  const invitationOrganization = await runtime.data.management.createOrganization('master', {
+    name: 'Invitation race', alias: 'invitation-race', enabled: true,
+    domains: [], identityProviderIds: [], attributes: {},
+  });
+  const createInvitation = runtime.data.management.createOrganizationInvitation
+    .bind(runtime.data.management);
+  runtime.data.management.createOrganizationInvitation = async (...arguments_) => {
+    const invitation = await createInvitation(...arguments_);
+    await runtime.data.management.deleteOrganization('master', invitationOrganization.id);
+    return invitation;
+  };
+  try {
+    await api('post', `/admin/v1/realms/master/organizations/${invitationOrganization.id}/invitations`, {
+      email: 'invitation-race@example.test', roles: ['member'], expiresInSeconds: 3600,
+    }).expect(409);
+  } finally {
+    runtime.data.management.createOrganizationInvitation = createInvitation;
+  }
+  assert.deepEqual(
+    await runtime.data.management.listOrganizationInvitations('master', invitationOrganization.id),
+    [],
+  );
+
+  await runtime.data.management.putRole('master', {
+    name: 'create-race-role', description: '', composites: [], attributes: {},
+  });
+  const createUser = runtime.store.createUser.bind(runtime.store);
+  runtime.store.createUser = async (input) => {
+    const user = await createUser(input);
+    await runtime.data.management.deleteRole('master', 'create-race-role');
+    return user;
+  };
+  try {
+    await api('post', '/admin/v1/realms/master/users', {
+      username: 'create-policy-race', email: 'create-policy-race@example.test',
+      password: 'Correct-Horse-Battery-Staple-2026!', roles: ['create-race-role'], groups: [], clientRoles: {},
+    }).expect(409);
+  } finally {
+    runtime.store.createUser = createUser;
+  }
+  assert.equal(await runtime.store.findUserByLogin('master', 'create-policy-race'), null);
+
+  await runtime.data.management.putRole('master', {
+    name: 'patch-race-role', description: '', composites: [], attributes: {},
+  });
+  const patchRaceUser = await createUser({
+    realm: 'master', username: 'patch-policy-race', email: 'patch-policy-race@example.test', passwordHash: 'hash',
+  });
+  const updateUser = runtime.store.updateUser.bind(runtime.store);
+  runtime.store.updateUser = async (...arguments_) => {
+    const user = await updateUser(...arguments_);
+    if (arguments_[2]?.roles?.includes('patch-race-role')) {
+      await runtime.data.management.deleteRole('master', 'patch-race-role');
+    }
+    return user;
+  };
+  try {
+    await api('patch', `/admin/v1/realms/master/users/${patchRaceUser.id}`, {
+      roles: ['patch-race-role'],
+    }).expect(409);
+  } finally {
+    runtime.store.updateUser = updateUser;
+  }
+  assert.deepEqual((await runtime.store.findUserById('master', patchRaceUser.id)).roles, []);
 });
 
 test('realm, role, nested group, scope, mapper, flow, and organization APIs are mutable and realm-scoped', async () => {
@@ -170,4 +265,6 @@ test('realm, role, nested group, scope, mapper, flow, and organization APIs are 
   await request(runtime.app).get('/realms/master/.well-known/openid-configuration').set('host', host).expect(503);
   await api('patch', '/admin/v1/realms/master', { enabled: true }).expect(200);
   await request(runtime.app).get('/realms/master/.well-known/openid-configuration').set('host', host).expect(200);
+  await api('delete', `/admin/v1/realms/master/users/${managedUser.body.id}`, {}).expect(204);
+  assert.deepEqual(await runtime.data.management.listOrganizationMemberships('master', organization.body.id), []);
 });

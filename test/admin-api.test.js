@@ -187,7 +187,7 @@ test('session revocation invalidates all account-bound state and bumps the secur
 });
 
 test('user deletion is idempotent, realm-isolated, and revokes account artifacts', async () => {
-  const { app, data } = await fixture();
+  const { app, data, federatedIdentities } = await fixture();
   const id = randomUUID();
   await data.store.createUser({
     id, realm: 'master', username: 'delete-me', email: 'delete-me@example.test', passwordHash: 'hash',
@@ -201,6 +201,12 @@ test('user deletion is idempotent, realm-isolated, and revokes account artifacts
   const otherSession = new OtherAdapter('Session');
   await masterSession.upsert('same-session', { accountId: id }, 600);
   await otherSession.upsert('same-session', { accountId: id }, 600);
+  const identity = {
+    realm: 'master', providerId: 'workforce', issuer: 'https://idp.example.test',
+    externalSubject: 'relink-after-delete', userId: id,
+    profile: { username: 'delete-me', email: 'delete-me@example.test' },
+  };
+  assert.equal((await federatedIdentities.link(identity)).status, 'linked');
 
   const [first, second] = await Promise.all([
     authorized(request(app).delete(`/admin/v1/realms/master/users/${id}`)),
@@ -212,6 +218,12 @@ test('user deletion is idempotent, realm-isolated, and revokes account artifacts
   assert.equal((await data.store.findUserById('other', id)).username, 'keep-me');
   assert.equal(await masterSession.find('same-session'), undefined);
   assert.notEqual(await otherSession.find('same-session'), undefined);
+  assert.deepEqual(await federatedIdentities.list('master', id), []);
+
+  const replacement = await data.store.createUser({
+    realm: 'master', username: 'replacement', email: 'replacement@example.test', passwordHash: 'hash',
+  });
+  assert.equal((await federatedIdentities.link({ ...identity, userId: replacement.id })).status, 'linked');
 
   const deletionEvents = (await data.store.listAudit('master'))
     .filter(({ type }) => type === 'admin.user.deleted');
@@ -219,7 +231,7 @@ test('user deletion is idempotent, realm-isolated, and revokes account artifacts
 });
 
 test('an audit failure rolls back in-memory user deletion before artifact revocation', async () => {
-  const { app, data } = await fixture();
+  const { app, data, federatedIdentities } = await fixture();
   const user = await data.store.createUser({
     realm: 'master',
     username: 'audit-rollback',
@@ -233,6 +245,32 @@ test('an audit failure rolls back in-memory user deletion before artifact revoca
   await sessions.upsert('rollback-session', { accountId: user.id }, 600);
   await grants.upsert('rollback-grant', { accountId: user.id }, 600);
   await tokens.upsert('rollback-token', { accountId: user.id, grantId: 'rollback-grant' }, 600);
+  const accountSessionDigest = 's'.repeat(43);
+  await data.store.createAccountSession({
+    idDigest: accountSessionDigest, realm: 'master', userId: user.id,
+    securityVersion: user.securityVersion, authenticationMethods: ['pwd'],
+    idleExpiresAt: new Date(Date.now() + 60_000), expiresAt: new Date(Date.now() + 120_000),
+  });
+  const actionTokenDigest = 't'.repeat(43);
+  await data.store.createAccountActionToken({
+    tokenDigest: actionTokenDigest, realm: 'master', userId: user.id,
+    type: 'email-verification', email: user.email, expiresAt: new Date(Date.now() + 60_000),
+  });
+  const challenge = await data.store.createWebAuthnChallenge({
+    realm: 'master', purpose: 'registration', userId: user.id,
+    challenge: 'audit-rollback-webauthn-challenge', expiresAt: new Date(Date.now() + 60_000),
+  });
+  const organization = await data.management.createOrganization('master', {
+    name: 'Rollback organization', alias: 'rollback-organization', enabled: true,
+    domains: [], identityProviderIds: [], attributes: {},
+  });
+  await data.management.upsertOrganizationMembership('master', organization.id, user.id, ['member']);
+  const identity = {
+    realm: 'master', providerId: 'workforce', issuer: 'https://idp.example.test',
+    externalSubject: 'audit-rollback-subject', userId: user.id,
+    profile: { username: user.username, email: user.email },
+  };
+  assert.equal((await federatedIdentities.link(identity)).status, 'linked');
 
   const writeAudit = data.store.writeAudit.bind(data.store);
   data.store.writeAudit = async () => { throw new Error('injected audit failure'); };
@@ -244,6 +282,21 @@ test('an audit failure rolls back in-memory user deletion before artifact revoca
   assert.notEqual(await sessions.find('rollback-session'), undefined);
   assert.notEqual(await grants.find('rollback-grant'), undefined);
   assert.notEqual(await tokens.find('rollback-token'), undefined);
+  assert.notEqual(await data.store.findAccountSession(accountSessionDigest), null);
+  assert.equal((await data.store.consumeAccountActionToken({
+    realm: 'master', tokenDigest: actionTokenDigest, type: 'email-verification',
+  })).email, user.email);
+  assert.equal((await data.store.consumeWebAuthnChallenge({
+    realm: 'master', id: challenge.id, purpose: 'registration', userId: user.id,
+  })).challenge, challenge.challenge);
+  assert.deepEqual(
+    (await data.management.listOrganizationMemberships('master', organization.id)).map(({ userId }) => userId),
+    [user.id],
+  );
+  assert.deepEqual(
+    (await federatedIdentities.list('master', user.id)).map(({ externalSubject }) => externalSubject),
+    [identity.externalSubject],
+  );
   assert.equal(
     (await data.store.listAudit('master')).some(({ type }) => type === 'admin.user.deleted'),
     false,

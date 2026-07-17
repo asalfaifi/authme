@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { assertAuthenticationFlowConfiguration } from '../authentication/flow-policy.js';
 
+export const organizationInvitationPreviousRoles = Symbol('organizationInvitationPreviousRoles');
+
 function clone(value) {
   return value === undefined ? undefined : structuredClone(value);
 }
@@ -67,6 +69,7 @@ function groupPaths(rows) {
 }
 
 function publicGroup(row) {
+  if (!row) return undefined;
   return {
     id: String(row.id),
     name: row.name,
@@ -79,6 +82,7 @@ function publicGroup(row) {
 }
 
 function publicClientScope(row) {
+  if (!row) return undefined;
   return {
     id: String(row.id),
     name: row.name,
@@ -91,6 +95,7 @@ function publicClientScope(row) {
 }
 
 function publicMapper(row) {
+  if (!row) return undefined;
   return {
     id: String(row.id),
     ownerType: row.ownerType ?? row.owner_type,
@@ -104,6 +109,7 @@ function publicMapper(row) {
 }
 
 function publicFlow(row) {
+  if (!row) return undefined;
   return {
     id: String(row.id),
     alias: row.alias,
@@ -120,6 +126,7 @@ function publicFlow(row) {
 }
 
 function publicOrganization(row, domains = []) {
+  if (!row) return undefined;
   return {
     id: String(row.id),
     name: row.name,
@@ -134,6 +141,7 @@ function publicOrganization(row, domains = []) {
 }
 
 function publicMembership(row) {
+  if (!row) return undefined;
   return {
     organizationId: String(row.organizationId ?? row.organization_id),
     userId: String(row.userId ?? row.user_id),
@@ -144,6 +152,7 @@ function publicMembership(row) {
 }
 
 function publicInvitation(row) {
+  if (!row) return undefined;
   return {
     id: String(row.id),
     organizationId: String(row.organizationId ?? row.organization_id),
@@ -156,6 +165,7 @@ function publicInvitation(row) {
 }
 
 function publicSigningKey(row) {
+  if (!row) return undefined;
   return {
     keyId: row.keyId ?? row.key_id,
     provider: row.provider,
@@ -604,6 +614,7 @@ export class MemoryManagementStore {
   }
   async listOrganizationMembershipsForUser(realm, userId) { return [...this.memberships.entries()].filter(([entry, membership]) => entry.startsWith(`${realm}\u0000`) && membership.userId === userId).map(([, membership]) => publicMembership(membership)); }
   async createOrganizationInvitation(realm, input) {
+    if (!this.organizations.has(key(realm, input.organizationId))) return undefined;
     const timestamp = nowIso();
     const invitation = { ...clone(input), id: input.id ?? randomUUID(), createdAt: timestamp, acceptedAt: null };
     this.invitations.set(key(realm, input.organizationId, invitation.id), invitation);
@@ -618,10 +629,33 @@ export class MemoryManagementStore {
     if (!match || match[1].email.toLowerCase() !== user.email.toLowerCase()) return undefined;
     const [entry, invitation] = match;
     if (!this.organizations.get(key(realm, invitation.organizationId))?.enabled) return undefined;
+    const previous = this.memberships.get(key(realm, invitation.organizationId, user.id));
     invitation.acceptedAt = nowIso();
     this.invitations.set(entry, invitation);
     await this.upsertOrganizationMembership(realm, invitation.organizationId, user.id, invitation.roles);
-    return publicInvitation(invitation);
+    const accepted = publicInvitation(invitation);
+    Object.defineProperty(accepted, organizationInvitationPreviousRoles, {
+      value: previous ? [...previous.roles] : undefined,
+    });
+    return accepted;
+  }
+  async rollbackOrganizationInvitationAcceptance(
+    realm,
+    organizationId,
+    invitationId,
+    userId,
+    { previousRoles, restoreMembership = true } = {},
+  ) {
+    const invitationKey = key(realm, organizationId, invitationId);
+    const invitation = this.invitations.get(invitationKey);
+    if (!invitation?.acceptedAt) return false;
+    this.invitations.set(invitationKey, { ...invitation, acceptedAt: null });
+    if (restoreMembership && previousRoles !== undefined) {
+      await this.upsertOrganizationMembership(realm, organizationId, userId, previousRoles);
+    } else {
+      await this.deleteOrganizationMembership(realm, organizationId, userId);
+    }
+    return true;
   }
 
   async listSigningKeys(realm) { return [...this.signingKeys.entries()].filter(([entry]) => entry.startsWith(`${realm}\u0000`)).map(([, signingKey]) => publicSigningKey(signingKey)).sort((a, b) => a.createdAt.localeCompare(b.createdAt)); }
@@ -916,7 +950,96 @@ export class PostgresManagementStore {
   async deleteOrganizationInvitation(realm, organizationId, invitationId) { return (await this.pool.query('DELETE FROM organization_invitations WHERE realm_name=$1 AND organization_id=$2 AND id=$3', [realm, organizationId, invitationId])).rowCount === 1; }
   async consumeOrganizationInvitation(realm, tokenDigest, user) {
     const client = await this.pool.connect();
-    try { await client.query('BEGIN'); const invitation = (await client.query(`UPDATE organization_invitations AS invitation SET accepted_at=CURRENT_TIMESTAMP FROM organizations AS organization WHERE invitation.realm_name=$1 AND invitation.token_digest=$2 AND invitation.accepted_at IS NULL AND invitation.expires_at>CURRENT_TIMESTAMP AND lower(invitation.email)=lower($3) AND organization.realm_name=invitation.realm_name AND organization.id=invitation.organization_id AND organization.enabled RETURNING invitation.*`, [realm, tokenDigest, user.email])).rows[0]; if (!invitation) { await client.query('ROLLBACK'); return undefined; } await client.query(`INSERT INTO organization_memberships (realm_name,organization_id,user_id,roles) VALUES ($1,$2,$3,$4) ON CONFLICT (realm_name,organization_id,user_id) DO UPDATE SET roles=EXCLUDED.roles`, [realm, invitation.organization_id, user.id, invitation.roles]); await client.query('COMMIT'); return publicInvitation(invitation); } catch (error) { await client.query('ROLLBACK').catch(() => {}); throw error; } finally { client.release(); }
+    try {
+      await client.query('BEGIN');
+      const lockedUser = (await client.query(
+        'SELECT email FROM users WHERE realm_name=$1 AND id=$2 FOR UPDATE',
+        [realm, user.id],
+      )).rows[0];
+      if (!lockedUser || lockedUser.email.toLowerCase() !== user.email.toLowerCase()) {
+        await client.query('ROLLBACK');
+        return undefined;
+      }
+      const invitation = (await client.query(
+        `SELECT invitation.* FROM organization_invitations AS invitation
+         JOIN organizations AS organization
+           ON organization.realm_name=invitation.realm_name
+          AND organization.id=invitation.organization_id
+         WHERE invitation.realm_name=$1 AND invitation.token_digest=$2
+           AND invitation.accepted_at IS NULL AND invitation.expires_at>CURRENT_TIMESTAMP
+           AND lower(invitation.email)=lower($3) AND organization.enabled
+         FOR UPDATE OF invitation,organization`,
+        [realm, tokenDigest, lockedUser.email],
+      )).rows[0];
+      if (!invitation) {
+        await client.query('ROLLBACK');
+        return undefined;
+      }
+      const previous = (await client.query(
+        `SELECT roles FROM organization_memberships
+         WHERE realm_name=$1 AND organization_id=$2 AND user_id=$3 FOR UPDATE`,
+        [realm, invitation.organization_id, user.id],
+      )).rows[0];
+      await client.query(
+        `UPDATE organization_invitations SET accepted_at=CURRENT_TIMESTAMP
+         WHERE realm_name=$1 AND id=$2`,
+        [realm, invitation.id],
+      );
+      await client.query(
+        `INSERT INTO organization_memberships (realm_name,organization_id,user_id,roles)
+         VALUES ($1,$2,$3,$4)
+         ON CONFLICT (realm_name,organization_id,user_id) DO UPDATE SET roles=EXCLUDED.roles`,
+        [realm, invitation.organization_id, user.id, invitation.roles],
+      );
+      const accepted = publicInvitation({ ...invitation, accepted_at: new Date() });
+      Object.defineProperty(accepted, organizationInvitationPreviousRoles, {
+        value: previous ? [...previous.roles] : undefined,
+      });
+      await client.query('COMMIT');
+      return accepted;
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw error;
+    } finally { client.release(); }
+  }
+  async rollbackOrganizationInvitationAcceptance(
+    realm,
+    organizationId,
+    invitationId,
+    userId,
+    { previousRoles, restoreMembership = true } = {},
+  ) {
+    return withPostgresAdvisoryTransaction(
+      this.pool,
+      `authme:organization-invitation:${realm}:${invitationId}`,
+      async (client) => {
+        const result = await client.query(
+          `UPDATE organization_invitations SET accepted_at=NULL
+           WHERE realm_name=$1 AND organization_id=$2 AND id=$3 AND accepted_at IS NOT NULL
+           RETURNING id`,
+          [realm, organizationId, invitationId],
+        );
+        if (result.rowCount !== 1) return false;
+        if (restoreMembership && previousRoles !== undefined) {
+          await client.query(
+            `INSERT INTO organization_memberships (realm_name,organization_id,user_id,roles)
+             SELECT $1::varchar(63),$2::uuid,$3::uuid,$4::text[]
+             FROM users,organizations
+             WHERE users.realm_name=$1 AND users.id=$3
+               AND organizations.realm_name=$1 AND organizations.id=$2
+             ON CONFLICT (realm_name,organization_id,user_id) DO UPDATE SET roles=EXCLUDED.roles`,
+            [realm, organizationId, userId, previousRoles],
+          );
+        } else {
+          await client.query(
+            `DELETE FROM organization_memberships
+             WHERE realm_name=$1 AND organization_id=$2 AND user_id=$3`,
+            [realm, organizationId, userId],
+          );
+        }
+        return true;
+      },
+    );
   }
   async listSigningKeys(realm) { return (await this.pool.query('SELECT * FROM signing_key_versions WHERE realm_name=$1 ORDER BY created_at', [realm])).rows.map(publicSigningKey); }
   async putSigningKey(realm, input) {

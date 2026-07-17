@@ -368,6 +368,44 @@ export class MemoryIdentityStore {
     return structuredClone(user);
   }
 
+  async snapshotUserOwnedState(realm, userId) {
+    const matches = (value) => value.realm === realm && value.userId === userId;
+    const entries = (collection) => [...collection.entries()]
+      .filter(([, value]) => matches(value))
+      .map(([entryKey, value]) => [entryKey, structuredClone(value)]);
+    return {
+      user: structuredClone(this.#users.get(`${realm}:${userId}`)),
+      adminGrant: structuredClone(this.#adminGrants.get(`${realm}:${userId}`)),
+      adminSessions: entries(this.#adminSessions),
+      accountSessions: entries(this.#accountSessions),
+      accountActionTokens: entries(this.#accountActionTokens),
+      webauthnCredentials: entries(this.#webauthnCredentials),
+      webauthnChallenges: entries(this.#webauthnChallenges),
+    };
+  }
+
+  async restoreUserOwnedState(snapshot) {
+    if (!snapshot?.user) return false;
+    const { realm, id: userId } = snapshot.user;
+    const matches = (value) => value.realm === realm && value.userId === userId;
+    const restoreEntries = (collection, entries) => {
+      for (const [entryKey, value] of collection) if (matches(value)) collection.delete(entryKey);
+      for (const [entryKey, value] of entries) collection.set(entryKey, structuredClone(value));
+    };
+    this.#users.set(`${realm}:${userId}`, structuredClone(snapshot.user));
+    if (snapshot.adminGrant) {
+      this.#adminGrants.set(`${realm}:${userId}`, structuredClone(snapshot.adminGrant));
+    } else {
+      this.#adminGrants.delete(`${realm}:${userId}`);
+    }
+    restoreEntries(this.#adminSessions, snapshot.adminSessions);
+    restoreEntries(this.#accountSessions, snapshot.accountSessions);
+    restoreEntries(this.#accountActionTokens, snapshot.accountActionTokens);
+    restoreEntries(this.#webauthnCredentials, snapshot.webauthnCredentials);
+    restoreEntries(this.#webauthnChallenges, snapshot.webauthnChallenges);
+    return true;
+  }
+
   async restoreUser(user) {
     const restored = normalizeUser(user);
     this.#users.set(`${restored.realm}:${restored.id}`, structuredClone(restored));

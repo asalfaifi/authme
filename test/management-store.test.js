@@ -204,7 +204,14 @@ test('organizations isolate domains, memberships, invitations, and signing-key l
     }),
   ]);
   assert.equal(accepted.filter(Boolean).length, 1);
-  assert.equal(accepted.find(Boolean).id, invitation.id);
+  const acceptedInvitation = accepted.find(Boolean);
+  assert.equal(acceptedInvitation.id, invitation.id);
+  assert.equal(await store.rollbackOrganizationInvitationAcceptance(
+    'master', organization.id, invitation.id, '00000000-0000-4000-8000-000000000002',
+  ), true);
+  assert.equal((await store.consumeOrganizationInvitation('master', 'a'.repeat(43), {
+    id: '00000000-0000-4000-8000-000000000002', email: 'invitee@example.test',
+  })).id, invitation.id);
   const revoked = await store.createOrganizationInvitation('master', {
     organizationId: organization.id,
     email: 'revoked@example.test',

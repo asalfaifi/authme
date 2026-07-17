@@ -10,6 +10,7 @@ import { hashPassword, verifyPassword } from '../crypto/password.js';
 import { decryptSecret, encryptSecret, keyedDigest, randomToken, safeEqual } from '../crypto/secrets.js';
 import { loggableError } from '../logging.js';
 import { ACCOUNT_CONSOLE_CLIENT_ID } from '../provider.js';
+import { organizationInvitationPreviousRoles } from '../repositories/management-store.js';
 import { createWebAuthn } from '../security/webauthn.js';
 import { renderAccountAction, renderAccountConsole, renderAccountLogin } from '../ui/account-render.js';
 
@@ -556,10 +557,41 @@ export function createAccountConsole({
         user,
       );
       if (!invitation) return problem(res, 400, 'Invitation unavailable', 'The invitation is invalid, expired, already used, or belongs to another email address.');
-      await store.writeAudit(auditEvent(req, 'account.organization_invitation.accepted', user.id, {
-        invitationId: invitation.id,
-        organizationId: invitation.organizationId,
-      }));
+      const currentUser = await store.findUserById(realm, user.id);
+      const currentOrganization = await management.findOrganization(realm, invitation.organizationId);
+      const lifecycleIntact = currentUser?.enabled
+        && currentUser.email.toLowerCase() === invitation.email.toLowerCase()
+        && currentOrganization?.enabled;
+      if (!lifecycleIntact) {
+        await management.rollbackOrganizationInvitationAcceptance(
+          realm,
+          invitation.organizationId,
+          invitation.id,
+          user.id,
+          { previousRoles: invitation[organizationInvitationPreviousRoles], restoreMembership: false },
+        );
+        return problem(res, 409, 'Invitation lifecycle changed', 'The account or organization changed while the invitation was being accepted.');
+      }
+      try {
+        await store.writeAudit(auditEvent(req, 'account.organization_invitation.accepted', user.id, {
+          invitationId: invitation.id,
+          organizationId: invitation.organizationId,
+        }));
+      } catch (error) {
+        const rollbackUser = await store.findUserById(realm, user.id);
+        const rollbackOrganization = await management.findOrganization(realm, invitation.organizationId);
+        await management.rollbackOrganizationInvitationAcceptance(
+          realm,
+          invitation.organizationId,
+          invitation.id,
+          user.id,
+          {
+            previousRoles: invitation[organizationInvitationPreviousRoles],
+            restoreMembership: Boolean(rollbackUser && rollbackOrganization),
+          },
+        );
+        throw error;
+      }
       await data.revokeAccount(realm, user.id);
       return res.status(204).end();
     } catch (error) { return next(error); }

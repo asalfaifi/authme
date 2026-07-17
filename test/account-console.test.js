@@ -352,6 +352,31 @@ test('organization invitations are email-bound, single-use, and immediately refl
     'x-authme-csrf': session.csrf,
   });
   assert.equal(response.status, 400);
+
+  const retryableToken = randomToken();
+  await runtime.data.management.createOrganizationInvitation('master', {
+    organizationId: organization.id,
+    email: user.email,
+    roles: ['owner'],
+    tokenDigest: keyedDigest(`organization-invitation:master:${retryableToken}`, PASSWORD_PEPPER),
+    expiresAt: new Date(Date.now() + 60_000),
+  });
+  const writeAudit = runtime.store.writeAudit.bind(runtime.store);
+  runtime.store.writeAudit = async (event) => {
+    if (event.type === 'account.organization_invitation.accepted') throw new Error('audit unavailable');
+    return writeAudit(event);
+  };
+  response = await client.json('/realms/master/account/api/organization-invitations/accept', 'POST', {
+    token: retryableToken,
+  }, { 'x-authme-csrf': session.csrf });
+  runtime.store.writeAudit = writeAudit;
+  assert.equal(response.status, 500);
+  assert.deepEqual((await runtime.data.management.listUserOrganizations('master', user.id))[0].roles, ['member']);
+  response = await client.json('/realms/master/account/api/organization-invitations/accept', 'POST', {
+    token: retryableToken,
+  }, { 'x-authme-csrf': session.csrf });
+  assert.equal(response.status, 204);
+  assert.deepEqual((await runtime.data.management.listUserOrganizations('master', user.id))[0].roles, ['owner']);
 });
 
 test('profile email verification and password reset tokens are single-use, realm-bound, enumeration-safe, and rate-limited', { timeout: 120_000 }, async () => {
