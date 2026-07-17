@@ -75,7 +75,7 @@ _Standards-first, self-hosted identity & access server (a Keycloak alternative).
 ## v1.0 exit criteria (gates before declaring 1.0)
 
 - Published compatibility matrix + migration tool with deterministic reconciliation (delivered in `docs/keycloak-compatibility.md` and `scripts/kc-import.mjs`).
-- No critical migration blocker for the three declared reference profiles; each real deployment must still produce its own reconciliation and interoperability evidence.
+- No critical migration blocker for the declared reference deployments; each deployment must produce its own reconciliation and interoperability evidence.
 - OpenID certification for supported profiles (X1).
 - Independent penetration test + architecture review, critical/high findings resolved (X2).
 - Reproducible builds, signed release artifacts, SBOM, vulnerability-response policy, documented support window.

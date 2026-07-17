@@ -252,6 +252,7 @@ function requiredAdminPermission(req) {
   if (/^\/v1\/realms\/[^/]+$/iu.test(path)) return req.method === 'GET' ? 'realms.read' : 'realms.manage';
   if (/^\/v1\/realms\/[^/]+\/configuration$/iu.test(path)) return 'configuration.read';
   if (/^\/v1\/realms\/[^/]+\/clients\/[^/]+\/client-scopes(?:\/[^/]+)?$/iu.test(path)) return req.method === 'GET' ? 'configuration.read' : 'client-scopes.manage';
+  if (/^\/v1\/realms\/[^/]+\/clients\/[^/]+\/roles(?:\/[^/]+)?$/iu.test(path)) return req.method === 'GET' ? 'configuration.read' : 'roles.manage';
   if (/^\/v1\/realms\/[^/]+\/clients(?:\/[^/]+)?$/iu.test(path)) return req.method === 'GET' ? 'clients.read' : 'clients.manage';
   if (/^\/v1\/realms\/[^/]+\/roles(?:\/[^/]+)?$/iu.test(path)) return req.method === 'GET' ? 'configuration.read' : 'roles.manage';
   if (/^\/v1\/realms\/[^/]+\/groups(?:\/[^/]+)?$/iu.test(path)) return req.method === 'GET' ? 'configuration.read' : 'groups.manage';
@@ -312,6 +313,14 @@ export function createAdminRouter({
       const groups = new Set((await management.listGroups(realm)).map((item) => item.path));
       const unknown = input.groups.find((path) => !groups.has(path));
       if (unknown) return `Group ${unknown} is not defined in this realm.`;
+    }
+    if (input.clientRoles) {
+      for (const clientId of Object.keys(input.clientRoles)) {
+        if (!await clientExists(realm, clientId)) return `Client ${clientId} is not defined in this realm.`;
+        const roles = new Set((await management.listClientRoles(realm, clientId)).map((item) => item.name));
+        const unknown = input.clientRoles[clientId].find((name) => !roles.has(name));
+        if (unknown) return `Client role ${clientId}:${unknown} is not defined in this realm.`;
+      }
     }
     return undefined;
   }
@@ -540,6 +549,54 @@ export function createAdminRouter({
     } catch (error) { return next(error); }
   });
 
+  router.get('/v1/realms/:realm/clients/:clientId/roles', async (req, res, next) => {
+    try {
+      if (!await clientExists(req.params.realm, req.params.clientId)) return problem(res, 404, 'Client not found', 'The requested client does not exist.');
+      return res.json({ roles: await management.listClientRoles(req.params.realm, req.params.clientId) });
+    } catch (error) { return next(error); }
+  });
+
+  router.put('/v1/realms/:realm/clients/:clientId/roles/:roleName', async (req, res, next) => {
+    try {
+      if (!policyName.safeParse(req.params.roleName).success) return problem(res, 400, 'Invalid client role name', 'The role name is invalid.');
+      const input = parse(roleSchema, req, res);
+      if (!input) return undefined;
+      if (!await clientExists(req.params.realm, req.params.clientId)) return problem(res, 404, 'Client not found', 'The requested client does not exist.');
+      const previous = (await management.listClientRoles(req.params.realm, req.params.clientId)).find((item) => item.name === req.params.roleName);
+      const result = await management.putClientRole(req.params.realm, req.params.clientId, { name: req.params.roleName, ...input });
+      if (!await clientExists(req.params.realm, req.params.clientId)) {
+        await management.deleteClientRole(req.params.realm, req.params.clientId, req.params.roleName);
+        return problem(res, 409, 'Client lifecycle changed', 'The client was removed while its role policy was being updated.');
+      }
+      if ((!previous && result.composites.length)
+        || (previous && JSON.stringify(previous.composites) !== JSON.stringify(result.composites))) {
+        await mutateRealmUsers(req.params.realm, (user) => Object.hasOwn(user.clientRoles ?? {}, req.params.clientId)
+          ? { clientRoles: user.clientRoles }
+          : undefined);
+      }
+      await audit(store, req, 'admin.client_role.upserted', undefined, { clientId: req.params.clientId, role: req.params.roleName });
+      return res.status(201).json(result);
+    } catch (error) { return managementFailure(error, res, next); }
+  });
+
+  router.delete('/v1/realms/:realm/clients/:clientId/roles/:roleName', async (req, res, next) => {
+    try {
+      if (!await management.deleteClientRole(req.params.realm, req.params.clientId, req.params.roleName)) return problem(res, 404, 'Client role not found', 'The requested client role does not exist.');
+      await mutateRealmUsers(req.params.realm, (user) => {
+        const assigned = user.clientRoles?.[req.params.clientId];
+        if (!Array.isArray(assigned) || !assigned.includes(req.params.roleName)) {
+          return Object.hasOwn(user.clientRoles ?? {}, req.params.clientId) ? { clientRoles: user.clientRoles } : undefined;
+        }
+        const clientRoles = structuredClone(user.clientRoles);
+        clientRoles[req.params.clientId] = assigned.filter((name) => name !== req.params.roleName);
+        if (!clientRoles[req.params.clientId].length) delete clientRoles[req.params.clientId];
+        return { clientRoles };
+      });
+      await audit(store, req, 'admin.client_role.deleted', undefined, { clientId: req.params.clientId, role: req.params.roleName });
+      return res.status(204).end();
+    } catch (error) { return managementFailure(error, res, next); }
+  });
+
   router.post('/v1/realms/:realm/clients', async (req, res, next) => {
     try {
       const input = parse(clientMetadataSchema, req, res);
@@ -595,6 +652,12 @@ export function createAdminRouter({
       if (!await data.deleteManagedClient(req.params.realm, req.params.clientId)) {
         return problem(res, 404, 'Managed client not found', 'Deployment clients cannot be removed through this API.');
       }
+      await mutateRealmUsers(req.params.realm, (user) => {
+        if (!Object.hasOwn(user.clientRoles ?? {}, req.params.clientId)) return undefined;
+        const clientRoles = structuredClone(user.clientRoles);
+        delete clientRoles[req.params.clientId];
+        return { clientRoles };
+      });
       await audit(store, req, 'admin.client.deleted', undefined, { clientId: req.params.clientId });
       return res.status(204).end();
     } catch (error) { return next(error); }
@@ -610,7 +673,8 @@ export function createAdminRouter({
       if (!input) return undefined;
       const previous = (await management.listRoles(req.params.realm)).find((item) => item.name === req.params.roleName);
       const result = await management.putRole(req.params.realm, { name: req.params.roleName, ...input });
-      if (previous && JSON.stringify(previous.composites) !== JSON.stringify(result.composites)) {
+      if ((!previous && result.composites.length)
+        || (previous && JSON.stringify(previous.composites) !== JSON.stringify(result.composites))) {
         await mutateRealmUsers(req.params.realm, (user) => ({ roles: user.roles }));
       }
       await audit(store, req, 'admin.role.upserted', undefined, { role: req.params.roleName });
@@ -750,29 +814,49 @@ export function createAdminRouter({
         const unknown = input.identityProviderIds.find((id) => !providerIds.has(id));
         if (unknown) return problem(res, 400, 'Unknown identity provider', `Identity provider ${unknown} is not configured in this realm.`);
       }
+      const memberships = (Object.hasOwn(input, 'enabled') || input.identityProviderIds)
+        ? await management.listOrganizationMemberships(req.params.realm, req.params.organizationId)
+        : [];
       const organization = await management.updateOrganization(req.params.realm, req.params.organizationId, input);
       if (!organization) return problem(res, 404, 'Organization not found', 'The requested organization does not exist.');
+      await Promise.all(memberships.map(({ userId: memberId }) => data.revokeAccount(req.params.realm, memberId)));
       await audit(store, req, 'admin.organization.updated', undefined, { organizationId: organization.id, fields: Object.keys(input) });
       return res.json(organization);
     } catch (error) { return managementFailure(error, res, next); }
   });
   router.delete('/v1/realms/:realm/organizations/:organizationId', async (req, res, next) => {
-    try { if (!await management.deleteOrganization(req.params.realm, req.params.organizationId)) return problem(res, 404, 'Organization not found', 'The requested organization does not exist.'); await audit(store, req, 'admin.organization.deleted', undefined, { organizationId: req.params.organizationId }); return res.status(204).end(); } catch (error) { return next(error); }
+    try {
+      const organization = await management.findOrganization(req.params.realm, req.params.organizationId);
+      if (!organization) return problem(res, 404, 'Organization not found', 'The requested organization does not exist.');
+      const memberships = await management.listOrganizationMemberships(req.params.realm, organization.id);
+      await management.deleteOrganization(req.params.realm, organization.id);
+      await Promise.all(memberships.map(({ userId: memberId }) => data.revokeAccount(req.params.realm, memberId)));
+      await audit(store, req, 'admin.organization.deleted', undefined, { organizationId: organization.id });
+      return res.status(204).end();
+    } catch (error) { return next(error); }
   });
   router.get('/v1/realms/:realm/organizations/:organizationId/members', async (req, res, next) => {
-    try { return res.json({ memberships: await management.listOrganizationMemberships(req.params.realm, req.params.organizationId) }); } catch (error) { return next(error); }
+    try { if (!await management.findOrganization(req.params.realm, req.params.organizationId)) return problem(res, 404, 'Organization not found', 'The requested organization does not exist.'); return res.json({ memberships: await management.listOrganizationMemberships(req.params.realm, req.params.organizationId) }); } catch (error) { return next(error); }
   });
   router.put('/v1/realms/:realm/organizations/:organizationId/members/:userId', async (req, res, next) => {
-    try { if (!userId.safeParse(req.params.userId).success) return problem(res, 400, 'Invalid user identifier', 'User identifiers must be UUIDs.'); const input = parse(organizationMembershipSchema, req, res); if (!input) return undefined; if (!await store.findUserById(req.params.realm, req.params.userId)) return problem(res, 404, 'User not found', 'The requested user does not exist.'); const membership = await management.upsertOrganizationMembership(req.params.realm, req.params.organizationId, req.params.userId, input.roles); if (!membership) return problem(res, 404, 'Organization not found', 'The requested organization does not exist.'); await audit(store, req, 'admin.organization.member_upserted', req.params.userId, { organizationId: req.params.organizationId, roles: input.roles }); return res.json(membership); } catch (error) { return managementFailure(error, res, next); }
+    try { if (!userId.safeParse(req.params.userId).success) return problem(res, 400, 'Invalid user identifier', 'User identifiers must be UUIDs.'); const input = parse(organizationMembershipSchema, req, res); if (!input) return undefined; if (!await management.findOrganization(req.params.realm, req.params.organizationId)) return problem(res, 404, 'Organization not found', 'The requested organization does not exist.'); if (!await store.findUserById(req.params.realm, req.params.userId)) return problem(res, 404, 'User not found', 'The requested user does not exist.'); const membership = await management.upsertOrganizationMembership(req.params.realm, req.params.organizationId, req.params.userId, input.roles); await data.revokeAccount(req.params.realm, req.params.userId); await audit(store, req, 'admin.organization.member_upserted', req.params.userId, { organizationId: req.params.organizationId, roles: input.roles }); return res.json(membership); } catch (error) { return managementFailure(error, res, next); }
   });
   router.delete('/v1/realms/:realm/organizations/:organizationId/members/:userId', async (req, res, next) => {
-    try { if (!await management.deleteOrganizationMembership(req.params.realm, req.params.organizationId, req.params.userId)) return problem(res, 404, 'Organization membership not found', 'The requested membership does not exist.'); await audit(store, req, 'admin.organization.member_removed', req.params.userId, { organizationId: req.params.organizationId }); return res.status(204).end(); } catch (error) { return next(error); }
+    try { if (!await management.deleteOrganizationMembership(req.params.realm, req.params.organizationId, req.params.userId)) return problem(res, 404, 'Organization membership not found', 'The requested membership does not exist.'); await data.revokeAccount(req.params.realm, req.params.userId); await audit(store, req, 'admin.organization.member_removed', req.params.userId, { organizationId: req.params.organizationId }); return res.status(204).end(); } catch (error) { return next(error); }
   });
   router.get('/v1/realms/:realm/organizations/:organizationId/invitations', async (req, res, next) => {
-    try { return res.json({ invitations: await management.listOrganizationInvitations(req.params.realm, req.params.organizationId) }); } catch (error) { return next(error); }
+    try { if (!await management.findOrganization(req.params.realm, req.params.organizationId)) return problem(res, 404, 'Organization not found', 'The requested organization does not exist.'); return res.json({ invitations: await management.listOrganizationInvitations(req.params.realm, req.params.organizationId) }); } catch (error) { return next(error); }
   });
   router.post('/v1/realms/:realm/organizations/:organizationId/invitations', async (req, res, next) => {
-    try { const input = parse(organizationInvitationSchema, req, res); if (!input) return undefined; if (!await management.findOrganization(req.params.realm, req.params.organizationId)) return problem(res, 404, 'Organization not found', 'The requested organization does not exist.'); const token = randomToken(); const invitation = await management.createOrganizationInvitation(req.params.realm, { organizationId: req.params.organizationId, email: input.email, roles: input.roles, tokenDigest: keyedDigest(`organization-invitation:${req.params.realm}:${token}`, config.passwordPepper), expiresAt: new Date(Date.now() + input.expiresInSeconds * 1000) }); await audit(store, req, 'admin.organization.invitation_created', undefined, { organizationId: req.params.organizationId, invitationId: invitation.id, email: input.email }); return res.status(201).json({ ...invitation, token }); } catch (error) { return managementFailure(error, res, next); }
+    try { const input = parse(organizationInvitationSchema, req, res); if (!input) return undefined; const organization = await management.findOrganization(req.params.realm, req.params.organizationId); if (!organization) return problem(res, 404, 'Organization not found', 'The requested organization does not exist.'); if (!organization.enabled) return problem(res, 409, 'Organization disabled', 'Enable the organization before issuing invitations.'); const token = randomToken(); const invitation = await management.createOrganizationInvitation(req.params.realm, { organizationId: req.params.organizationId, email: input.email, roles: input.roles, tokenDigest: keyedDigest(`organization-invitation:${req.params.realm}:${token}`, config.passwordPepper), expiresAt: new Date(Date.now() + input.expiresInSeconds * 1000) }); await audit(store, req, 'admin.organization.invitation_created', undefined, { organizationId: req.params.organizationId, invitationId: invitation.id, email: input.email }); return res.status(201).json({ ...invitation, token }); } catch (error) { return managementFailure(error, res, next); }
+  });
+  router.delete('/v1/realms/:realm/organizations/:organizationId/invitations/:invitationId', async (req, res, next) => {
+    try {
+      if (!managementId.safeParse(req.params.invitationId).success) return problem(res, 400, 'Invalid invitation identifier', 'Invitation identifiers must be UUIDs.');
+      if (!await management.deleteOrganizationInvitation(req.params.realm, req.params.organizationId, req.params.invitationId)) return problem(res, 404, 'Organization invitation not found', 'The requested invitation does not exist.');
+      await audit(store, req, 'admin.organization.invitation_revoked', undefined, { organizationId: req.params.organizationId, invitationId: req.params.invitationId });
+      return res.status(204).end();
+    } catch (error) { return next(error); }
   });
 
   router.get('/v1/realms/:realm/signing-keys', async (req, res, next) => {

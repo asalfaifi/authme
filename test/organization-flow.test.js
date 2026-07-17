@@ -21,7 +21,7 @@ function csrf(html) {
   return match[1];
 }
 
-async function authorize({ agent = request.agent(runtime.app), organization, scope = 'openid organization', acrValues, expectFailure = false } = {}) {
+async function authorize({ agent = request.agent(runtime.app), organization, scope = 'openid organization roles', acrValues, expectFailure = false } = {}) {
   const verifier = randomBytes(32).toString('base64url');
   const state = randomBytes(16).toString('base64url');
   let response = await agent.get('/realms/master/protocol/openid-connect/auth').set('host', host).query({
@@ -79,7 +79,8 @@ before(async () => {
       redirect_uris: [client.redirectUri], response_types: ['code'], grant_types: ['authorization_code'],
     }] }),
     AUTHME_RESOURCE_SERVERS_JSON: JSON.stringify({ master: [{
-      audience: resource, scopes: ['organization', 'optional-context'], authorized_client_ids: [client.id],
+      audience: resource, scopes: ['organization', 'optional-context', 'roles'], authorized_client_ids: [client.id],
+      role_client_ids: [client.id],
     }] }),
   }));
   const jwks = await request(runtime.app).get('/realms/master/protocol/openid-connect/certs').set('host', host).expect(200);
@@ -90,6 +91,15 @@ after(async () => runtime?.close());
 
 test('organization context, optional client scopes, and configured step-up flows are enforced end to end', async () => {
   const admin = await runtime.store.findUserByLogin('master', 'admin');
+  await runtime.data.management.putClientRole('master', client.id, {
+    name: 'resource.read', description: 'Read the organization resource', composites: [], attributes: {},
+  });
+  await runtime.data.management.putClientRole('master', client.id, {
+    name: 'resource.admin', description: 'Administer the organization resource', composites: ['resource.read'], attributes: {},
+  });
+  await runtime.store.updateUser('master', admin.id, {
+    clientRoles: { [client.id]: ['resource.admin'] },
+  });
   const organization = await runtime.data.management.createOrganization('master', {
     name: 'Example', alias: 'example', enabled: true, domains: [{ domain: 'example.test', verified: true }],
     identityProviderIds: [], attributes: {},
@@ -106,6 +116,9 @@ test('organization context, optional client scopes, and configured step-up flows
 
   const ordinary = await exchange(await authorize({ organization: organization.alias }));
   assert.deepEqual(ordinary.payload.organizations, [{ id: organization.id, alias: 'example', name: 'Example', roles: ['owner'] }]);
+  assert.deepEqual(ordinary.payload.resource_access, {
+    [client.id]: { roles: ['resource.admin', 'resource.read'] },
+  });
   assert.equal(ordinary.payload.optional_context, undefined);
 
   const optional = await exchange(await authorize({ organization: organization.id, scope: 'openid organization optional-context' }));

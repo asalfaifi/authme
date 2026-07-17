@@ -1,6 +1,37 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { monitorAvailability } from '../src/operations/availability-rehearsal.js';
+import { monitorAvailability, probeRealmAvailability } from '../src/operations/availability-rehearsal.js';
+
+test('realm availability probe validates readiness and exact protocol discovery', async () => {
+  const fetch = async (url) => {
+    const path = new URL(url).pathname;
+    if (path === '/health/ready') return new Response(JSON.stringify({ status: 'ready' }), { status: 200 });
+    return new Response(JSON.stringify({
+      issuer: 'https://auth.example.test/realms/master',
+      authorization_endpoint: 'https://auth.example.test/realms/master/protocol/openid-connect/auth',
+      token_endpoint: 'https://auth.example.test/realms/master/protocol/openid-connect/token',
+      jwks_uri: 'https://auth.example.test/realms/master/protocol/openid-connect/certs',
+    }), { status: 200 });
+  };
+  assert.deepEqual(await probeRealmAvailability({ origin: 'https://auth.example.test', realm: 'master', fetch }), {
+    ready: 'ready', issuer: 'https://auth.example.test/realms/master',
+  });
+  await assert.rejects(probeRealmAvailability({
+    origin: 'https://auth.example.test', realm: 'master',
+    fetch: async () => new Response(JSON.stringify({ status: 'ready' }), { status: 200 }),
+  }), /discovery/iu);
+  await assert.rejects(probeRealmAvailability({
+    origin: 'https://auth.example.test', realm: 'master',
+    fetch: async (url) => new Response(JSON.stringify(new URL(url).pathname === '/health/ready'
+      ? { status: 'ready' }
+      : {
+          issuer: 'https://auth.example.test/realms/master',
+          authorization_endpoint: 'https://attacker.example.test/authorize',
+          token_endpoint: 'https://auth.example.test/realms/master/protocol/openid-connect/token',
+          jwks_uri: 'https://auth.example.test/realms/master/protocol/openid-connect/certs',
+        }), { status: 200 }),
+  }), /discovery/iu);
+});
 
 test('availability monitor probes throughout an operation and reports transient failures', async () => {
   let probes = 0;

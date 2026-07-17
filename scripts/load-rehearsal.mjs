@@ -8,11 +8,13 @@ const requests = Number(option('--requests', '500'));
 const concurrency = Number(option('--concurrency', '25'));
 const p95TargetMs = Number(option('--p95-ms', '500'));
 const scenario = option('--scenario', 'discovery');
-if (!baseUrl || !Number.isSafeInteger(requests) || requests < 1 || !Number.isSafeInteger(concurrency) || concurrency < 1) {
+const realm = process.env.AUTHME_PERF_REALM ?? 'master';
+if (!baseUrl || !Number.isSafeInteger(requests) || requests < 1 || !Number.isSafeInteger(concurrency) || concurrency < 1
+  || !Number.isFinite(p95TargetMs) || p95TargetMs <= 0 || !/^[a-z][a-z0-9-]{0,62}$/u.test(realm)) {
   throw new Error('Usage: npm run perf:rehearse -- --base-url https://auth.example.com [--scenario discovery|authorization-code --requests 500 --concurrency 25 --p95-ms 500]');
 }
 if (!['discovery', 'authorization-code'].includes(scenario)) throw new Error('--scenario must be discovery or authorization-code');
-const endpoint = new URL('/realms/master/.well-known/openid-configuration', baseUrl);
+const endpoint = new URL(`/realms/${encodeURIComponent(realm)}/.well-known/openid-configuration`, baseUrl);
 const durations = [];
 let failures = 0;
 let next = 0;
@@ -24,7 +26,7 @@ async function worker() {
       if (scenario === 'authorization-code') {
         await authorizationCodeRoundTrip({
           baseUrl,
-          realm: process.env.AUTHME_PERF_REALM ?? 'master',
+          realm,
           clientId: process.env.AUTHME_PERF_CLIENT_ID,
           clientSecret: process.env.AUTHME_PERF_CLIENT_SECRET,
           redirectUri: process.env.AUTHME_PERF_REDIRECT_URI,
@@ -37,7 +39,8 @@ async function worker() {
       } else {
         const response = await fetch(endpoint, { cache: 'no-store', signal: AbortSignal.timeout(10_000) });
         if (!response.ok) failures += 1;
-        await response.arrayBuffer();
+        const discovery = await response.json();
+        if (discovery.issuer !== new URL(`/realms/${encodeURIComponent(realm)}`, baseUrl).href.replace(/\/$/u, '')) failures += 1;
       }
     } catch { failures += 1; }
     durations.push(performance.now() - started);

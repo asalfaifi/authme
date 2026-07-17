@@ -16,6 +16,11 @@ const optionalString = z.preprocess(
   z.string().trim().min(1).optional(),
 );
 
+const moduleSpecifier = z.preprocess(
+  (value) => value === '' ? undefined : value,
+  z.string().trim().min(1).max(2048).refine((value) => !/[\r\n\0]/u.test(value), 'module specifier contains invalid characters').optional(),
+);
+
 const rawSchema = z.object({
   AUTHME_PUBLIC_URL: z.string().url().optional(),
   AUTHME_PORT: z.coerce.number().int().min(1).max(65535).optional(),
@@ -35,6 +40,7 @@ const rawSchema = z.object({
   AUTHME_JWKS_DIR: z.string().optional(),
   AUTHME_SIGNING_KEY_PROVIDERS_JSON: z.string().optional(),
   AUTHME_SIGNING_ADAPTER_MODULES_JSON: z.string().optional(),
+  AUTHME_ACCOUNT_EMAIL_MODULE: moduleSpecifier,
   AUTHME_CLIENTS_JSON: z.string().optional(),
   AUTHME_RESOURCE_SERVERS_JSON: z.string().optional(),
   AUTHME_LDAP_PROVIDERS_JSON: z.string().optional(),
@@ -396,6 +402,7 @@ export function loadConfig(environment = process.env) {
     jwksDir: raw.AUTHME_JWKS_DIR,
     signingKeyProvidersByRealm: signingKeyProviders,
     signingAdapterModules: signingAdapterModules(raw.AUTHME_SIGNING_ADAPTER_MODULES_JSON),
+    accountEmailModule: raw.AUTHME_ACCOUNT_EMAIL_MODULE,
     clientsByRealm: clients,
     resourceServersByRealm: resourceServersByRealm(raw.AUTHME_RESOURCE_SERVERS_JSON, realms, devMode),
     ldapProvidersByRealm: parseLdapProviders(raw.AUTHME_LDAP_PROVIDERS_JSON, { realms, devMode }),

@@ -68,6 +68,7 @@ The configuration catalog returns the realm issuer, deployment/storage mode, Red
 | Resource | Operations | Notes |
 |---|---|---|
 | `/realms/{realm}/clients[/{clientId}]` | `GET`, collection `POST`, item `PUT`/`DELETE` | Full OIDC client metadata is validated by the same security policy as startup. Secrets are never returned. Static and reserved clients are immutable. Delete revokes client grants and protocol artifacts. |
+| `/realms/{realm}/clients/{clientId}/roles[/{roleName}]` | `GET`, item `PUT`/`DELETE` | Realm-scoped client-role catalog with same-client composite expansion. Deletion reconciles user assignments and dependent composites. |
 | `/realms/{realm}/roles[/{roleName}]` | `GET`, item `PUT`/`DELETE` | Supports attributes and composite roles; missing references and cycles are rejected. |
 | `/realms/{realm}/groups[/{groupId}]` | `GET`, collection `POST`, item `PATCH`/`DELETE` | Supports parent IDs, canonical paths, existing-role assignment, and cycle prevention. Rename/move rewrites affected user paths and revokes stale sessions. A group with children must be reconciled before deletion. |
 | `/realms/{realm}/client-scopes[/{scopeId}]` | `GET`, collection `POST`, item `PATCH`/`DELETE` | Reusable OIDC client scopes. |
@@ -75,7 +76,7 @@ The configuration catalog returns the realm issuer, deployment/storage mode, Red
 | `/realms/{realm}/claim-mappers[/{mapperId}]` | `GET`, collection `POST`, item `PATCH`/`DELETE` | Existing-client- or existing-client-scope-owned hardcoded/user-attribute/role/group/organization mappers. |
 | `/realms/{realm}/authentication-flows[/{flowId}]` | `GET`, collection `POST`, item `PATCH`/`DELETE` | Required password/passkey/federation primary method; optional password+TOTP required/conditional composition; or alternative primary methods. Client, `acr`, AMR, and maximum-age policy are enforced on new and existing sessions. Unexecutable mixed definitions are rejected. |
 
-All paths in this table are below `/admin/v1`. Mutations are realm-scoped and audited. User role/group assignments, mapper owners, scope assignments, and flow client references must resolve within the same realm. A newly stored client is visible to the protocol provider without a restart; deleting it invalidates further client use immediately. Client-scope and authentication-flow mutations update discovery metadata immediately.
+All paths in this table are below `/admin/v1`. Mutations are realm-scoped and audited. User realm-role, client-role, and group assignments, mapper owners, scope assignments, and flow client references must resolve within the same realm. A newly stored client is visible to the protocol provider without a restart; deleting it invalidates further client use immediately and removes its role assignments. Client-scope and authentication-flow mutations update discovery metadata immediately.
 
 ## Organization and signing-key operations
 
@@ -86,10 +87,11 @@ All paths in this table are below `/admin/v1`. Mutations are realm-scoped and au
 | `GET` | `/admin/v1/realms/{realm}/organizations/{organizationId}/members` | List memberships |
 | `PUT`/`DELETE` | `/admin/v1/realms/{realm}/organizations/{organizationId}/members/{userId}` | Set membership roles or remove membership |
 | `GET`/`POST` | `/admin/v1/realms/{realm}/organizations/{organizationId}/invitations` | List invitations or issue a single-use, email-bound invitation token |
+| `DELETE` | `/admin/v1/realms/{realm}/organizations/{organizationId}/invitations/{invitationId}` | Revoke a pending invitation |
 | `GET` | `/admin/v1/realms/{realm}/signing-keys` | List public-only active/retiring key inventory and provider references |
 | `POST` | `/admin/v1/realms/{realm}/signing-keys/rotate` | Request an overlap-safe provider rotation; roll replicas after rotation |
 
-Invitation plaintext is returned only at creation and is stored as a digest. Acceptance occurs through the authenticated account console and requires the invited email address. Supplying an `organization` authorization parameter constrains tokens to a current enabled membership, and configured organization IdPs are enforced during federation.
+Invitation plaintext is returned only at creation and is stored as a digest. Acceptance occurs through the authenticated account console, requires the invited email address and an enabled organization, and revokes prior account grants before the new membership is used. Membership, organization-authentication policy, disablement, and deletion changes revoke affected browser grants. Supplying an `organization` authorization parameter constrains tokens to a current enabled membership, and configured organization IdPs are enforced during federation.
 
 Federated login never links by email or username. The link POST body is:
 

@@ -325,6 +325,35 @@ test('account console requires its real OIDC login and enforces origin, CSRF, JS
   assert.equal(response.status, 401, 'A master realm account session crossed into staff');
 });
 
+test('organization invitations are email-bound, single-use, and immediately reflected in the account console', { timeout: 120_000 }, async () => {
+  const organization = await runtime.data.management.createOrganization('master', {
+    name: 'Account organization', alias: 'account-organization', enabled: true,
+    domains: [{ domain: 'account-organization.example.test', verified: true }],
+    identityProviderIds: [], attributes: {},
+  });
+  const token = randomToken();
+  await runtime.data.management.createOrganizationInvitation('master', {
+    organizationId: organization.id,
+    email: user.email,
+    roles: ['member'],
+    tokenDigest: keyedDigest(`organization-invitation:master:${token}`, PASSWORD_PEPPER),
+    expiresAt: new Date(Date.now() + 60_000),
+  });
+  const client = await loginAccount();
+  const session = await sessionFor(client);
+  let response = await client.json('/realms/master/account/api/organization-invitations/accept', 'POST', { token }, {
+    'x-authme-csrf': session.csrf,
+  });
+  assert.equal(response.status, 204);
+  response = await client.get('/realms/master/account/api/organizations');
+  assert.equal(response.status, 200);
+  assert((await response.json()).organizations.some((entry) => entry.alias === 'account-organization'));
+  response = await client.json('/realms/master/account/api/organization-invitations/accept', 'POST', { token }, {
+    'x-authme-csrf': session.csrf,
+  });
+  assert.equal(response.status, 400);
+});
+
 test('profile email verification and password reset tokens are single-use, realm-bound, enumeration-safe, and rate-limited', { timeout: 120_000 }, async () => {
   let client = await loginAccount();
   let session = await sessionFor(client);

@@ -234,6 +234,9 @@ export function corsAllowed(origin, client) {
 }
 
 function accountClaims(user) {
+  const resourceAccess = Object.fromEntries(Object.entries(user.clientRoles ?? {})
+    .filter(([, roles]) => Array.isArray(roles) && roles.length)
+    .map(([clientId, roles]) => [clientId, { roles: [...roles] }]));
   return {
     sub: user.id,
     email: user.email,
@@ -244,7 +247,7 @@ function accountClaims(user) {
     family_name: user.familyName,
     groups: user.groups,
     realm_access: { roles: user.roles },
-    resource_access: user.clientRoles,
+    resource_access: resourceAccess,
   };
 }
 
@@ -533,11 +536,16 @@ export async function createRealmProvider({ realm, config, store, data, manageme
     const scopeNames = grantedScopes instanceof Set
       ? [...grantedScopes]
       : String(grantedScopes ?? '').split(' ').filter(Boolean);
-    const [roles, groups, organizations, mappers] = await Promise.all([
+    const clientRoleIds = Object.keys(user.clientRoles ?? {});
+    const [roles, groups, organizations, mappers, clientRoleDefinitions] = await Promise.all([
       management.listRoles(realm),
       management.listGroups(realm),
       management.listUserOrganizations(realm, user.id),
       clientId ? management.effectiveClaimMappers(realm, clientId, scopeNames) : [],
+      Promise.all(clientRoleIds.map(async (roleClientId) => [
+        roleClientId,
+        await management.listClientRoles(realm, roleClientId),
+      ])),
     ]);
     const groupRoles = groups
       .filter((group) => user.groups?.includes(group.path))
@@ -549,7 +557,12 @@ export async function createRealmProvider({ realm, config, store, data, manageme
       throw new errors.AccessDenied('The account is no longer a member of the requested organization');
     }
     const expandedRoles = expandCompositeRoles([...(user.roles ?? []), ...groupRoles], roles);
-    const enriched = { ...user, roles: expandedRoles };
+    const definitionsByClient = new Map(clientRoleDefinitions);
+    const expandedClientRoles = Object.fromEntries(clientRoleIds.map((roleClientId) => [
+      roleClientId,
+      expandCompositeRoles(user.clientRoles[roleClientId], definitionsByClient.get(roleClientId) ?? []),
+    ]));
+    const enriched = { ...user, roles: expandedRoles, clientRoles: expandedClientRoles };
     return {
       ...accountClaims(enriched),
       organizations: contextualOrganizations.map((organization) => ({
@@ -949,7 +962,17 @@ export async function createRealmProvider({ realm, config, store, data, manageme
       if (audiences.length !== 1) return Object.keys(customClaims).length ? customClaims : undefined;
       const resourceServer = findConfiguredResourceServer(resourceServers, audiences[0]);
       if (!resourceServer) return Object.keys(customClaims).length ? customClaims : undefined;
-      return { ...resourceTokenClaims(resourceServer, { ...user, roles: managedClaims.realm_access.roles }, token.scopes), ...customClaims };
+      const expandedClientRoles = Object.fromEntries(Object.entries(managedClaims.resource_access ?? {}).map(
+        ([roleClientId, value]) => [roleClientId, value.roles],
+      ));
+      return {
+        ...resourceTokenClaims(resourceServer, {
+          ...user,
+          roles: managedClaims.realm_access?.roles ?? [],
+          clientRoles: expandedClientRoles,
+        }, token.scopes),
+        ...customClaims,
+      };
     },
     async pairwiseIdentifier(_ctx, accountId, client) {
       const sector = client.sectorIdentifier;

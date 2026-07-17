@@ -560,6 +560,7 @@ export function createAccountConsole({
         invitationId: invitation.id,
         organizationId: invitation.organizationId,
       }));
+      await data.revokeAccount(realm, user.id);
       return res.status(204).end();
     } catch (error) { return next(error); }
   });

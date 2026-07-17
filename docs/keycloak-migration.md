@@ -112,6 +112,9 @@ The AuthMe artifact contains:
 - realm/client role inventories, flattened groups, users, and federated links;
 - raw LDAP, upstream OIDC, and upstream SAML provider entries matching the
   corresponding `AUTHME_*_PROVIDERS_JSON` input shapes;
+- downstream SAML service-provider registrations matching `AUTHME_SAML_IDP_JSON`,
+  including exact entity/ACS/SLO endpoints, portable profile/group/role
+  attributes, source request-signing requirements, and assertion encryption;
 - an `environment` object whose `*_JSON` values are structured JSON and must be
   serialized when placed in environment variables.
 
@@ -125,9 +128,10 @@ Treat both input and config output as restricted identity data. The transformer
 does not copy Keycloak client secrets, password hashes, OTP/passkey material,
 LDAP bind credentials, IdP client secrets, SMTP credentials, or private keys.
 It emits `__ROTATE__` where an otherwise mappable integration requires a new
-secret; this value is intentionally too short for AuthMe's production static
-client policy. Replace every placeholder through the approved secret channel
-before validation or deployment. Reports contain identifiers, source paths,
+secret and `__GENERATE_AUTHME_SAML_IDP_*__` placeholders where the migrated
+realm requires a new IdP signing key/certificate. These values are intentionally
+invalid production configuration. Replace every placeholder through the approved
+secret/key channel before validation or deployment. Reports contain identifiers, source paths,
 classifications, and fixed reasons, never source values or secret/key material.
 
 Malformed structure, duplicate identifiers, invalid realm names, and invalid
@@ -151,7 +155,8 @@ missing source user UUIDs are explicit warnings.
 | Device grant / CIBA poll | Corresponding AuthMe grant metadata | Direct where source metadata and client authentication are compatible |
 | Wildcard/relative redirect or web origin | Not emitted | Unsupported/skipped; replace with reviewed exact URI/origin |
 | Direct Access Grant / implicit flow | Not emitted | Unsupported |
-| Disabled, bearer-only, SAML, or reserved client | Not emitted as a static OIDC client | Unsupported/skipped; bearer APIs need explicit resource-server policy |
+| Disabled, bearer-only, or reserved client | Not emitted as a static OIDC client | Unsupported/skipped; bearer APIs need explicit resource-server policy |
+| Enabled SAML client | Downstream `AUTHME_SAML_IDP_JSON` service-provider registration | Exact HTTPS ACS; signed-request/encryption requirements are preserved only with usable exported public certificates; unsupported NameID/mappers/bindings are reported |
 | Realm and client roles | Separate role inventories and user namespaces | Direct for portable role names |
 | Composite role | Role name retained; transformer does not emit the composite graph | Warning; create/reconcile the graph through the mutable role API before cutover |
 | Nested group | Canonical flattened path such as `/engineering/platform` | Direct path mapping |

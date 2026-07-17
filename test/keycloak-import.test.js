@@ -7,7 +7,7 @@ import { test } from 'node:test';
 
 import { parseLdapProviders } from '../src/federation/ldap.js';
 import { parseOidcProviders } from '../src/federation/oidc.js';
-import { parseSamlProviders } from '../src/federation/saml-config.js';
+import { parseSamlIdentityProviders, parseSamlProviders } from '../src/federation/saml-config.js';
 import {
   KeycloakImportError,
   formatCompatibilityReport,
@@ -328,6 +328,172 @@ test('emits client and federation fragments accepted by AuthMe parsers after sec
   assert.equal(oidc.acme[0].issuer, 'https://idp.example.test');
   assert.equal(ldap.acme[0].url, 'ldaps://directory.example.test:636');
   assert.deepEqual(saml.acme, []);
+  assert.equal(config.environment.AUTHME_SAML_IDP_JSON.acme, null);
+});
+
+test('maps a Keycloak SAML client into a parser-valid downstream service-provider policy', () => {
+  const source = realmExport({
+    clients: [{
+      clientId: 'https://analytics.example.test/saml/metadata',
+      name: 'Analytics SAML',
+      enabled: true,
+      protocol: 'saml',
+      redirectUris: ['https://analytics.example.test/saml/acs'],
+      attributes: {
+        'saml_assertion_consumer_url_post': 'https://analytics.example.test/saml/acs/post',
+        'saml_single_logout_service_url_redirect': 'https://analytics.example.test/saml/slo',
+        'saml.client.signature': 'true',
+        'saml.signing.certificate': 'A'.repeat(128),
+        'saml.encrypt': 'true',
+        'saml.encryption.certificate': 'B'.repeat(128),
+        'saml_idp_initiated_sso_url_name': 'analytics',
+        'saml_name_id_format': 'email',
+      },
+      protocolMappers: [{
+        name: 'email',
+        protocol: 'saml',
+        protocolMapper: 'saml-user-property-mapper',
+        config: { 'user.attribute': 'email', 'attribute.name': 'mail' },
+      }, {
+        name: 'groups',
+        protocol: 'saml',
+        protocolMapper: 'saml-group-membership-mapper',
+        config: { 'attribute.name': 'memberOf' },
+      }, {
+        name: 'roles',
+        protocol: 'saml',
+        protocolMapper: 'saml-role-list-mapper',
+        config: { 'attribute.name': 'roles' },
+      }],
+    }],
+  });
+  const { config, report } = transformKeycloakRealm(source, {
+    publicUrl: 'https://login.example.test',
+  });
+
+  assert.deepEqual(config.clients, []);
+  assert.deepEqual(config.samlIdentityProvider, {
+    entity_id: 'https://login.example.test/realms/acme/protocol/saml',
+    signing_private_key: '__GENERATE_AUTHME_SAML_IDP_SIGNING_KEY__',
+    signing_certificates: ['__GENERATE_AUTHME_SAML_IDP_SIGNING_CERTIFICATE__'],
+    service_providers: [{
+      id: 'analytics',
+      entity_id: 'https://analytics.example.test/saml/metadata',
+      acs_urls: [
+        'https://analytics.example.test/saml/acs',
+        'https://analytics.example.test/saml/acs/post',
+      ],
+      slo_url: 'https://analytics.example.test/saml/slo',
+      signing_certificates: [`-----BEGIN CERTIFICATE-----\n${'A'.repeat(64)}\n${'A'.repeat(64)}\n-----END CERTIFICATE-----`],
+      require_signed_authn_requests: true,
+      encryption_certificate: `-----BEGIN CERTIFICATE-----\n${'B'.repeat(64)}\n${'B'.repeat(64)}\n-----END CERTIFICATE-----`,
+      encrypt_assertions: true,
+      allow_idp_initiated: true,
+      name_id_format: 'urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress',
+      name_id_source: 'email',
+      attribute_mapping: { mail: 'email', memberOf: 'groups', roles: 'roles' },
+    }],
+  });
+  assert.deepEqual(config.environment.AUTHME_SAML_IDP_JSON.acme, config.samlIdentityProvider);
+  assert.equal(report.unsupportedOrSkipped.some(({ target }) => target.startsWith('samlIdentityProvider')), false);
+  assert.throws(() => parseSamlIdentityProviders(JSON.stringify(config.environment.AUTHME_SAML_IDP_JSON), {
+    realms: ['acme'], publicUrl: 'https://login.example.test',
+  }), /signing_private_key/u);
+
+  const deployable = structuredClone(config.environment.AUTHME_SAML_IDP_JSON);
+  deployable.acme.signing_private_key = `-----BEGIN PRIVATE KEY-----\n${'C'.repeat(128)}\n-----END PRIVATE KEY-----`;
+  deployable.acme.signing_certificates = [`-----BEGIN CERTIFICATE-----\n${'D'.repeat(128)}\n-----END CERTIFICATE-----`];
+  const parsed = parseSamlIdentityProviders(JSON.stringify(deployable), {
+    realms: ['acme'], publicUrl: 'https://login.example.test',
+  });
+  assert.equal(parsed.acme.serviceProviders[0].entityId, 'https://analytics.example.test/saml/metadata');
+  assert.equal(parsed.acme.serviceProviders[0].requireSignedAuthnRequests, true);
+  assert.equal(parsed.acme.serviceProviders[0].encryptAssertions, true);
+});
+
+test('does not weaken signed or encrypted SAML client requirements when certificates are missing', () => {
+  for (const attributes of [{
+    'saml.client.signature': 'true',
+  }, {
+    'saml.encrypt': 'true',
+  }]) {
+    const { config, report } = transformKeycloakRealm(realmExport({
+      clients: [{
+        clientId: 'https://blocked.example.test/saml/metadata',
+        protocol: 'saml',
+        redirectUris: ['https://blocked.example.test/saml/acs'],
+        attributes,
+      }],
+    }), { publicUrl: 'https://login.example.test' });
+    assert.equal(config.samlIdentityProvider, null);
+    assert.ok(report.unsupportedOrSkipped.some(({ category, item, reason }) =>
+      category === 'saml-client' && item === 'https://blocked.example.test/saml/metadata'
+        && /required.*no usable.*certificate/iu.test(reason)));
+  }
+});
+
+test('declared OIDC, workforce, and federation-hub reference profiles have no transformer blocker', () => {
+  const oidcClient = {
+    clientId: 'reference-browser', enabled: true, protocol: 'openid-connect', publicClient: true,
+    standardFlowEnabled: true, redirectUris: ['https://app.example.test/callback'],
+    attributes: { 'pkce.code.challenge.method': 'S256' },
+  };
+  const profiles = [{
+    name: 'OIDC application estate',
+    source: { realm: 'oidc-reference', clients: [oidcClient] },
+    assertConfig(config) { assert.equal(config.clients[0].client_id, 'reference-browser'); },
+  }, {
+    name: 'enterprise workforce',
+    source: {
+      realm: 'workforce-reference',
+      clients: [oidcClient],
+      identityProviders: [{
+        alias: 'workforce', providerId: 'oidc', enabled: true,
+        config: {
+          issuer: 'https://idp.example.test', authorizationUrl: 'https://idp.example.test/authorize',
+          tokenUrl: 'https://idp.example.test/token', jwksUrl: 'https://idp.example.test/jwks',
+          clientId: 'authme-workforce', clientSecret: 'not-copied', clientAuthMethod: 'client_secret_basic',
+        },
+      }],
+      components: {
+        'org.keycloak.storage.UserStorageProvider': [{
+          id: 'workforce-ldap', name: 'workforce-ldap', providerId: 'ldap',
+          config: {
+            enabled: ['true'], connectionUrl: ['ldaps://directory.example.test:636'],
+            usersDn: ['ou=people,dc=example,dc=test'], bindDn: ['cn=reader,dc=example,dc=test'],
+            bindCredential: ['not-copied'], usernameLDAPAttribute: ['uid'], uuidLDAPAttribute: ['entryUUID'],
+          },
+        }],
+      },
+    },
+    assertConfig(config) {
+      assert.equal(config.federation.oidc[0].id, 'workforce');
+      assert.equal(config.federation.ldap[0].id, 'workforce-ldap');
+    },
+  }, {
+    name: 'federation hub',
+    source: {
+      realm: 'federation-reference',
+      clients: [{
+        clientId: 'https://sp.example.test/metadata', protocol: 'saml', enabled: true,
+        redirectUris: ['https://sp.example.test/acs'],
+        attributes: {
+          'saml.client.signature': 'true', 'saml.signing.certificate': 'A'.repeat(128),
+          'saml.encrypt': 'true', 'saml.encryption.certificate': 'B'.repeat(128),
+          'saml_name_id_format': 'persistent',
+        },
+      }],
+    },
+    assertConfig(config) { assert.equal(config.samlIdentityProvider.service_providers.length, 1); },
+  }];
+
+  for (const profile of profiles) {
+    const { config, report } = transformKeycloakRealm(profile.source, {
+      publicUrl: 'https://login.example.test',
+    });
+    profile.assertConfig(config);
+    assert.deepEqual(report.unsupportedOrSkipped, [], `${profile.name} unexpectedly contains a migration blocker`);
+  }
 });
 
 test('skips public service-account clients and keeps client_credentials confidential', () => {

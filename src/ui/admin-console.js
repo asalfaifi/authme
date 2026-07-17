@@ -1103,6 +1103,28 @@ function clientCard(client) {
       element('li', {}, [element('span', { text: 'Authentication' }), element('strong', { text: method })]),
     ]),
   ]);
+  if (can('roles.manage')) {
+    card.append(actionButton('Create or edit client role', async () => {
+      const clientId = clientIdentifier(client);
+      const { roles = [] } = await requestJson(`/admin/v1/realms/${encodeURIComponent(state.realm)}/clients/${encodeURIComponent(clientId)}/roles`);
+      const definition = await promptedJson(`Create or replace a client role. Existing roles: ${roles.map((role) => role.name).join(', ') || 'none'}.`, {
+        name: 'reader', description: '', composites: [], attributes: {},
+      });
+      if (!definition?.name) return;
+      const { name, ...body } = definition;
+      await requestJson(`/admin/v1/realms/${encodeURIComponent(state.realm)}/clients/${encodeURIComponent(clientId)}/roles/${encodeURIComponent(name)}`, { method: 'PUT', body });
+      toast('Client role saved.');
+    }, 'secondary'));
+    card.append(actionButton('Delete client role', async () => {
+      const clientId = clientIdentifier(client);
+      const { roles = [] } = await requestJson(`/admin/v1/realms/${encodeURIComponent(state.realm)}/clients/${encodeURIComponent(clientId)}/roles`);
+      if (!roles.length) { toast('This client has no managed roles.'); return; }
+      const name = await promptedValue(`Client role to delete: ${roles.map((role) => role.name).join(', ')}`);
+      if (!name) return;
+      await requestJson(`/admin/v1/realms/${encodeURIComponent(state.realm)}/clients/${encodeURIComponent(clientId)}/roles/${encodeURIComponent(name)}`, { method: 'DELETE', body: {} });
+      toast('Client role deleted.');
+    }, 'danger-quiet'));
+  }
   if (client.managed && can('clients.manage')) {
     card.append(actionButton('Edit managed client', async () => {
       const metadata = editableClientMetadata(client);
@@ -1476,6 +1498,15 @@ async function renderOrganizations(signal) {
         const roles = await promptedValue('Organization roles (comma separated)', 'member'); if (roles === null) return;
         const invitation = await requestJson(`${organizationBase}/invitations`, { method: 'POST', body: { email, roles: commaValues(roles), expiresInSeconds: 86_400 } });
         showOneTimeValues({ title: 'Organization invitation created', description: 'Deliver this single-use token through a protected channel.', values: [['Email', invitation.email], ['Invitation token', invitation.token]] });
+      }, 'secondary'),
+      actionButton('Manage invitations', async () => {
+        const { invitations = [] } = await requestJson(`${organizationBase}/invitations`);
+        const available = invitations.filter((invitation) => !invitation.acceptedAt);
+        if (!available.length) { toast('This organization has no pending invitations.'); return; }
+        const invitationId = await promptedValue(`Enter an invitation UUID to revoke. Pending invitations:\n${available.map((invitation) => `${invitation.id} (${invitation.email}, expires ${formatDate(invitation.expiresAt)})`).join('\n')}`);
+        if (!invitationId) return;
+        await requestJson(`${organizationBase}/invitations/${encodeURIComponent(invitationId)}`, { method: 'DELETE', body: {} });
+        toast('Organization invitation revoked.');
       }, 'secondary'),
       actionButton('Delete', async () => {
         if (!await askConfirmation({ title: 'Delete organization?', message: `${organization.name}, its invitations, and memberships will be removed.`, action: 'Delete organization' })) return;

@@ -147,6 +147,7 @@ function fixture(options = {}) {
     publicUrl: 'https://login.example.test',
     csrfSecret,
     maxSamlPostBytes: options.maxSamlPostBytes ?? 2_048,
+    ...(options.loginPolicy ? { loginPolicy: options.loginPolicy } : {}),
   }));
   app.use((_req, res) => res.status(404).json({ code: 'NOT_FOUND' }));
   app.use((error, _req, res, _next) => res.status(error.status ?? 500).json({
@@ -372,6 +373,29 @@ test('OIDC callback is exact, fixed-origin, and completes with federated authent
   const openRedirect = await request(app)
     .get(`${callbackPath}?state=${oidcState}&code=code&returnTo=https%3A%2F%2Fevil.test`);
   assert.equal(openRedirect.status, 400);
+});
+
+test('completion enforces the caller policy and uses its configured flow assurance', async () => {
+  let context = fixture({ loginPolicy: async () => false });
+  let callback = await request(context.app)
+    .get(`/realms/master/federation/builtin.oidc-federation/partner/callback?state=${oidcState}&code=code`);
+  let { location } = callbackHandle(callback);
+  const denied = await request(context.app).get(`${location.pathname}${location.search}`);
+  assert.equal(denied.status, 403);
+  assert.equal(context.calls.finished.length, 0);
+
+  context = fixture({
+    loginPolicy: async ({ login }) => ({
+      accepted: login.amr.includes('federated'),
+      acr: 'urn:authme:configured-federation-flow',
+    }),
+  });
+  callback = await request(context.app)
+    .get(`/realms/master/federation/builtin.oidc-federation/partner/callback?state=${oidcState}&code=code`);
+  ({ location } = callbackHandle(callback));
+  const accepted = await request(context.app).get(`${location.pathname}${location.search}`);
+  assert.equal(accepted.status, 204);
+  assert.equal(context.calls.finished[0].result.login.acr, 'urn:authme:configured-federation-flow');
 });
 
 test('callback rejects an extension result mismatch and an invalid resolver result', async () => {

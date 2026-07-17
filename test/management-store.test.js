@@ -6,7 +6,7 @@ import {
   MemoryManagementStore,
 } from '../src/repositories/management-store.js';
 import { authenticationSatisfiesFlow } from '../src/routes/interactions.js';
-import { authenticationFlowConfigurationError } from '../src/authentication/flow-policy.js';
+import { authenticationFlowConfigurationError, totpRequiredForFlow } from '../src/authentication/flow-policy.js';
 
 test('realm roles compose without cycles and nested groups retain stable paths', async () => {
   const store = new MemoryManagementStore(['master', 'staff']);
@@ -18,12 +18,39 @@ test('realm roles compose without cycles and nested groups retain stable paths',
     store.putRole('master', { name: 'reader', description: '', composites: ['administrator'], attributes: {} }),
     /cycle/iu,
   );
+  await store.putRole('master', { name: 'concurrent-a', description: '', composites: [], attributes: {} });
+  await store.putRole('master', { name: 'concurrent-b', description: '', composites: [], attributes: {} });
+  const concurrentRealmCycle = await Promise.allSettled([
+    store.putRole('master', { name: 'concurrent-a', description: '', composites: ['concurrent-b'], attributes: {} }),
+    store.putRole('master', { name: 'concurrent-b', description: '', composites: ['concurrent-a'], attributes: {} }),
+  ]);
+  assert.equal(concurrentRealmCycle.filter(({ status }) => status === 'rejected').length, 1);
 
   const parent = await store.createGroup('master', { name: 'engineering', parentId: null, roles: ['reader'], attributes: {} });
   const child = await store.createGroup('master', { name: 'platform', parentId: parent.id, roles: ['editor'], attributes: {} });
   assert.equal(child.path, '/engineering/platform');
   await assert.rejects(store.updateGroup('master', parent.id, { parentId: child.id }), /cycle/iu);
   assert.deepEqual(await store.listGroups('staff'), []);
+});
+
+test('client roles have realm-local catalogs and validated composite expansion', async () => {
+  const store = new MemoryManagementStore(['master', 'staff']);
+  await store.putClientRole('master', 'orders', { name: 'read', description: '', composites: [], attributes: {} });
+  await store.putClientRole('master', 'orders', { name: 'admin', description: '', composites: ['read'], attributes: {} });
+  assert.deepEqual(expandCompositeRoles(['admin'], await store.listClientRoles('master', 'orders')), ['admin', 'read']);
+  await assert.rejects(store.putClientRole('master', 'orders', {
+    name: 'broken', description: '', composites: ['missing'], attributes: {},
+  }), /Unknown composite role/iu);
+  await store.putClientRole('master', 'orders', { name: 'concurrent-a', description: '', composites: [], attributes: {} });
+  await store.putClientRole('master', 'orders', { name: 'concurrent-b', description: '', composites: [], attributes: {} });
+  const concurrentClientCycle = await Promise.allSettled([
+    store.putClientRole('master', 'orders', { name: 'concurrent-a', description: '', composites: ['concurrent-b'], attributes: {} }),
+    store.putClientRole('master', 'orders', { name: 'concurrent-b', description: '', composites: ['concurrent-a'], attributes: {} }),
+  ]);
+  assert.equal(concurrentClientCycle.filter(({ status }) => status === 'rejected').length, 1);
+  assert.deepEqual(await store.listClientRoles('staff', 'orders'), []);
+  await store.deleteClientRole('master', 'orders', 'read');
+  assert.deepEqual((await store.listClientRoles('master', 'orders')).find((role) => role.name === 'admin').composites, []);
 });
 
 test('client scopes aggregate safe claim mappers and authentication flows resolve by client and acr', async () => {
@@ -65,6 +92,9 @@ test('client scopes aggregate safe claim mappers and authentication flows resolv
 
 test('authentication flows reject configurations the interaction engine cannot execute', async () => {
   assert.match(authenticationFlowConfigurationError([
+    { type: 'totp', requirement: 'conditional' },
+  ]), /primary method/iu);
+  assert.match(authenticationFlowConfigurationError([
     { type: 'passkey', requirement: 'required' },
     { type: 'totp', requirement: 'required' },
   ]), /TOTP can only be combined with password/iu);
@@ -76,6 +106,12 @@ test('authentication flows reject configurations the interaction engine cannot e
     { type: 'password', requirement: 'required' },
     { type: 'totp', requirement: 'conditional' },
   ]), undefined);
+  assert.equal(totpRequiredForFlow({ steps: [{ type: 'password', requirement: 'required' }] }, { totpConfirmed: true }), false);
+  assert.equal(totpRequiredForFlow({ steps: [
+    { type: 'password', requirement: 'required' },
+    { type: 'totp', requirement: 'conditional' },
+  ] }, { totpConfirmed: true }), true);
+  assert.equal(totpRequiredForFlow(undefined, { totpConfirmed: true }), true, 'the baseline enrolled-MFA policy changed');
 });
 
 test('organizations isolate domains, memberships, invitations, and signing-key lifecycle by realm', async () => {
@@ -98,6 +134,33 @@ test('organizations isolate domains, memberships, invitations, and signing-key l
   await store.upsertOrganizationMembership('master', organization.id, '00000000-0000-4000-8000-000000000001', ['owner']);
   assert.equal((await store.listUserOrganizations('master', '00000000-0000-4000-8000-000000000001'))[0].alias, 'example');
   assert.deepEqual(await store.listUserOrganizations('staff', '00000000-0000-4000-8000-000000000001'), []);
+
+  const invitation = await store.createOrganizationInvitation('master', {
+    organizationId: organization.id,
+    email: 'invitee@example.test',
+    roles: ['member'],
+    tokenDigest: 'a'.repeat(43),
+    expiresAt: new Date(Date.now() + 60_000),
+  });
+  await store.updateOrganization('master', organization.id, { enabled: false });
+  assert.equal(await store.consumeOrganizationInvitation('master', 'a'.repeat(43), {
+    id: '00000000-0000-4000-8000-000000000002', email: 'invitee@example.test',
+  }), undefined);
+  await store.updateOrganization('master', organization.id, { enabled: true });
+  assert.equal((await store.consumeOrganizationInvitation('master', 'a'.repeat(43), {
+    id: '00000000-0000-4000-8000-000000000002', email: 'invitee@example.test',
+  })).id, invitation.id);
+  const revoked = await store.createOrganizationInvitation('master', {
+    organizationId: organization.id,
+    email: 'revoked@example.test',
+    roles: [],
+    tokenDigest: 'b'.repeat(43),
+    expiresAt: new Date(Date.now() + 60_000),
+  });
+  assert.equal(await store.deleteOrganizationInvitation('master', organization.id, revoked.id), true);
+  assert.equal(await store.consumeOrganizationInvitation('master', 'b'.repeat(43), {
+    id: '00000000-0000-4000-8000-000000000003', email: 'revoked@example.test',
+  }), undefined);
 
   await store.putSigningKey('master', { keyId: 'old', provider: 'aws-kms', status: 'active', algorithm: 'RS256', materialReference: 'kms:key/old', publicJwk: { kty: 'RSA', kid: 'old' }, activatedAt: new Date(), retireAfter: null });
   await store.putSigningKey('master', { keyId: 'new', provider: 'aws-kms', status: 'active', algorithm: 'RS256', materialReference: 'kms:key/new', publicJwk: { kty: 'RSA', kid: 'new' }, activatedAt: new Date(), retireAfter: null });

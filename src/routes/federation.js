@@ -369,19 +369,21 @@ export function createFederationRouter({
       const { extensionId, providerId } = login;
       extensionFor(registry, realm, extensionId, providerId,
         extensionId === 'builtin.saml-federation' ? 'saml2' : 'oidc');
-      if (!await loginPolicy({ details, login })) {
-        throw requestError('The federated identity is not authorized for the requested organization', 403, 'AUTHME_FEDERATION_ORGANIZATION_DENIED');
+      const policy = await loginPolicy({ details, login });
+      if (policy === false || policy?.accepted === false) {
+        throw requestError('The federated identity does not satisfy this authorization request', 403, 'AUTHME_FEDERATION_POLICY_DENIED');
       }
+      const acr = typeof policy?.acr === 'string' ? policy.acr : login.acr;
       await audit(auditEvent(req, realm, 'identity.federation.login_succeeded', extensionId, providerId, {
         clientId: details.params?.client_id,
         subjectId: login.accountId,
-        metadata: { amr: login.amr, acr: login.acr },
+        metadata: { amr: login.amr, acr },
       }));
       res.set('Referrer-Policy', 'no-referrer');
       return provider.interactionFinished(req, res, {
         login: {
           accountId: login.accountId,
-          acr: login.acr,
+          acr,
           amr: login.amr,
           remember: true,
         },

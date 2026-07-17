@@ -16,6 +16,8 @@ const prototypeShapedKeys = new Set(['__proto__', 'constructor', 'prototype']);
 // client-secret policy. An artifact cannot become deployable by accident.
 const clientSecretPlaceholder = '__ROTATE__';
 const bindSecretPlaceholder = '__ROTATE__';
+const samlIdpSigningKeyPlaceholder = '__GENERATE_AUTHME_SAML_IDP_SIGNING_KEY__';
+const samlIdpSigningCertificatePlaceholder = '__GENERATE_AUTHME_SAML_IDP_SIGNING_CERTIFICATE__';
 const sensitiveAttributeName = /(?:password|passwd|secret|token|credential|private[-_. ]?key)/iu;
 
 const compare = (left, right) => left < right ? -1 : left > right ? 1 : 0;
@@ -622,6 +624,7 @@ function mapClients(source, report) {
       continue;
     }
     const protocol = optionalString(input.protocol, `${path}.protocol`) ?? 'openid-connect';
+    if (protocol === 'saml') continue;
     if (protocol !== 'openid-connect') {
       report.unsupported('client', path, 'clients', clientId,
         `Protocol ${protocol} is not an AuthMe relying-party protocol.`);
@@ -735,6 +738,193 @@ function mapClients(source, report) {
     report.mapped('client', path, 'clients', clientId);
   }
   return clients.sort((left, right) => compare(left.client_id, right.client_id));
+}
+
+function normalizeSamlServiceProviderId(value, path, report, item) {
+  if (providerIdPattern.test(value)) return value;
+  let prefix = value.toLowerCase().replace(/[^a-z0-9-]+/gu, '-').replace(/^-+|-+$/gu, '');
+  if (!/^[a-z]/u.test(prefix)) prefix = `sp-${prefix}`;
+  if (!prefix) prefix = 'sp';
+  const digest = createHash('sha256').update(`authme-saml-service-provider\0${value}`).digest('hex').slice(0, 8);
+  const id = `${prefix.slice(0, 23).replace(/-+$/u, '')}-${digest}`;
+  report.warning('saml-service-provider', path, 'samlIdentityProvider.service_providers[].id', item,
+    `Service-provider identifier was normalized to ${id}; update IdP-initiated links and operator references.`);
+  return id;
+}
+
+function samlClientNameId(client, path, report, clientId) {
+  const raw = clientAttribute(client, 'saml_name_id_format')
+    ?? clientAttribute(client, 'saml.name.id.format')
+    ?? 'username';
+  const normalized = raw.toLowerCase();
+  if (normalized === 'username'
+    || normalized === 'unspecified'
+    || normalized === 'urn:oasis:names:tc:saml:1.1:nameid-format:unspecified') {
+    return {
+      name_id_format: 'urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified',
+      name_id_source: 'username',
+    };
+  }
+  if (normalized === 'email'
+    || normalized === 'emailaddress'
+    || normalized === 'urn:oasis:names:tc:saml:1.1:nameid-format:emailaddress') {
+    return {
+      name_id_format: 'urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress',
+      name_id_source: 'email',
+    };
+  }
+  if (normalized === 'persistent'
+    || normalized === 'urn:oasis:names:tc:saml:2.0:nameid-format:persistent') {
+    return {
+      name_id_format: 'urn:oasis:names:tc:SAML:2.0:nameid-format:persistent',
+      name_id_source: 'persistent',
+    };
+  }
+  report.unsupported('saml-client', `${path}.attributes.saml_name_id_format`,
+    'samlIdentityProvider.service_providers[].name_id_format', clientId,
+    `NameID format ${raw} cannot be reproduced by AuthMe's persistent, email, or username subject sources.`);
+  return undefined;
+}
+
+function samlClientAttributeMapping(client, path, report, clientId) {
+  const entries = [];
+  const sourceNames = new Map([
+    ['id', 'id'], ['username', 'username'], ['email', 'email'], ['emailverified', 'email_verified'],
+    ['firstname', 'given_name'], ['givenname', 'given_name'], ['lastname', 'family_name'],
+    ['familyname', 'family_name'], ['displayname', 'name'], ['name', 'name'],
+  ]);
+  for (const [index, raw] of optionalArray(client.protocolMappers, `${path}.protocolMappers`).entries()) {
+    const mapperPath = `${path}.protocolMappers[${index}]`;
+    const input = record(raw, mapperPath);
+    const name = optionalString(input.name, `${mapperPath}.name`) ?? `mapper-${index}`;
+    const type = (optionalString(input.protocolMapper, `${mapperPath}.protocolMapper`) ?? '').toLowerCase();
+    const configuration = optionalRecord(input.config, `${mapperPath}.config`);
+    const attribute = configString(configuration, 'attribute.name');
+    let source;
+    if (type === 'saml-group-membership-mapper') source = 'groups';
+    else if (type === 'saml-role-list-mapper') source = 'roles';
+    else if (['saml-user-property-mapper', 'saml-user-attribute-mapper'].includes(type)) {
+      const property = configString(configuration, 'user.attribute')
+        ?? configString(configuration, 'user.attribute.name');
+      source = property ? sourceNames.get(property.toLowerCase()) : undefined;
+    }
+    if (!attribute || !source) {
+      report.unsupported('saml-protocol-mapper', mapperPath,
+        'samlIdentityProvider.service_providers[].attribute_mapping', `${clientId}:${name}`,
+        'Only direct user profile, group-membership, and role-list SAML mappers are portable.');
+      continue;
+    }
+    const existing = entries.find(([mappedAttribute]) => mappedAttribute === attribute);
+    if (existing && existing[1] !== source) {
+      invalid(`${mapperPath}.config.attribute.name`, `conflicts with another mapping for SAML attribute ${attribute}`);
+    }
+    if (!existing) entries.push([attribute, source]);
+    report.mapped('saml-protocol-mapper', mapperPath,
+      `samlIdentityProvider.service_providers[].attribute_mapping.${attribute}`, `${clientId}:${name}`);
+  }
+  return sortedRecord(entries);
+}
+
+function mapSamlIdentityProvider(source, realmMapping, report) {
+  const serviceProviders = [];
+  const ids = new Set();
+  const entityIds = new Set();
+  for (const [index, raw] of optionalArray(source.clients, 'clients').entries()) {
+    const path = `clients[${index}]`;
+    const input = record(raw, path);
+    const clientId = requiredString(input.clientId, `${path}.clientId`);
+    const protocol = optionalString(input.protocol, `${path}.protocol`) ?? 'openid-connect';
+    if (protocol !== 'saml' || input.enabled === false) continue;
+
+    const entityId = samlEntityId(clientId);
+    if (!entityId) {
+      report.unsupported('saml-client', `${path}.clientId`,
+        'samlIdentityProvider.service_providers[].entity_id', clientId,
+        'A downstream SAML service provider requires an absolute, credential-free entity ID without a fragment.');
+      continue;
+    }
+    if (entityIds.has(entityId)) invalid(`${path}.clientId`, `duplicates SAML entity ID ${entityId}`);
+    entityIds.add(entityId);
+
+    const initiatedAlias = clientAttribute(input, 'saml_idp_initiated_sso_url_name');
+    const id = normalizeSamlServiceProviderId(initiatedAlias ?? optionalString(input.name, `${path}.name`) ?? clientId,
+      initiatedAlias ? `${path}.attributes.saml_idp_initiated_sso_url_name` : `${path}.clientId`, report, clientId);
+    if (ids.has(id)) invalid(path, `normalizes to duplicate SAML service-provider id ${id}`);
+    ids.add(id);
+
+    const assertionConsumerUrl = clientAttribute(input, 'saml_assertion_consumer_url_post');
+    const acsUrls = uniqueSorted([
+      ...mapUriList(input.redirectUris, `${path}.redirectUris`, report, clientId,
+        'samlIdentityProvider.service_providers[].acs_urls', {}),
+      ...mapUriList(assertionConsumerUrl ? [assertionConsumerUrl] : [],
+        `${path}.attributes.saml_assertion_consumer_url_post`, report, clientId,
+        'samlIdentityProvider.service_providers[].acs_urls', {}),
+    ]);
+    if (!acsUrls.length) {
+      report.unsupported('saml-client', path, 'samlIdentityProvider.service_providers[].acs_urls', clientId,
+        'No exact HTTPS Assertion Consumer Service URL could be mapped.');
+      continue;
+    }
+
+    const signingCertificate = certificatePem(clientAttribute(input, 'saml.signing.certificate'));
+    const requireSignedAuthnRequests = configBoolean(optionalRecord(input.attributes, `${path}.attributes`),
+      'saml.client.signature');
+    if (requireSignedAuthnRequests && !signingCertificate) {
+      report.unsupported('saml-client', `${path}.attributes.saml.signing.certificate`,
+        'samlIdentityProvider.service_providers[].signing_certificates', clientId,
+        'Signed AuthnRequests are required but the export has no usable service-provider signing certificate.');
+      continue;
+    }
+
+    const encryptionCertificate = certificatePem(clientAttribute(input, 'saml.encryption.certificate')
+      ?? clientAttribute(input, 'saml_encryption_certificate'));
+    const encryptAssertions = configBoolean(optionalRecord(input.attributes, `${path}.attributes`), 'saml.encrypt');
+    if (encryptAssertions && !encryptionCertificate) {
+      report.unsupported('saml-client', `${path}.attributes.saml.encryption.certificate`,
+        'samlIdentityProvider.service_providers[].encryption_certificate', clientId,
+        'Encrypted assertions are required but the export has no usable service-provider encryption certificate.');
+      continue;
+    }
+
+    const nameId = samlClientNameId(input, path, report, clientId);
+    if (!nameId) continue;
+    const rawSloUrl = clientAttribute(input, 'saml_single_logout_service_url_redirect');
+    const sloUrl = rawSloUrl ? exactUri(rawSloUrl, `${path}.attributes.saml_single_logout_service_url_redirect`) : undefined;
+    if (rawSloUrl && !sloUrl) {
+      report.unsupported('saml-client-slo', `${path}.attributes.saml_single_logout_service_url_redirect`,
+        'samlIdentityProvider.service_providers[].slo_url', clientId,
+        'The Redirect-binding SLO URL is not an exact HTTPS endpoint and was omitted.');
+    }
+    if (sloUrl && !signingCertificate) {
+      report.unsupported('saml-client-slo', `${path}.attributes.saml.signing.certificate`,
+        'samlIdentityProvider.service_providers[].slo_url', clientId,
+        'SLO was omitted because AuthMe requires a service-provider certificate for signed logout messages.');
+    }
+
+    serviceProviders.push({
+      id,
+      entity_id: entityId,
+      acs_urls: acsUrls,
+      ...(sloUrl && signingCertificate ? { slo_url: sloUrl } : {}),
+      ...(signingCertificate ? { signing_certificates: [signingCertificate] } : {}),
+      require_signed_authn_requests: requireSignedAuthnRequests,
+      ...(encryptionCertificate ? { encryption_certificate: encryptionCertificate } : {}),
+      encrypt_assertions: encryptAssertions,
+      allow_idp_initiated: Boolean(initiatedAlias),
+      ...nameId,
+      attribute_mapping: samlClientAttributeMapping(input, path, report, clientId),
+    });
+    report.mapped('saml-client', path, 'samlIdentityProvider.service_providers', clientId);
+  }
+  if (!serviceProviders.length) return null;
+  report.warning('saml-idp-signing-key', 'clients', 'samlIdentityProvider.signing_private_key', realmMapping.realm.name,
+    'Downstream SAML service providers were mapped, but a new AuthMe IdP signing key and certificate must be generated and injected.');
+  return {
+    ...(realmMapping.realm.issuer ? { entity_id: `${realmMapping.realm.issuer}/protocol/saml` } : {}),
+    signing_private_key: samlIdpSigningKeyPlaceholder,
+    signing_certificates: [samlIdpSigningCertificatePlaceholder],
+    service_providers: serviceProviders.sort((left, right) => compare(left.id, right.id)),
+  };
 }
 
 function normalizeProviderId(alias, path, report) {
@@ -1326,6 +1516,7 @@ export function transformKeycloakRealm(sourceInput, options = {}) {
   const report = reportBuilder(realmName);
   const realmMapping = mapRealm(source, realmName, settings, report);
   const clients = mapClients(source, report);
+  const samlIdentityProvider = mapSamlIdentityProvider(source, realmMapping, report);
   const roles = mapRoles(source, report);
   const groups = mapGroups(source, report);
   const idp = mapIdentityProviders(source, report);
@@ -1346,11 +1537,13 @@ export function transformKeycloakRealm(sourceInput, options = {}) {
     AUTHME_LDAP_PROVIDERS_JSON: { [realmName]: ldap },
     AUTHME_OIDC_PROVIDERS_JSON: { [realmName]: idp.oidc },
     AUTHME_SAML_PROVIDERS_JSON: { [realmName]: idp.saml },
+    AUTHME_SAML_IDP_JSON: { [realmName]: samlIdentityProvider },
   };
   const config = {
     schemaVersion: 'authme.keycloak-import/v1',
     realm: realmMapping.realm,
     clients,
+    samlIdentityProvider,
     roles,
     groups,
     users,

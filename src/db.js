@@ -174,24 +174,40 @@ export async function createDataLayer(config) {
       return cloneManagedClient(metadata);
     },
     async deleteManagedClient(realm, clientId) {
-      const result = await pool.query(
-        `WITH removed_client AS (
-           DELETE FROM oidc_records WHERE realm_name=$1 AND model='Client' AND id=$2 RETURNING id
-         ), client_grants AS MATERIALIZED (
-           SELECT id FROM oidc_records WHERE realm_name=$1 AND model='Grant' AND payload->>'clientId'=$2
-         ), revoked AS (
-           DELETE FROM oidc_records WHERE realm_name=$1
-             AND ((payload->>'clientId'=$2 AND model<>'Client') OR grant_id IN (SELECT id FROM client_grants))
-         ), assignments AS (
-           DELETE FROM client_scope_assignments
-           WHERE realm_name=$1 AND client_id=$2 AND EXISTS (SELECT 1 FROM removed_client)
-         ), mappers AS (
-           DELETE FROM claim_mappers
-           WHERE realm_name=$1 AND owner_type='client' AND owner_id=$2 AND EXISTS (SELECT 1 FROM removed_client)
-         ) SELECT id FROM removed_client`,
-        [realm, clientId],
-      );
-      return result.rowCount === 1;
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [
+          `authme:client-roles:${realm}:${clientId}`,
+        ]);
+        const result = await client.query(
+          `WITH removed_client AS (
+             DELETE FROM oidc_records WHERE realm_name=$1 AND model='Client' AND id=$2 RETURNING id
+           ), client_grants AS MATERIALIZED (
+             SELECT id FROM oidc_records WHERE realm_name=$1 AND model='Grant' AND payload->>'clientId'=$2
+           ), revoked AS (
+             DELETE FROM oidc_records WHERE realm_name=$1
+               AND ((payload->>'clientId'=$2 AND model<>'Client') OR grant_id IN (SELECT id FROM client_grants))
+           ), assignments AS (
+             DELETE FROM client_scope_assignments
+             WHERE realm_name=$1 AND client_id=$2 AND EXISTS (SELECT 1 FROM removed_client)
+           ), mappers AS (
+             DELETE FROM claim_mappers
+             WHERE realm_name=$1 AND owner_type='client' AND owner_id=$2 AND EXISTS (SELECT 1 FROM removed_client)
+           ), roles AS (
+             DELETE FROM client_roles
+             WHERE realm_name=$1 AND client_id=$2 AND EXISTS (SELECT 1 FROM removed_client)
+           ) SELECT id FROM removed_client`,
+          [realm, clientId],
+        );
+        await client.query('COMMIT');
+        return result.rowCount === 1;
+      } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw error;
+      } finally {
+        client.release();
+      }
     },
     async claimInitialAccessToken(realm, id) {
       const result = await pool.query(

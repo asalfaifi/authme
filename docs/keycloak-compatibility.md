@@ -2,9 +2,9 @@
 
 ## Compatibility promise
 
-AuthMe v1.0.0-rc.1 provides a migration-oriented compatibility facade for common Keycloak OpenID Connect clients. It preserves Keycloak-shaped issuer URLs, OIDC endpoint paths, and role claims so many relying parties can switch providers with little or no application code change.
+AuthMe v1.0.0-rc.1 provides a migration-oriented compatibility facade for common Keycloak OpenID Connect applications and downstream SAML service providers. It preserves Keycloak-shaped issuer URLs, OIDC endpoint paths, role claims, and the supported exact SAML registration contract so relying parties can migrate through an explicit reconciliation process.
 
-It is not a drop-in replacement for the Keycloak Admin REST API, database, extensions, adapters, SAML surface, or every Keycloak feature. Compatibility means explicitly listed behavior only.
+It is not a drop-in replacement for the Keycloak Admin REST API, database, extensions, adapters, complete SAML surface, or every Keycloak feature. Compatibility means explicitly listed behavior only.
 
 Keycloak's current feature inventory includes OIDC/OAuth, SAML, identity brokering, social login, LDAP/AD federation, Kerberos, admin and account consoles, themes, flexible authentication, passkeys/TOTP/recovery codes, sessions, token mappers, and SPIs; see the official [Keycloak Server Administration Guide](https://www.keycloak.org/docs/latest/server_admin/). AuthMe implements a documented subset and stages the rest rather than implying drop-in parity.
 
@@ -68,6 +68,12 @@ The v1 release-candidate compatibility contract is evaluated against three named
 | **Federation hub** | AuthMe downstream SAML IdP with exact registered SP metadata, signed Response/Assertion, optional assertion encryption, supported IdP initiation and redirect SLO, plus the OIDC application profile | SAML artifact binding, SOAP/POST or multi-party logout, arbitrary Keycloak authentication SPIs/themes, or SP behavior outside the registered algorithm/binding contract |
 
 A deployment matches a profile only when `kc:import` reports no unsupported feature used by a critical workload, every emitted reference reconciles, credentials and secrets have an explicit replacement plan, and its relying-party/federation test suite passes against a production-like AuthMe environment. Any listed blocker makes that source deployment out of profile; it must be redesigned, split into a bounded coexistence migration, or remain on Keycloak. This prevents “no critical blocker” from being inferred merely from a successful JSON parse.
+
+`test/keycloak-import.test.js` contains executable minimal exports for all three
+profiles and requires a zero-item `unsupportedOrSkipped` report. They prove the
+bounded transformer contract, including downstream signed/encrypted SAML
+registration; they do not replace a deployment's own inventory, secret/key
+replacement, reconciliation, or interoperability evidence.
 
 ## URL mapping
 

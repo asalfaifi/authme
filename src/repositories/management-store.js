@@ -41,6 +41,14 @@ function publicRole(row) {
   };
 }
 
+function publicClientRole(row) {
+  if (!row) return undefined;
+  return {
+    clientId: row.clientId ?? row.client_id,
+    ...publicRole(row),
+  };
+}
+
 function groupPaths(rows) {
   const byId = new Map(rows.map((row) => [String(row.id), row]));
   const paths = new Map();
@@ -212,10 +220,27 @@ export function applyClaimMappers({ user, organizations = [], mappers = [] }) {
   return claims;
 }
 
+async function withPostgresRoleGraphLock(pool, namespace, operation) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [namespace]);
+    const result = await operation(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 export class MemoryManagementStore {
   constructor(realms = []) {
     this.realms = new Map();
     this.roles = new Map();
+    this.clientRoleDefinitions = new Map();
     this.groups = new Map();
     this.clientScopes = new Map();
     this.scopeAssignments = new Map();
@@ -247,7 +272,9 @@ export class MemoryManagementStore {
   }
 
   async putRole(realm, input) {
-    const roles = await this.listRoles(realm);
+    const roles = [...this.roles.entries()]
+      .filter(([entry]) => entry.startsWith(`${realm}\u0000`))
+      .map(([, role]) => publicRole(role));
     validateRoleGraph(input, roles);
     const existing = this.roles.get(key(realm, input.name));
     const timestamp = nowIso();
@@ -267,6 +294,44 @@ export class MemoryManagementStore {
     for (const [entry, group] of this.groups) {
       if (entry.startsWith(`${realm}\u0000`) && group.roles.includes(name)) {
         this.groups.set(entry, { ...group, roles: group.roles.filter((item) => item !== name), updatedAt: nowIso() });
+      }
+    }
+    return true;
+  }
+
+  async listClientRoles(realm, clientId) {
+    return [...this.clientRoleDefinitions.entries()]
+      .filter(([entry]) => entry.startsWith(`${realm}\u0000${clientId}\u0000`))
+      .map(([, definition]) => publicClientRole(definition))
+      .sort((left, right) => left.name.localeCompare(right.name));
+  }
+
+  async putClientRole(realm, clientId, input) {
+    const definitions = [...this.clientRoleDefinitions.entries()]
+      .filter(([entry]) => entry.startsWith(`${realm}\u0000${clientId}\u0000`))
+      .map(([, definition]) => publicClientRole(definition));
+    validateRoleGraph(input, definitions);
+    const entry = key(realm, clientId, input.name);
+    const existing = this.clientRoleDefinitions.get(entry);
+    const timestamp = nowIso();
+    const definition = {
+      ...clone(input), clientId,
+      createdAt: existing?.createdAt ?? timestamp, updatedAt: timestamp,
+    };
+    this.clientRoleDefinitions.set(entry, definition);
+    return publicClientRole(definition);
+  }
+
+  async deleteClientRole(realm, clientId, name) {
+    const deleted = this.clientRoleDefinitions.delete(key(realm, clientId, name));
+    if (!deleted) return false;
+    for (const [entry, definition] of this.clientRoleDefinitions) {
+      if (entry.startsWith(`${realm}\u0000${clientId}\u0000`) && definition.composites.includes(name)) {
+        this.clientRoleDefinitions.set(entry, {
+          ...definition,
+          composites: definition.composites.filter((item) => item !== name),
+          updatedAt: nowIso(),
+        });
       }
     }
     return true;
@@ -367,6 +432,7 @@ export class MemoryManagementStore {
   async deleteClientPolicy(realm, clientId) {
     let assignments = 0;
     let claimMappers = 0;
+    let clientRoles = 0;
     for (const entry of this.scopeAssignments.keys()) {
       if (entry.startsWith(`${realm}\u0000${clientId}\u0000`)) {
         this.scopeAssignments.delete(entry);
@@ -379,7 +445,13 @@ export class MemoryManagementStore {
         claimMappers += 1;
       }
     }
-    return { assignments, claimMappers };
+    for (const entry of this.clientRoleDefinitions.keys()) {
+      if (entry.startsWith(`${realm}\u0000${clientId}\u0000`)) {
+        this.clientRoleDefinitions.delete(entry);
+        clientRoles += 1;
+      }
+    }
+    return { assignments, claimMappers, clientRoles };
   }
   async effectiveClaimMappers(realm, clientId, grantedScopes = []) {
     const direct = await this.listClaimMappers(realm, 'client', clientId);
@@ -490,10 +562,15 @@ export class MemoryManagementStore {
     return publicInvitation(invitation);
   }
   async listOrganizationInvitations(realm, organizationId) { return [...this.invitations.entries()].filter(([entry]) => entry.startsWith(`${realm}\u0000${organizationId}\u0000`)).map(([, invitation]) => publicInvitation(invitation)); }
+  async deleteOrganizationInvitation(realm, organizationId, invitationId) {
+    return this.invitations.delete(key(realm, organizationId, invitationId));
+  }
   async consumeOrganizationInvitation(realm, tokenDigest, user) {
     const match = [...this.invitations.entries()].find(([entry, invitation]) => entry.startsWith(`${realm}\u0000`) && invitation.tokenDigest === tokenDigest && !invitation.acceptedAt && new Date(invitation.expiresAt).getTime() > Date.now());
     if (!match || match[1].email.toLowerCase() !== user.email.toLowerCase()) return undefined;
     const [entry, invitation] = match;
+    const organization = await this.findOrganization(realm, invitation.organizationId);
+    if (!organization?.enabled) return undefined;
     invitation.acceptedAt = nowIso();
     this.invitations.set(entry, invitation);
     await this.upsertOrganizationMembership(realm, invitation.organizationId, user.id, invitation.roles);
@@ -529,23 +606,53 @@ export class PostgresManagementStore {
   }
   async listRoles(realm) { return (await this.pool.query('SELECT * FROM realm_roles WHERE realm_name=$1 ORDER BY name', [realm])).rows.map(publicRole); }
   async putRole(realm, input) {
-    validateRoleGraph(input, await this.listRoles(realm));
-    const result = await this.pool.query(
-      `INSERT INTO realm_roles (realm_name,name,description,composites,attributes) VALUES ($1,$2,$3,$4,$5)
-       ON CONFLICT (realm_name,name) DO UPDATE SET description=EXCLUDED.description, composites=EXCLUDED.composites, attributes=EXCLUDED.attributes
-       RETURNING *`, [realm, input.name, input.description, input.composites, input.attributes],
-    );
-    return publicRole(result.rows[0]);
+    return withPostgresRoleGraphLock(this.pool, `authme:realm-roles:${realm}`, async (client) => {
+      const roles = (await client.query('SELECT * FROM realm_roles WHERE realm_name=$1 ORDER BY name', [realm])).rows.map(publicRole);
+      validateRoleGraph(input, roles);
+      const result = await client.query(
+        `INSERT INTO realm_roles (realm_name,name,description,composites,attributes) VALUES ($1,$2,$3,$4,$5)
+         ON CONFLICT (realm_name,name) DO UPDATE SET description=EXCLUDED.description, composites=EXCLUDED.composites, attributes=EXCLUDED.attributes
+         RETURNING *`, [realm, input.name, input.description, input.composites, input.attributes],
+      );
+      return publicRole(result.rows[0]);
+    });
   }
   async deleteRole(realm, name) {
-    const result = await this.pool.query(
-      `WITH deleted AS (DELETE FROM realm_roles WHERE realm_name=$1 AND name=$2 RETURNING name),
-       roles_updated AS (UPDATE realm_roles SET composites=array_remove(composites,$2) WHERE realm_name=$1 AND $2=ANY(composites)),
-       groups_updated AS (UPDATE realm_groups SET roles=array_remove(roles,$2) WHERE realm_name=$1 AND $2=ANY(roles)),
-       users_updated AS (UPDATE users SET roles=array_remove(roles,$2) WHERE realm_name=$1 AND $2=ANY(roles))
-       SELECT name FROM deleted`, [realm, name],
-    );
-    return result.rowCount === 1;
+    return withPostgresRoleGraphLock(this.pool, `authme:realm-roles:${realm}`, async (client) => {
+      const result = await client.query(
+        `WITH deleted AS (DELETE FROM realm_roles WHERE realm_name=$1 AND name=$2 RETURNING name),
+         roles_updated AS (UPDATE realm_roles SET composites=array_remove(composites,$2) WHERE realm_name=$1 AND $2=ANY(composites)),
+         groups_updated AS (UPDATE realm_groups SET roles=array_remove(roles,$2) WHERE realm_name=$1 AND $2=ANY(roles)),
+         users_updated AS (UPDATE users SET roles=array_remove(roles,$2) WHERE realm_name=$1 AND $2=ANY(roles))
+         SELECT name FROM deleted`, [realm, name],
+      );
+      return result.rowCount === 1;
+    });
+  }
+  async listClientRoles(realm, clientId) { return (await this.pool.query('SELECT * FROM client_roles WHERE realm_name=$1 AND client_id=$2 ORDER BY name', [realm, clientId])).rows.map(publicClientRole); }
+  async putClientRole(realm, clientId, input) {
+    return withPostgresRoleGraphLock(this.pool, `authme:client-roles:${realm}:${clientId}`, async (client) => {
+      const definitions = (await client.query(
+        'SELECT * FROM client_roles WHERE realm_name=$1 AND client_id=$2 ORDER BY name', [realm, clientId],
+      )).rows.map(publicClientRole);
+      validateRoleGraph(input, definitions);
+      return publicClientRole((await client.query(
+        `INSERT INTO client_roles (realm_name,client_id,name,description,composites,attributes) VALUES ($1,$2,$3,$4,$5,$6)
+         ON CONFLICT (realm_name,client_id,name) DO UPDATE SET description=EXCLUDED.description,composites=EXCLUDED.composites,attributes=EXCLUDED.attributes RETURNING *`,
+        [realm, clientId, input.name, input.description, input.composites, input.attributes],
+      )).rows[0]);
+    });
+  }
+  async deleteClientRole(realm, clientId, name) {
+    return withPostgresRoleGraphLock(this.pool, `authme:client-roles:${realm}:${clientId}`, async (client) => {
+      const result = await client.query(
+        `WITH deleted AS (DELETE FROM client_roles WHERE realm_name=$1 AND client_id=$2 AND name=$3 RETURNING name),
+         updated AS (UPDATE client_roles SET composites=array_remove(composites,$3) WHERE realm_name=$1 AND client_id=$2 AND $3=ANY(composites))
+         SELECT name FROM deleted`,
+        [realm, clientId, name],
+      );
+      return result.rowCount === 1;
+    });
   }
   async listGroups(realm) { return groupPaths((await this.pool.query('SELECT * FROM realm_groups WHERE realm_name=$1', [realm])).rows.map(publicGroup)).sort((a, b) => a.path.localeCompare(b.path)); }
   async createGroup(realm, input) {
@@ -605,12 +712,15 @@ export class PostgresManagementStore {
          DELETE FROM client_scope_assignments WHERE realm_name=$1 AND client_id=$2 RETURNING 1
        ), deleted_mappers AS (
          DELETE FROM claim_mappers WHERE realm_name=$1 AND owner_type='client' AND owner_id=$2 RETURNING 1
+       ), deleted_roles AS (
+         DELETE FROM client_roles WHERE realm_name=$1 AND client_id=$2 RETURNING 1
        )
        SELECT (SELECT count(*)::integer FROM deleted_assignments) AS assignments,
-              (SELECT count(*)::integer FROM deleted_mappers) AS claim_mappers`,
+              (SELECT count(*)::integer FROM deleted_mappers) AS claim_mappers,
+              (SELECT count(*)::integer FROM deleted_roles) AS client_roles`,
       [realm, clientId],
     );
-    return { assignments: result.rows[0].assignments, claimMappers: result.rows[0].claim_mappers };
+    return { assignments: result.rows[0].assignments, claimMappers: result.rows[0].claim_mappers, clientRoles: result.rows[0].client_roles };
   }
   async effectiveClaimMappers(realm, clientId, grantedScopes = []) { return (await this.pool.query(`SELECT DISTINCT m.* FROM claim_mappers m LEFT JOIN client_scope_assignments a ON a.realm_name=m.realm_name AND m.owner_type='client-scope' AND m.owner_id=a.scope_id::text LEFT JOIN client_scopes s ON s.realm_name=a.realm_name AND s.id=a.scope_id WHERE m.realm_name=$1 AND ((m.owner_type='client' AND m.owner_id=$2) OR (a.client_id=$2 AND (a.assignment_type='default' OR s.name=ANY($3::text[])))) ORDER BY m.name`, [realm, clientId, [...grantedScopes]])).rows.map(publicMapper); }
   async listAuthenticationFlows(realm) { return (await this.pool.query('SELECT * FROM authentication_flows WHERE realm_name=$1 ORDER BY priority,alias', [realm])).rows.map(publicFlow); }
@@ -636,9 +746,10 @@ export class PostgresManagementStore {
   async listUserOrganizations(realm, userId) { const memberships = await this.listOrganizationMembershipsForUser(realm, userId); const organizations = await this.listOrganizations(realm); return memberships.flatMap((membership) => { const organization = organizations.find((item) => item.id === membership.organizationId); return organization?.enabled ? [{ ...organization, roles: membership.roles }] : []; }); }
   async createOrganizationInvitation(realm, input) { return publicInvitation((await this.pool.query('INSERT INTO organization_invitations (realm_name,id,organization_id,email,roles,token_digest,expires_at) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *', [realm, input.id ?? randomUUID(), input.organizationId, input.email, input.roles, input.tokenDigest, input.expiresAt])).rows[0]); }
   async listOrganizationInvitations(realm, organizationId) { return (await this.pool.query('SELECT * FROM organization_invitations WHERE realm_name=$1 AND organization_id=$2 ORDER BY created_at DESC', [realm, organizationId])).rows.map(publicInvitation); }
+  async deleteOrganizationInvitation(realm, organizationId, invitationId) { return (await this.pool.query('DELETE FROM organization_invitations WHERE realm_name=$1 AND organization_id=$2 AND id=$3', [realm, organizationId, invitationId])).rowCount === 1; }
   async consumeOrganizationInvitation(realm, tokenDigest, user) {
     const client = await this.pool.connect();
-    try { await client.query('BEGIN'); const invitation = (await client.query(`UPDATE organization_invitations SET accepted_at=CURRENT_TIMESTAMP WHERE realm_name=$1 AND token_digest=$2 AND accepted_at IS NULL AND expires_at>CURRENT_TIMESTAMP AND lower(email)=lower($3) RETURNING *`, [realm, tokenDigest, user.email])).rows[0]; if (!invitation) { await client.query('ROLLBACK'); return undefined; } await client.query(`INSERT INTO organization_memberships (realm_name,organization_id,user_id,roles) VALUES ($1,$2,$3,$4) ON CONFLICT (realm_name,organization_id,user_id) DO UPDATE SET roles=EXCLUDED.roles`, [realm, invitation.organization_id, user.id, invitation.roles]); await client.query('COMMIT'); return publicInvitation(invitation); } catch (error) { await client.query('ROLLBACK').catch(() => {}); throw error; } finally { client.release(); }
+    try { await client.query('BEGIN'); const invitation = (await client.query(`UPDATE organization_invitations AS invitation SET accepted_at=CURRENT_TIMESTAMP FROM organizations AS organization WHERE invitation.realm_name=$1 AND invitation.token_digest=$2 AND invitation.accepted_at IS NULL AND invitation.expires_at>CURRENT_TIMESTAMP AND lower(invitation.email)=lower($3) AND organization.realm_name=invitation.realm_name AND organization.id=invitation.organization_id AND organization.enabled RETURNING invitation.*`, [realm, tokenDigest, user.email])).rows[0]; if (!invitation) { await client.query('ROLLBACK'); return undefined; } await client.query(`INSERT INTO organization_memberships (realm_name,organization_id,user_id,roles) VALUES ($1,$2,$3,$4) ON CONFLICT (realm_name,organization_id,user_id) DO UPDATE SET roles=EXCLUDED.roles`, [realm, invitation.organization_id, user.id, invitation.roles]); await client.query('COMMIT'); return publicInvitation(invitation); } catch (error) { await client.query('ROLLBACK').catch(() => {}); throw error; } finally { client.release(); }
   }
   async listSigningKeys(realm) { return (await this.pool.query('SELECT * FROM signing_key_versions WHERE realm_name=$1 ORDER BY created_at', [realm])).rows.map(publicSigningKey); }
   async putSigningKey(realm, input) {

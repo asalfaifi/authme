@@ -228,7 +228,7 @@ test('account deletion atomically removes the user and realm-scoped provider sta
   }
 });
 
-test('managed client deletion atomically removes grants, tokens, scope assignments, and direct mappers', { skip: !databaseUrl }, async () => {
+test('managed client deletion atomically removes grants, tokens, scope assignments, mappers, and client roles', { skip: !databaseUrl }, async () => {
   const data = await createDataLayer({ databaseUrl, devMode: false, realms: [realm] });
   try {
     const clientId = `managed-${randomUUID().slice(0, 8)}`;
@@ -240,6 +240,9 @@ test('managed client deletion atomically removes grants, tokens, scope assignmen
     await data.management.createClaimMapper(realm, {
       ownerType: 'client', ownerId: clientId, name: 'managed-claim', mapperType: 'hardcoded',
       config: { claim: 'managed_claim', value: true },
+    });
+    await data.management.putClientRole(realm, clientId, {
+      name: 'reader', description: '', composites: [], attributes: {},
     });
     const Adapter = data.adapterFor(realm);
     const grants = new Adapter('Grant');
@@ -256,6 +259,7 @@ test('managed client deletion atomically removes grants, tokens, scope assignmen
     assert.equal(await tokens.find('managed-delete-token'), undefined);
     assert.deepEqual(await data.management.listClientScopeAssignments(realm, clientId), []);
     assert.deepEqual(await data.management.listClaimMappers(realm, 'client', clientId), []);
+    assert.deepEqual(await data.management.listClientRoles(realm, clientId), []);
     assert.equal(await data.deleteManagedClient(realm, clientId), false);
   } finally {
     await data.close();

@@ -5,6 +5,7 @@ import helmet from 'helmet';
 import pinoHttp from 'pino-http';
 import { createDataLayer } from './db.js';
 import { resolveFederatedLogin } from './authentication/federated-login.js';
+import { authenticationSatisfiesFlow } from './authentication/flow-policy.js';
 import { createIdentityRuntime } from './authentication/runtime.js';
 import { createSigningKeyManager } from './crypto/signing-key-manager.js';
 import { hashPassword } from './crypto/password.js';
@@ -334,12 +335,24 @@ export async function createAuthMeApp(config, overrides = {}) {
         csrfSecret: config.csrfSecret,
         audit: (event) => store.writeAudit(event),
         loginPolicy: async ({ details, login }) => {
+          const user = await store.findUserById(realm, login.accountId);
+          if (!user?.enabled) return false;
+          const requestedAcrs = String(details.params?.acr_values ?? '').split(' ').filter(Boolean);
+          const flow = await data.management.resolveAuthenticationFlow(realm, {
+            clientId: details.params?.client_id,
+            requestedAcrs,
+          });
+          if (flow && (!authenticationSatisfiesFlow(flow, login.amr, user)
+            || (requestedAcrs.length > 0 && !requestedAcrs.includes(flow.acr)))) return false;
           const organizationContext = details.params?.organization;
-          if (!organizationContext) return true;
+          if (!organizationContext) return { accepted: true, acr: flow?.acr ?? login.acr };
           const organization = await data.management.findOrganization(realm, organizationContext);
           if (!organization?.enabled || !organization.identityProviderIds.includes(login.providerId)) return false;
           const memberships = await data.management.listOrganizationMemberships(realm, organization.id);
-          return memberships.some((membership) => membership.userId === login.accountId);
+          return {
+            accepted: memberships.some((membership) => membership.userId === login.accountId),
+            acr: flow?.acr ?? login.acr,
+          };
         },
         accountResolver: async ({ extensionId, providerId, profile, identity }) => {
           const configured = extensionId === 'builtin.saml-federation'

@@ -34,12 +34,24 @@ test('managed clients are validated, live immediately, listed without secrets, a
   const scope = await runtime.data.management.createClientScope('master', { name: 'managed-policy', description: '', protocol: 'openid-connect', attributes: {} });
   await runtime.data.management.setClientScopeAssignment('master', 'managed-native', scope.id, 'default');
   await runtime.data.management.createClaimMapper('master', { ownerType: 'client', ownerId: 'managed-native', name: 'managed-claim', mapperType: 'hardcoded', config: { claim: 'managed_claim', value: true } });
+  await api('put', '/admin/v1/realms/master/clients/managed-native/roles/read', {
+    description: 'Read', composites: [], attributes: {},
+  }).expect(201);
+  const assigned = await api('post', '/admin/v1/realms/master/users', {
+    username: 'managed-client-role', email: 'managed-client-role@example.test', password: 'Correct-Horse-Battery-Staple-2026!',
+    roles: [], groups: [], clientRoles: { 'managed-native': ['read'] },
+  }).expect(201);
+  const assignedVersion = (await runtime.store.findUserById('master', assigned.body.id)).securityVersion;
   const inventory = await api('get', '/admin/v1/realms/master/clients').expect(200);
   assert(inventory.body.clients.some((client) => client.client_id === 'managed-native' && client.managed));
   await api('delete', '/admin/v1/realms/master/clients/managed-native', {}).expect(204);
   assert.equal(await runtime.providers.get('master').Client.find('managed-native'), undefined);
   assert.deepEqual(await runtime.data.management.listClientScopeAssignments('master', 'managed-native'), []);
   assert.deepEqual(await runtime.data.management.listClaimMappers('master', 'client', 'managed-native'), []);
+  assert.deepEqual(await runtime.data.management.listClientRoles('master', 'managed-native'), []);
+  const reconciled = await runtime.store.findUserById('master', assigned.body.id);
+  assert.deepEqual(reconciled.clientRoles, {});
+  assert(reconciled.securityVersion > assignedVersion);
   await api('post', '/admin/v1/realms/master/clients', { ...metadata, client_id: 'authme-admin-console' }).expect(409);
 });
 
@@ -55,6 +67,10 @@ test('realm, role, nested group, scope, mapper, flow, and organization APIs are 
   await api('post', '/admin/v1/realms/master/users', {
     username: 'orphan-relations', email: 'orphan-relations@example.test', password: 'Correct-Horse-Battery-Staple-2026!',
     roles: ['missing-role'], groups: [], clientRoles: {},
+  }).expect(400);
+  await api('post', '/admin/v1/realms/master/users', {
+    username: 'orphan-client-role', email: 'orphan-client-role@example.test', password: 'Correct-Horse-Battery-Staple-2026!',
+    roles: [], groups: [], clientRoles: { 'missing-client': ['read'] },
   }).expect(400);
   const securityVersionBeforeMove = (await runtime.store.findUserById('master', managedUser.body.id)).securityVersion;
   await api('patch', `/admin/v1/realms/master/groups/${group.body.id}`, { name: 'platform' }).expect(200);
@@ -75,6 +91,13 @@ test('realm, role, nested group, scope, mapper, flow, and organization APIs are 
   assert(discovery.body.acr_values_supported.includes('urn:authme:strong'));
   const organization = await api('post', '/admin/v1/realms/master/organizations', { name: 'Example', alias: 'example', enabled: true, domains: [{ domain: 'example.test', verified: false }], identityProviderIds: [], attributes: {} }).expect(201);
   assert.equal(organization.body.alias, 'example');
+  await api('get', '/admin/v1/realms/master/organizations/00000000-0000-4000-8000-000000000000/members').expect(404);
+  await api('put', `/admin/v1/realms/master/organizations/${organization.body.id}/members/${managedUser.body.id}`, { roles: ['owner'] }).expect(200);
+  const invitation = await api('post', `/admin/v1/realms/master/organizations/${organization.body.id}/invitations`, {
+    email: 'pending-invitation@example.test', roles: ['member'], expiresInSeconds: 3600,
+  }).expect(201);
+  assert.match(invitation.body.token, /^[A-Za-z0-9_-]{43}$/u);
+  await api('delete', `/admin/v1/realms/master/organizations/${organization.body.id}/invitations/${invitation.body.id}`, {}).expect(204);
   await api('patch', `/admin/v1/realms/master/organizations/${organization.body.id}`, { identityProviderIds: ['unconfigured'] }).expect(400);
 
   await api('patch', '/admin/v1/realms/master', { displayName: 'Primary realm', enabled: false }).expect(200);

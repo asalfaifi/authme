@@ -12,10 +12,17 @@ export function authenticationSatisfiesFlow(flow, amr = [], user = {}) {
   if (!flow) return true;
   const methods = Array.isArray(amr) ? amr : [];
   const required = flow.steps.filter((step) => step.requirement === 'required'
-    || (step.requirement === 'conditional' && step.type === 'totp' && user.totpConfirmed));
+    || (step.requirement === 'conditional' && step.type === 'totp' && user?.totpConfirmed));
   if (required.some((step) => !amrSatisfies(step.type, methods))) return false;
   const alternatives = flow.steps.filter((step) => step.requirement === 'alternative');
   return alternatives.length === 0 || alternatives.some((step) => amrSatisfies(step.type, methods));
+}
+
+export function totpRequiredForFlow(flow, user = {}) {
+  if (!user?.totpConfirmed) return false;
+  if (!flow) return true;
+  return flow.steps.some((step) => step.type === 'totp'
+    && (step.requirement === 'required' || step.requirement === 'conditional'));
 }
 
 export function authenticationFlowConfigurationError(steps) {
@@ -31,6 +38,9 @@ export function authenticationFlowConfigurationError(steps) {
   const requiredPrimary = steps.filter((step) => step.requirement === 'required' && primaryMethods.has(step.type));
   if (requiredPrimary.length > 1) return 'only one primary authentication method can be required';
   const alternatives = steps.filter((step) => step.requirement === 'alternative');
+  if (requiredPrimary.length === 0 && alternatives.length === 0) {
+    return 'an authentication flow must contain a required or alternative primary method';
+  }
   if (alternatives.some((step) => !primaryMethods.has(step.type))) {
     return 'alternative execution is supported only for primary authentication methods';
   }

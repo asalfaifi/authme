@@ -17,6 +17,21 @@ const migrations = [{ id: '001_initial.sql', checksum: 'a'.repeat(64) }];
 before(async () => { root = await mkdtemp(join(tmpdir(), 'authme-backup-test-')); });
 after(async () => rm(root, { recursive: true, force: true }));
 
+test('backup creation requires its dedicated key and migration manifest before running pg_dump', async () => {
+  let called = false;
+  await assert.rejects(createEncryptedBackup({
+    databaseUrl: 'postgresql://test', outputDirectory: join(root, 'invalid-key'),
+    encryptionKey: Buffer.alloc(31), migrationManifest: migrations, version: '1.0.0',
+    command: async () => { called = true; },
+  }), /32-byte backup encryption key/iu);
+  await assert.rejects(createEncryptedBackup({
+    databaseUrl: 'postgresql://test', outputDirectory: join(root, 'invalid-manifest'),
+    encryptionKey: key, migrationManifest: undefined, version: '1.0.0',
+    command: async () => { called = true; },
+  }), /migration manifest/iu);
+  assert.equal(called, false);
+});
+
 test('backup encrypts database and key material, verifies checksums, and restores through pg_restore', async () => {
   const jwks = join(root, 'source-jwks');
   await mkdir(jwks);
@@ -29,7 +44,7 @@ test('backup encrypts database and key material, verifies checksums, and restore
     if (name === 'pg_restore') assert.equal(await readFile(args.at(-1), 'utf8'), 'sensitive database bytes');
   };
   await createEncryptedBackup({ databaseUrl: 'postgresql://test', outputDirectory: backup, jwksDirectory: jwks, encryptionKey: key, migrationManifest: migrations, version: '1.0.0', command });
-  const manifest = await verifyBackup(backup);
+  const manifest = await verifyBackup(backup, key);
   assert.equal(manifest.files.length, 2);
   assert.doesNotMatch(await readFile(join(backup, 'database.dump.enc'), 'utf8'), /sensitive database bytes/u);
   const restoredJwks = join(root, 'restored-jwks');
@@ -45,5 +60,22 @@ test('restore fails before command execution when an encrypted file is tampered 
   await writeFile(join(backup, 'database.dump.enc'), 'tampered');
   let called = false;
   await assert.rejects(restoreEncryptedBackup({ databaseUrl: 'postgresql://restore', inputDirectory: backup, encryptionKey: key, expectedMigrations: migrations, command: async () => { called = true; } }), /checksum/iu);
+  assert.equal(called, false);
+});
+
+test('restore authenticates the manifest before trusting names, checksums, or migrations', async () => {
+  const backup = join(root, 'manifest-tampered');
+  const command = async (_name, args) => writeFile(args[args.indexOf('--file') + 1], 'dump');
+  await createEncryptedBackup({ databaseUrl: 'postgresql://test', outputDirectory: backup, encryptionKey: key, migrationManifest: migrations, version: '1.0.0', command });
+  const path = join(backup, 'manifest.json');
+  const manifest = JSON.parse(await readFile(path, 'utf8'));
+  manifest.migrations = [];
+  manifest.files[0].logicalName = 'jwks/master.json';
+  await writeFile(path, `${JSON.stringify(manifest, null, 2)}\n`);
+  let called = false;
+  await assert.rejects(restoreEncryptedBackup({
+    databaseUrl: 'postgresql://restore', inputDirectory: backup, encryptionKey: key,
+    expectedMigrations: [], command: async () => { called = true; },
+  }), /manifest authentication/iu);
   assert.equal(called, false);
 });

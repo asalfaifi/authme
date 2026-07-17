@@ -56,6 +56,10 @@ Production configuration must define, using the names supported by the current e
 
 Secrets belong in a secret manager or mounted secret file with restrictive permissions. Avoid environment-variable exposure where the platform includes environments in diagnostics, but never commit secrets to files or images. Fail startup when an example/default secret is detected.
 
+### Account email delivery
+
+The standalone server loads `AUTHME_ACCOUNT_EMAIL_MODULE` before opening its HTTP listener. The module exports `createAccountEmailSender({ publicUrl, realms })` or a default sender object with asynchronous `sendEmailVerification(message)` and `sendPasswordReset(message)` methods. Delivery modules receive one-time action URLs and normalized destination addresses; they must use a reviewed transactional-mail provider, avoid logging message payloads, apply bounded timeouts/retries, and resolve only after the provider accepts the message. A missing module leaves these endpoints fail-closed with `503`; configure and exercise one before advertising production account recovery.
+
 The executable recognizes these security-critical inputs:
 
 | Setting | Production requirement |
@@ -66,6 +70,7 @@ The executable recognizes these security-critical inputs:
 | `AUTHME_JWKS_DIR` | Read-only directory containing realm JWK sets for realms using the `file` signing provider |
 | `AUTHME_SIGNING_KEY_PROVIDERS_JSON` | Per-realm provider (`file`, `aws-kms`, `gcp-kms`, `azure-key-vault`, or `pkcs11`), algorithm, non-secret material reference, rotation days, and public-key overlap. |
 | `AUTHME_SIGNING_ADAPTER_MODULES_JSON` | Trusted deployment module specifier for every external provider used by a realm; modules are loaded before the HTTP listener starts. |
+| `AUTHME_ACCOUNT_EMAIL_MODULE` | Trusted delivery module loaded before listening; required when production email verification/password recovery is offered. |
 | `AUTHME_COOKIE_KEYS` | At least two independent values, newest first, each at least 32 bytes |
 | `AUTHME_CSRF_SECRET` | Independent random value of at least 32 bytes |
 | `AUTHME_PASSWORD_PEPPER` | Independent random value of at least 32 bytes |
@@ -146,6 +151,7 @@ Operational rules:
 - Migration `006_ciba.sql` adds durable CIBA polling deadline columns to `oidc_records`; apply it before enabling a release that accepts CIBA requests on any replica.
 - Migration `007_ldap_sync.sql` adds per-run reconciliation markers to immutable external-identity links; apply it before running `ldap:sync`.
 - Migration `009_v1_management.sql` adds realm/client authorization policy, organizations, authentication flows, claim mappers, signing-key inventory, and unbounded CIBA poll backoff; apply it before starting this release candidate.
+- Migration `010_client_roles.sql` additively creates the realm/client-scoped client-role catalog and same-client composite graph. Apply it before using the client-role API. Existing old-version processes do not write this table, so they may drain during a schema-first rolling upgrade, but the strict migration manifest prevents restarting an old image after `010` is recorded. The supported rollback is a pre-migration database restore with the old image; do not delete the table or edit `schema_migrations` in place.
 - Back up before schema changes and verify that the target application can run against the migrated schema.
 - Bound each AuthMe replica's connection pool so the combined maximum remains below database capacity with headroom for migrations and operations.
 - Configure statement, lock, and idle transaction timeouts.
@@ -325,7 +331,7 @@ Back up:
 - immutable deployment configuration and secret-manager metadata;
 - migration tooling/version and release image digest.
 
-AuthMe's backup command uses `pg_dump` custom format and encrypts the database dump and every file-provider JWK independently with AES-256-GCM. The manifest binds file sizes, SHA-256 checksums, package version, and the exact migration manifest. Supply a base64url-encoded 32-byte `AUTHME_BACKUP_ENCRYPTION_KEY` from a backup-specific secret boundary:
+AuthMe's backup command uses `pg_dump` custom format and encrypts the database dump and every file-provider JWK independently with AES-256-GCM. The v2 manifest binds unique logical names, file sizes, SHA-256 checksums, package version, and the exact migration manifest, and authenticates the complete manifest with a domain-separated HMAC-SHA-256 under the backup key. Supply a base64url-encoded 32-byte `AUTHME_BACKUP_ENCRYPTION_KEY` from a backup-specific secret boundary:
 
 ```sh
 npm run backup -- --output /protected/backups/authme-2026-07-17 --jwks-dir /protected/jwks
@@ -334,16 +340,23 @@ npm run restore -- --input /protected/backups/authme-2026-07-17 --jwks-dir /rest
 
 Restore verifies every checksum, validates the migration manifest, authenticates/decrypts every payload before invoking `pg_restore`, and refuses to overwrite an existing signing-key file. Run it only against an isolated/empty recovery target first. Encrypt backups, isolate backup credentials, define retention/deletion, and test restoration. A database backup without the corresponding signing keys or KMS references cannot resume the same issuer cleanly; signing keys without the database are insufficient to restore grants and sessions.
 
+The v2 format deliberately rejects the earlier unauthenticated-manifest v1
+format. Keep the prior release's restore tool and image for the retention period
+of any v1 backup, restore it only into an isolated target, upgrade through the
+documented migration sequence, and immediately create/rehearse a v2 backup.
+There is no trusted in-place v1-to-v2 manifest conversion because the missing
+source authentication cannot be reconstructed afterward.
+
 Recovery objectives must state whether active sessions must survive. If not, deliberately revoke/invalidate them rather than accidentally accepting inconsistent state.
 
 For a single-region rolling-availability rehearsal, first run plan mode and inspect the public health result, then allow the command to perform and observe a Kubernetes rollout:
 
 ```sh
-npm run ha:rehearse -- --base-url https://auth.example.com
-npm run ha:rehearse -- --base-url https://auth.example.com --execute --namespace authme --deployment authme
+npm run ha:rehearse -- --base-url https://auth.example.com --realm master
+npm run ha:rehearse -- --base-url https://auth.example.com --realm master --execute --namespace authme --deployment authme
 ```
 
-Execute mode probes public readiness continuously throughout the restart and rollout wait, records sample count, maximum latency, and bounded failure details, and exits nonzero for any failed probe, failed rollout, or failed final health check. A passing report therefore requires zero observed public-readiness errors across the single-region rolling update. This proves the scripted single-region rollout path only. Database standby promotion, dependency outage, physical HSM behavior, disaster recovery, and regional failover must be executed in the operator's real infrastructure and attached as external X3 evidence.
+Execute mode continuously probes public readiness and the realm's exact issuer/authorization/token/JWKS discovery contract throughout the restart and rollout wait. It records sample count, maximum latency, and bounded failure details, and exits nonzero for any failed probe, malformed discovery response, failed rollout, or failed final check. A passing report therefore requires zero observed public protocol errors across the single-region rolling update. This proves the scripted single-region rollout path only. Database standby promotion, dependency outage, physical HSM behavior, disaster recovery, and regional failover must be executed in the operator's real infrastructure and attached as external X3 evidence.
 
 ## Performance target and rehearsal
 

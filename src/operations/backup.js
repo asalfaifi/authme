@@ -1,12 +1,35 @@
-import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
+import {
+  createCipheriv,
+  createDecipheriv,
+  createHash,
+  createHmac,
+  randomBytes,
+  timingSafeEqual,
+} from 'node:crypto';
 import { createReadStream, createWriteStream } from 'node:fs';
 import { access, chmod, mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { basename, dirname, join, relative, resolve, sep } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { spawn } from 'node:child_process';
 
-const backupFormat = 'authme-backup/v1';
+const backupFormat = 'authme-backup/v2';
 const encryptedMagic = Buffer.from('AUTHMEB1');
+const manifestDomain = Buffer.from('authme-backup-manifest\0');
+
+function manifestAuthenticationCode(manifest, key) {
+  const authenticated = Object.fromEntries(Object.entries(manifest).filter(([name]) => name !== 'manifestMac'));
+  return createHmac('sha256', key)
+    .update(manifestDomain)
+    .update(JSON.stringify(authenticated))
+    .digest('base64url');
+}
+
+function validManifestAuthenticationCode(manifest, key) {
+  if (typeof manifest.manifestMac !== 'string' || !/^[A-Za-z0-9_-]{43}$/u.test(manifest.manifestMac)) return false;
+  const expected = Buffer.from(manifestAuthenticationCode(manifest, key), 'base64url');
+  const supplied = Buffer.from(manifest.manifestMac, 'base64url');
+  return expected.length === supplied.length && timingSafeEqual(expected, supplied);
+}
 
 export function backupEncryptionKey(value) {
   const decoded = Buffer.from(String(value ?? ''), 'base64url');
@@ -96,6 +119,10 @@ export async function createEncryptedBackup({
   clock = () => new Date(),
 }) {
   if (!databaseUrl) throw new Error('DATABASE_URL is required for a backup');
+  if (!Buffer.isBuffer(encryptionKey) || encryptionKey.length !== 32) {
+    throw new Error('A 32-byte backup encryption key is required');
+  }
+  if (!Array.isArray(migrationManifest)) throw new Error('A migration manifest is required for a backup');
   const target = resolve(outputDirectory);
   const staging = `${target}.partial-${process.pid}-${randomBytes(5).toString('hex')}`;
   await mkdir(staging, { recursive: false, mode: 0o700 });
@@ -120,6 +147,7 @@ export async function createEncryptedBackup({
       migrations: migrationManifest.map(({ id, checksum }) => ({ id, checksum })),
       files,
     };
+    manifest.manifestMac = manifestAuthenticationCode(manifest, encryptionKey);
     await writeFile(join(staging, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
     await rename(staging, target);
     await chmod(target, 0o700);
@@ -130,17 +158,30 @@ export async function createEncryptedBackup({
   }
 }
 
-export async function verifyBackup(directory) {
+export async function verifyBackup(directory, encryptionKey) {
+  if (!Buffer.isBuffer(encryptionKey) || encryptionKey.length !== 32) {
+    throw new Error('A 32-byte backup encryption key is required to authenticate the manifest');
+  }
   const root = resolve(directory);
   const manifest = JSON.parse(await readFile(join(root, 'manifest.json'), 'utf8'));
   if (manifest.format !== backupFormat || manifest.encryption !== 'AES-256-GCM' || !Array.isArray(manifest.files)) {
     throw new Error('Backup manifest format is unsupported');
   }
+  if (!validManifestAuthenticationCode(manifest, encryptionKey)) {
+    throw new Error('Backup manifest authentication failed');
+  }
+  const logicalNames = new Set();
+  const storedFiles = new Set();
   for (const file of manifest.files) {
     if (typeof file.logicalName !== 'string' || typeof file.file !== 'string'
-      || file.file.includes('..') || resolve(root, file.file) !== join(root, file.file)) {
+      || !Number.isSafeInteger(file.bytes) || file.bytes < 1
+      || typeof file.sha256 !== 'string' || !/^[a-f0-9]{64}$/u.test(file.sha256)
+      || file.file.includes('..') || resolve(root, file.file) !== join(root, file.file)
+      || logicalNames.has(file.logicalName) || storedFiles.has(file.file)) {
       throw new Error('Backup manifest contains an unsafe file path');
     }
+    logicalNames.add(file.logicalName);
+    storedFiles.add(file.file);
     const path = join(root, file.file);
     const details = await stat(path);
     if (details.size !== file.bytes || await sha256File(path) !== file.sha256) {
@@ -160,7 +201,7 @@ export async function restoreEncryptedBackup({
 }) {
   if (!databaseUrl) throw new Error('DATABASE_URL is required for a restore');
   const root = resolve(inputDirectory);
-  const manifest = await verifyBackup(root);
+  const manifest = await verifyBackup(root, encryptionKey);
   if (expectedMigrations) {
     const expected = JSON.stringify(expectedMigrations.map(({ id, checksum }) => ({ id, checksum })));
     if (JSON.stringify(manifest.migrations) !== expected) throw new Error('Backup migration manifest does not match this AuthMe build');

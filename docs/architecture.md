@@ -367,7 +367,12 @@ emission requires both a granted `roles` or `groups` scope and the audience's
 explicit claim policy. `resource_access` is filtered to the configured role
 client IDs for that audience, so unrelated client assignments are not leaked.
 Possession of a role in the database does not imply that every token receives
-it. Direct and group-assigned realm roles are expanded through a validated acyclic composite graph. Client- and client-scope-owned claim mappers add only their configured hardcoded, user-attribute, role, group, or organization claims.
+it. Direct and group-assigned realm roles are expanded through a validated
+acyclic composite graph. Client roles have a separate realm-and-client-scoped
+definition catalog; their composites may reference only roles in the same
+client namespace and expand before the Keycloak-shaped `resource_access`
+filter is applied. Client- and client-scope-owned claim mappers add only their
+configured hardcoded, user-attribute, role, group, or organization claims.
 
 ## End-user account console
 

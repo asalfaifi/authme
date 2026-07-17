@@ -220,6 +220,7 @@ test('realm, client, key, URL, and TTL validation fail closed', () => {
     () => loadConfig({ AUTHME_DEV_MODE: 'true', AUTHME_SIGNING_ADAPTER_MODULES_JSON: JSON.stringify({ unsupported: 'adapter' }) }),
     /not a supported external signing provider/,
   );
+  assert.equal(loadConfig({ AUTHME_DEV_MODE: 'true', AUTHME_ACCOUNT_EMAIL_MODULE: 'file:///opt/authme/email.mjs' }).accountEmailModule, 'file:///opt/authme/email.mjs');
   assert.throws(
     () => loadConfig({ AUTHME_DEV_MODE: 'true', AUTHME_RESOURCE_SERVERS_JSON: '{not-json' }),
     /must contain valid JSON/,

@@ -1,5 +1,6 @@
 import { createServer } from 'node:http';
 import { createAuthMeApp } from './app.js';
+import { loadAccountEmailSender } from './account/email-delivery.js';
 import { loadConfig } from './config.js';
 import { loadSigningKeyAdapters } from './crypto/signing-adapters.js';
 import { createLogger } from './logging.js';
@@ -7,7 +8,8 @@ import { createLogger } from './logging.js';
 const config = loadConfig();
 const logger = createLogger(config.logLevel);
 const signingKeyAdapters = await loadSigningKeyAdapters(config);
-const runtime = await createAuthMeApp(config, { logger, signingKeyAdapters });
+const accountEmailSender = await loadAccountEmailSender(config);
+const runtime = await createAuthMeApp(config, { logger, signingKeyAdapters, accountEmailSender });
 const server = createServer(runtime.app);
 let stopping = false;
 

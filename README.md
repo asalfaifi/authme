@@ -158,6 +158,7 @@ Create the runtime and per-realm JWKS Secrets before installation. The migration
 | `AUTHME_JWKS_DIR` | Directory containing private `{realm}.json` JWK sets. |
 | `AUTHME_SIGNING_KEY_PROVIDERS_JSON` | Per-realm `file`, `aws-kms`, `gcp-kms`, `azure-key-vault`, or `pkcs11` provider, key reference, rotation period, and overlap policy. |
 | `AUTHME_SIGNING_ADAPTER_MODULES_JSON` | Trusted module specifiers implementing public-inventory, remote-sign, and rotate operations for configured external providers. |
+| `AUTHME_ACCOUNT_EMAIL_MODULE` | Trusted delivery module implementing verification and password-reset email sending for the standalone server. |
 | `AUTHME_COOKIE_KEYS` | At least two comma-separated 32-byte-or-longer rotation keys. |
 | `AUTHME_CSRF_SECRET` | Independent 32-byte-or-longer CSRF signing secret. |
 | `AUTHME_PASSWORD_PEPPER` | Independent password/recovery-code pepper. |

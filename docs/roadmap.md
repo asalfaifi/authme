@@ -180,7 +180,8 @@ v1.0 means an organization can replace Keycloak for a documented set of OIDC, SA
 ### Implemented product contract
 
 - Deterministic offline transformation of a Keycloak realm/partial export into
-  AuthMe realm, client, role, group, user, and supported federation
+  AuthMe realm, OIDC client, downstream SAML service-provider, role, group,
+  user, and supported upstream federation
   configuration, with structured JSON and human-readable compatibility reports.
   The tool fails closed on malformed input, omits source credentials/keys, and
   remains a reviewed planning artifact rather than an automatic database
@@ -193,7 +194,7 @@ v1.0 means an organization can replace Keycloak for a documented set of OIDC, SA
 - Nested groups, composite roles, reusable client scopes, and configurable claim mappers.
 - Organizations with domain, invitation, membership, organization IdP, and token context policy.
 - Configurable authentication flows with client/ACR selection, required/alternative/conditional steps, AMR verification, and maximum-age step-up.
-- AES-256-GCM encrypted database/JWKS backup, manifest-verified destructive restore, single-region HA and load rehearsal commands.
+- AES-256-GCM encrypted database/JWKS backup, authenticated-manifest destructive restore, single-region HA and load rehearsal commands.
 - File and external KMS/HSM signing-provider lifecycle, public-only inventory, scheduled/forced rotation, and public-key overlap.
 - Reproducible npm archives, CycloneDX SBOM, SHA-256 manifests, mandatory release signing, and tag release workflow.
 - H1–H4 security follow-ups: redirect-location redaction, audience non-widening regression coverage, unbounded CIBA slow-down, and retained `expired_token` semantics.

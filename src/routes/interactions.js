@@ -1,6 +1,6 @@
 import { Router, urlencoded } from 'express';
 import { resolveFederatedLogin } from '../authentication/federated-login.js';
-import { authenticationSatisfiesFlow } from '../authentication/flow-policy.js';
+import { authenticationSatisfiesFlow, totpRequiredForFlow } from '../authentication/flow-policy.js';
 import { createCsrfToken, verifyCsrfToken } from '../crypto/csrf.js';
 import { decryptSecret, safeEqual } from '../crypto/secrets.js';
 import { recoveryCodeDigest, totpStep } from '../crypto/mfa.js';
@@ -189,9 +189,14 @@ export function createInteractionRouter({
         }
       }
       const locked = user?.lockedUntil && new Date(user.lockedUntil).getTime() > Date.now();
-      let mfaOk = !user?.totpConfirmed;
+      const selectedFlow = management && await management.resolveAuthenticationFlow(realm, {
+        clientId: details.params.client_id,
+        requestedAcrs: requestedAcrs(details),
+      });
+      const requireTotp = totpRequiredForFlow(selectedFlow, user);
+      let mfaOk = !requireTotp;
       let recoveryUsed = false;
-      if (passwordOk && user?.enabled && !locked && user?.totpConfirmed && user.totpSecret) {
+      if (passwordOk && user?.enabled && !locked && requireTotp && user.totpSecret) {
         const secret = decryptSecret(user.totpSecret, config.fieldEncryptionKey, `${realm}:${user.id}:totp`);
         const step = totpStep(secret, req.body.otp);
         mfaOk = step !== null && await store.consumeTotpStep(realm, user.id, step);
@@ -216,7 +221,7 @@ export function createInteractionRouter({
         const replacementHash = await hashPassword(suppliedPassword, config.passwordPepper);
         await store.rehashPasswordIfCurrent(realm, user.id, user.passwordHash, replacementHash);
       }
-      const amr = user.totpConfirmed
+      const amr = requireTotp
         ? [authenticationMethod, recoveryUsed ? 'recovery' : 'otp']
         : [authenticationMethod];
       const context = await authenticationContext(

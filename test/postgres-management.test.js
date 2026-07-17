@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { after, before, test } from 'node:test';
 import pg from 'pg';
 import { PostgresIdentityStore } from '../src/repositories/identity-store.js';
-import { PostgresManagementStore } from '../src/repositories/management-store.js';
+import { expandCompositeRoles, PostgresManagementStore } from '../src/repositories/management-store.js';
 
 const databaseUrl = process.env.DATABASE_URL;
 const realm = `mgmt-${randomUUID().slice(0, 8)}`;
@@ -28,6 +28,15 @@ after(async () => {
 test('PostgreSQL management policy is durable, mutable, nested, and realm-scoped', { skip: !databaseUrl }, async () => {
   await management.putRole(realm, { name: 'reader', description: '', composites: [], attributes: {} });
   await management.putRole(realm, { name: 'editor', description: '', composites: ['reader'], attributes: {} });
+  await management.putRole(realm, { name: 'concurrent-a', description: '', composites: [], attributes: {} });
+  await management.putRole(realm, { name: 'concurrent-b', description: '', composites: [], attributes: {} });
+  const realmCycle = await Promise.allSettled([
+    management.putRole(realm, { name: 'concurrent-a', description: '', composites: ['concurrent-b'], attributes: {} }),
+    management.putRole(realm, { name: 'concurrent-b', description: '', composites: ['concurrent-a'], attributes: {} }),
+  ]);
+  assert.equal(realmCycle.filter(({ status }) => status === 'rejected').length, 1);
+  const realmRoles = await management.listRoles(realm);
+  assert.doesNotThrow(() => expandCompositeRoles(realmRoles.map(({ name }) => name), realmRoles));
   const parent = await management.createGroup(realm, { name: 'engineering', parentId: null, roles: ['reader'], attributes: {} });
   const child = await management.createGroup(realm, { name: 'platform', parentId: parent.id, roles: ['editor'], attributes: {} });
   assert.equal(child.path, '/engineering/platform');
@@ -45,9 +54,22 @@ test('PostgreSQL management policy is durable, mutable, nested, and realm-scoped
   assert.deepEqual(await management.listClaimMappers(realm, 'client-scope', optional.id), []);
 
   await management.createClaimMapper(realm, { ownerType: 'client', ownerId: 'portal', name: 'direct', mapperType: 'hardcoded', config: { claim: 'direct', value: true } });
+  await management.putClientRole(realm, 'portal', { name: 'read', description: '', composites: [], attributes: {} });
+  await management.putClientRole(realm, 'portal', { name: 'admin', description: '', composites: ['read'], attributes: {} });
+  await management.putClientRole(realm, 'portal', { name: 'concurrent-a', description: '', composites: [], attributes: {} });
+  await management.putClientRole(realm, 'portal', { name: 'concurrent-b', description: '', composites: [], attributes: {} });
+  const clientCycle = await Promise.allSettled([
+    management.putClientRole(realm, 'portal', { name: 'concurrent-a', description: '', composites: ['concurrent-b'], attributes: {} }),
+    management.putClientRole(realm, 'portal', { name: 'concurrent-b', description: '', composites: ['concurrent-a'], attributes: {} }),
+  ]);
+  assert.equal(clientCycle.filter(({ status }) => status === 'rejected').length, 1);
+  const clientRoles = await management.listClientRoles(realm, 'portal');
+  assert.doesNotThrow(() => expandCompositeRoles(clientRoles.map(({ name }) => name), clientRoles));
+  assert.deepEqual((await management.listClientRoles(realm, 'portal')).find((role) => role.name === 'admin').composites, ['read']);
   await management.deleteClientPolicy(realm, 'portal');
   assert.deepEqual(await management.listClientScopeAssignments(realm, 'portal'), []);
   assert.deepEqual(await management.listClaimMappers(realm, 'client', 'portal'), []);
+  assert.deepEqual(await management.listClientRoles(realm, 'portal'), []);
 
   const flow = await management.createAuthenticationFlow(realm, { alias: 'strong', description: '', enabled: true, priority: 10, clientIds: ['portal'], acr: 'urn:test:strong', maxAgeSeconds: 300, steps: [{ type: 'password', requirement: 'required' }] });
   assert.equal((await management.resolveAuthenticationFlow(realm, { clientId: 'portal' })).id, flow.id);
