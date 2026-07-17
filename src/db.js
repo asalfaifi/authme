@@ -97,6 +97,23 @@ export async function createDataLayer(config) {
         }
         return true;
       },
+      async cleanupDeletedClient(realm, clientId) {
+        const affectedUsers = [];
+        for (let offset = 0; ; offset += 200) {
+          const users = await store.listUsers(realm, { limit: 200, offset });
+          affectedUsers.push(...users.filter((user) => Object.hasOwn(user.clientRoles ?? {}, clientId)));
+          if (users.length < 200) break;
+        }
+        revokeMemoryClient(realm, clientId);
+        await management.deleteClientPolicy(realm, clientId);
+        for (const user of affectedUsers) {
+          const clientRoles = structuredClone(user.clientRoles);
+          delete clientRoles[clientId];
+          await store.updateUser(realm, user.id, { clientRoles });
+          await store.bumpSecurityVersion(realm, user.id);
+          revokeMemoryAccount(realm, user.id);
+        }
+      },
       async claimInitialAccessToken(realm, id) { return claimMemoryInitialAccessToken(realm, id); },
       async revokeAccount(realm, accountId) { return revokeMemoryAccount(realm, accountId); },
       async listOidcSessions(realm, accountId) { return listMemoryAccountSessions(realm, accountId); },
@@ -279,6 +296,60 @@ export async function createDataLayer(config) {
         );
         await client.query('COMMIT');
         return result.rowCount === 1;
+      } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw error;
+      } finally {
+        client.release();
+      }
+    },
+    async cleanupDeletedClient(realm, clientId) {
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [
+          `authme:client-roles:${realm}:${clientId}`,
+        ]);
+        await client.query(
+          `WITH affected_users AS MATERIALIZED (
+             SELECT id::text AS id FROM users
+             WHERE realm_name=$1 AND client_roles ? $2
+             FOR UPDATE
+           ), updated_users AS (
+             UPDATE users SET client_roles=client_roles-$2,
+               security_version=security_version+1, updated_at=CURRENT_TIMESTAMP
+             WHERE realm_name=$1 AND id::text IN (SELECT id FROM affected_users)
+             RETURNING id::text AS id
+           ), client_grants AS MATERIALIZED (
+             SELECT id FROM oidc_records
+             WHERE realm_name=$1 AND model='Grant' AND payload->>'clientId'=$2
+           ), account_grants AS MATERIALIZED (
+             SELECT id FROM oidc_records
+             WHERE realm_name=$1 AND model='Grant'
+               AND payload->>'accountId' IN (SELECT id FROM updated_users)
+           ), revoked AS (
+             DELETE FROM oidc_records WHERE realm_name=$1 AND model<>'Client'
+               AND (payload->>'clientId'=$2
+                 OR payload->>'accountId' IN (SELECT id FROM updated_users)
+                 OR grant_id IN (SELECT id FROM client_grants)
+                 OR grant_id IN (SELECT id FROM account_grants))
+           ), assignments AS (
+             DELETE FROM client_scope_assignments WHERE realm_name=$1 AND client_id=$2
+           ), mappers AS (
+             DELETE FROM claim_mappers
+             WHERE realm_name=$1 AND owner_type='client' AND owner_id=$2
+           ), roles AS (
+             DELETE FROM client_roles WHERE realm_name=$1 AND client_id=$2
+           ), updated_flows AS (
+             UPDATE authentication_flows SET client_ids=array_remove(client_ids,$2)
+             WHERE realm_name=$1 AND $2=ANY(client_ids) AND cardinality(client_ids)>1
+           ), deleted_flows AS (
+             DELETE FROM authentication_flows
+             WHERE realm_name=$1 AND $2=ANY(client_ids) AND cardinality(client_ids)=1
+           ) SELECT count(*) FROM updated_users`,
+          [realm, clientId],
+        );
+        await client.query('COMMIT');
       } catch (error) {
         await client.query('ROLLBACK').catch(() => {});
         throw error;

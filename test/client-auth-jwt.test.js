@@ -282,6 +282,72 @@ test('client registration rejects every private inline JWK member as invalid cli
   }
 });
 
+test('registration management deletion cascades client policy, grants, and user assignments', async () => {
+  const token = await registrationToken();
+  const registration = await postRegistration(token, {
+    application_type: 'native',
+    token_endpoint_auth_method: 'none',
+    grant_types: ['authorization_code'],
+    response_types: ['code'],
+    redirect_uris: ['http://127.0.0.1:49154/callback'],
+  }).expect(201);
+  const clientId = registration.body.client_id;
+  const scope = await runtime.data.management.createClientScope('master', {
+    name: `scope-${clientId}`, description: '', protocol: 'openid-connect', attributes: {},
+  });
+  await runtime.data.management.setClientScopeAssignment('master', clientId, scope.id, 'default');
+  await runtime.data.management.createClaimMapper('master', {
+    ownerType: 'client', ownerId: clientId, name: 'tenant', mapperType: 'hardcoded',
+    config: { claim: 'tenant', value: 'example' },
+  });
+  await runtime.data.management.putClientRole('master', clientId, {
+    name: 'reader', description: '', composites: [], attributes: {},
+  });
+  await runtime.data.management.createAuthenticationFlow('master', {
+    alias: `flow-${clientId}`, description: '', enabled: true, priority: 10,
+    clientIds: [clientId], acr: `urn:authme:${clientId}`, maxAgeSeconds: null,
+    steps: [{ type: 'password', requirement: 'required' }],
+  });
+  await runtime.providers.get('master').authmeManagementMetadata.synchronize();
+  assert((await request(runtime.app)
+    .get('/realms/master/.well-known/openid-configuration')
+    .set('host', '127.0.0.1:34992')
+    .expect(200)).body.acr_values_supported.includes(`urn:authme:${clientId}`));
+  const user = await runtime.store.createUser({
+    realm: 'master', username: `user-${clientId}`, email: `${clientId}@example.test`,
+    passwordHash: 'hash', clientRoles: { [clientId]: ['reader'] },
+  });
+  const version = user.securityVersion;
+  const Adapter = runtime.data.adapterFor('master');
+  await new Adapter('Grant').upsert(`grant-${clientId}`, { clientId, accountId: user.id });
+  await new Adapter('AccessToken').upsert(`token-${clientId}`, {
+    clientId, accountId: user.id, grantId: `grant-${clientId}`,
+  });
+
+  const registrationUri = new URL(registration.body.registration_client_uri);
+  await request(runtime.app)
+    .delete(`${registrationUri.pathname}${registrationUri.search}`)
+    .set('host', '127.0.0.1:34992')
+    .set('authorization', `Bearer ${registration.body.registration_access_token}`)
+    .expect(204);
+
+  assert.equal(await runtime.providers.get('master').Client.find(clientId), undefined);
+  assert.deepEqual(await runtime.data.management.listClientScopeAssignments('master', clientId), []);
+  assert.deepEqual(await runtime.data.management.listClaimMappers('master', 'client', clientId), []);
+  assert.deepEqual(await runtime.data.management.listClientRoles('master', clientId), []);
+  assert.equal((await runtime.data.management.listAuthenticationFlows('master'))
+    .some((flow) => flow.clientIds.includes(clientId)), false);
+  assert.equal((await request(runtime.app)
+    .get('/realms/master/.well-known/openid-configuration')
+    .set('host', '127.0.0.1:34992')
+    .expect(200)).body.acr_values_supported.includes(`urn:authme:${clientId}`), false);
+  const updatedUser = await runtime.store.findUserById('master', user.id);
+  assert.deepEqual(updatedUser.clientRoles, {});
+  assert(updatedUser.securityVersion > version);
+  assert.equal(await new Adapter('Grant').find(`grant-${clientId}`), undefined);
+  assert.equal(await new Adapter('AccessToken').find(`token-${clientId}`), undefined);
+});
+
 test('client_secret_basic and none client authentication remain unchanged', async () => {
   const basicResponse = await request(runtime.app)
     .post(tokenPath)

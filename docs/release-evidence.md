@@ -6,7 +6,7 @@ This document maps every autonomous milestone to executable evidence. A green un
 |---|---|---|
 | K1 | Deterministic Keycloak export transformer, structured/human compatibility reports, dry-run default, and zero-blocker minimal fixtures for all three declared profiles | `test/keycloak-import.test.js`; `docs/keycloak-compatibility.md`; `docs/keycloak-migration.md` |
 | K2 | Subject-bound account console for profile/recovery/password/MFA/passkeys/sessions/invitations and standalone production delivery integration | `test/account-console.test.js`; `test/account-email-delivery.test.js`; `test/postgres-account-console.test.js` |
-| K3 | Mutable realm status/settings, managed clients, roles, nested groups, users, and audited native admin UI/API | `test/admin-management.test.js`; `test/admin-console.test.js`; `test/admin-api.test.js` |
+| K3 | Mutable realm status/settings, managed and dynamically registered clients, roles, nested groups, users, complete client-scope assignment controls, and audited native admin UI/API | `test/admin-management.test.js`; `test/admin-console.test.js`; `test/admin-console-ui.test.js`; `test/admin-api.test.js`; `test/client-auth-jwt.test.js` |
 | K4 | Realm-local organizations, unique domains, invitations, current membership, IdP allowlists, durable token context | `test/organization-flow.test.js`; `test/management-store.test.js`; PostgreSQL management test |
 | K5 | Downstream SAML IdP metadata, signed Response/Assertion, encryption, IdP initiation, redirect SLO | `test/saml-idp.test.js` |
 | K6 | LDAP/AD authentication, bounded import/sync/reconciliation, immutable external identity, outage thresholds | `test/ldap.test.js`; `test/ldap-sync.test.js`; PostgreSQL LDAP tests |
@@ -51,14 +51,15 @@ Until all three records are attached, the accurate product label is **v1.0 relea
 
 The repository was re-audited on 2026-07-17 after the client-role, migration,
 flow/federation/CIBA, account-delivery, policy-lifecycle, organization,
-federated-link, and backup-manifest corrections:
+federated-link, backup-manifest, dynamic-registration deletion, and admin
+client-scope lifecycle corrections:
 
 - clean Node.js 22 container: source check passed for 150 JavaScript files;
-  ordinary suite 332 tests, 311 passed, 21 PostgreSQL-only skips, 0 failures;
-- clean Node.js 22 container against migrated PostgreSQL 17: 43/43 release
+  ordinary suite 335 tests, 313 passed, 22 PostgreSQL-only skips, 0 failures;
+- clean Node.js 22 container against migrated PostgreSQL 17: 44/44 release
   tests passed with 0 skips, including concurrent role/group graphs, managed
-  client policy cleanup, invitation rollback, account-membership cascades, and
-  migration `010_client_roles.sql`;
+  and registration-managed client policy cleanup, invitation rollback,
+  account-membership cascades, and migration `010_client_roles.sql`;
 - PostgreSQL protocol smoke passed, including OIDC/RFC 8414, PKCE, token
   audience/claims, refresh replay, device flow, MFA/recovery, SCIM, and audit;
 - real `pg_dump` v2 backup and destructive restore into an isolated database
@@ -70,7 +71,7 @@ federated-link, and backup-manifest corrections:
 - signed archive, CycloneDX SBOM, and checksum signatures verified; a second
   artifact run was byte-for-byte identical;
 - realm HA baseline probe and a 40-request/8-worker discovery rehearsal passed
-  with zero failures and 273.43 ms p95 on the rebuilt local audit image.
+  with zero failures and 172.05 ms p95 on the rebuilt local audit image.
 
 These are reproducible autonomous checks, not substitutes for X1 certification,
 X2 independent review, or X3 target-infrastructure/hardware drill records.

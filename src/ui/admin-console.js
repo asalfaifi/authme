@@ -1408,6 +1408,11 @@ async function renderAccessModel(signal) {
         await requestJson(`${base}/clients/${encodeURIComponent(clientId)}/client-scopes/${encodeURIComponent(scope.id)}`, { method: 'PUT', body: { assignmentType } });
         toast('Client scope assigned.');
       }, 'secondary'),
+      actionButton('Unassign', async () => {
+        const clientId = await promptedValue('Client ID'); if (!clientId) return;
+        await requestJson(`${base}/clients/${encodeURIComponent(clientId)}/client-scopes/${encodeURIComponent(scope.id)}`, { method: 'DELETE', body: {} });
+        toast('Client scope unassigned.');
+      }, 'secondary'),
       actionButton('Edit', async () => {
         const update = await promptedJson('Edit the client scope.', { name: scope.name, description: scope.description, attributes: scope.attributes });
         if (!update) return;

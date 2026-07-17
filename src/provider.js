@@ -1187,6 +1187,16 @@ export async function createRealmProvider({ realm, config, store, data, manageme
       ctx.body.backchannel_user_code_parameter_supported = false;
     }
   });
+  provider.middleware.unshift(async (ctx, next) => {
+    await next();
+    if (ctx.oidc?.route === 'client_delete' && ctx.status === 204) {
+      const clientId = ctx.oidc.client?.clientId;
+      if (clientId) {
+        await data.cleanupDeletedClient(realm, clientId);
+        await provider.authmeManagementMetadata.synchronize();
+      }
+    }
+  });
 
   provider.proxy = config.trustProxy;
   if (config.trustProxy) provider.maxIpsCount = 1;

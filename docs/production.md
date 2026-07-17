@@ -256,7 +256,7 @@ The independent `AUTHME_ADMIN_TOKEN` protects root automation under `/admin/v1` 
 
 Do not use the root bearer as a console login mechanism and do not copy it into HTML, browser JavaScript, local storage, or operator screenshots. Restrict both management paths at ingress; the in-browser console then applies its realm and permission grant in addition to that network boundary.
 
-Initial access tokens must be short-lived and delivered out of band. AuthMe does not attach fine-grained policies to these tokens, so treat each one as permission to submit any client metadata accepted by the protocol engine. Review every dynamically registered redirect/logout URI and authentication method. Revoke suspicious clients immediately.
+Initial access tokens must be short-lived and delivered out of band. AuthMe does not attach fine-grained policies to these tokens, so treat each one as permission to submit any client metadata accepted by the protocol engine. Review every dynamically registered redirect/logout URI and authentication method. Revoke suspicious clients immediately. Deleting a dynamic client with its registration access token also removes AuthMe scope assignments, claim mappers, client roles, client-only authentication flows, affected user assignments, and client/account grants.
 
 ## Cookies and browser security
 

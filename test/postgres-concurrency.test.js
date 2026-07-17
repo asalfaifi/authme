@@ -305,6 +305,50 @@ test('managed client deletion atomically removes policy, user assignments, and a
   }
 });
 
+test('PostgreSQL reconciles policy and grants after registration management removes a client record', { skip: !databaseUrl }, async () => {
+  const data = await createDataLayer({ databaseUrl, devMode: false, realms: [realm] });
+  try {
+    const clientId = `registered-${randomUUID().slice(0, 8)}`;
+    const Adapter = data.adapterFor(realm);
+    await data.upsertManagedClient(realm, {
+      client_id: clientId, redirect_uris: ['https://registered.example/callback'],
+    });
+    const scope = await data.management.createClientScope(realm, {
+      name: `registered-scope-${randomUUID().slice(0, 8)}`,
+      description: '', protocol: 'openid-connect', attributes: {},
+    });
+    await data.management.setClientScopeAssignment(realm, clientId, scope.id, 'default');
+    await data.management.putClientRole(realm, clientId, {
+      name: 'reader', description: '', composites: [], attributes: {},
+    });
+    const user = await data.store.createUser({
+      realm, username: `registered-${randomUUID().slice(0, 8)}`,
+      email: `${randomUUID()}@example.test`, passwordHash: 'hash',
+      clientRoles: { [clientId]: ['reader'] },
+    });
+    const version = user.securityVersion;
+    await new Adapter('Grant').upsert(`registered-grant-${clientId}`, {
+      clientId, accountId: user.id,
+    }, 600);
+    await new Adapter('AccessToken').upsert(`registered-token-${clientId}`, {
+      clientId, accountId: user.id, grantId: `registered-grant-${clientId}`,
+    }, 600);
+
+    await new Adapter('Client').destroy(clientId);
+    await data.cleanupDeletedClient(realm, clientId);
+
+    assert.deepEqual(await data.management.listClientScopeAssignments(realm, clientId), []);
+    assert.deepEqual(await data.management.listClientRoles(realm, clientId), []);
+    assert.equal(await new Adapter('Grant').find(`registered-grant-${clientId}`), undefined);
+    assert.equal(await new Adapter('AccessToken').find(`registered-token-${clientId}`), undefined);
+    const updatedUser = await data.store.findUserById(realm, user.id);
+    assert.deepEqual(updatedUser.clientRoles, {});
+    assert(updatedUser.securityVersion > version);
+  } finally {
+    await data.close();
+  }
+});
+
 test('audit retention deletes only records older than the configured window', { skip: !databaseUrl }, async () => {
   const data = await createDataLayer({ databaseUrl, devMode: false, realms: [realm] });
   try {
