@@ -37,6 +37,7 @@ test('development configuration supplies safe defaults and freezes top-level col
   assert.deepEqual(config.realms, ['master', 'engineering']);
   assert.deepEqual(config.clientsByRealm, { master: [], engineering: [] });
   assert.deepEqual(config.resourceServersByRealm, { master: [], engineering: [] });
+  assert.deepEqual(config.signingAdapterModules, {});
   assert.equal(config.cookieKeys.length, 1);
   assert.ok(Buffer.byteLength(config.cookieKeys[0]) >= 32);
   assert.ok(Buffer.byteLength(config.csrfSecret) >= 32);
@@ -49,6 +50,7 @@ test('development configuration supplies safe defaults and freezes top-level col
   assert.equal(Object.isFrozen(config), true);
   assert.equal(Object.isFrozen(config.realms), true);
   assert.equal(Object.isFrozen(config.cookieKeys), true);
+  assert.equal(Object.isFrozen(config.signingAdapterModules), true);
 });
 
 test('mTLS proxy configuration is explicit, normalized, and frozen', () => {
@@ -213,6 +215,10 @@ test('realm, client, key, URL, and TTL validation fail closed', () => {
   assert.throws(
     () => loadConfig({ AUTHME_DEV_MODE: 'true', AUTHME_CLIENTS_JSON: '[]' }),
     /must be an object keyed by realm/,
+  );
+  assert.throws(
+    () => loadConfig({ AUTHME_DEV_MODE: 'true', AUTHME_SIGNING_ADAPTER_MODULES_JSON: JSON.stringify({ unsupported: 'adapter' }) }),
+    /not a supported external signing provider/,
   );
   assert.throws(
     () => loadConfig({ AUTHME_DEV_MODE: 'true', AUTHME_RESOURCE_SERVERS_JSON: '{not-json' }),

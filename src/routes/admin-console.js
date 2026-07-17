@@ -3,6 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { Router, json, urlencoded } from 'express';
 import { createLocalJWKSet, jwtVerify } from 'jose';
+import { publicSigningJwks } from '../crypto/jwks.js';
 import { safeEqual } from '../crypto/secrets.js';
 import { ADMIN_CONSOLE_CLIENT_ID } from '../provider.js';
 import { renderAdminConsole, renderAdminLogin } from '../ui/admin-render.js';
@@ -121,12 +122,6 @@ function sessionDigest(sessionValue, config) {
   return createHmac('sha256', config.csrfSecret)
     .update(`authme-admin-console-session-v1\u0000${sessionValue}`)
     .digest('base64url');
-}
-
-function publicJwks(jwks) {
-  return {
-    keys: (jwks?.keys ?? []).map(({ d, p, q, dp, dq, qi, oth, k, ...publicKey }) => publicKey),
-  };
 }
 
 export function hasStrongAdminAuthentication(amr) {
@@ -335,7 +330,7 @@ export function createAdminConsole({ config, store, rateLimits, jwksByRealm, fet
       });
       const jwks = jwksByRealm.get(transaction.realm);
       if (!jwks) throw new Error('The realm signing keys are unavailable.');
-      const { payload } = await jwtVerify(token.id_token, createLocalJWKSet(publicJwks(jwks)), {
+      const { payload } = await jwtVerify(token.id_token, createLocalJWKSet(publicSigningJwks(jwks)), {
         issuer: `${config.publicUrl}/realms/${transaction.realm}`,
         audience: ADMIN_CONSOLE_CLIENT_ID,
         clockTolerance: 5,

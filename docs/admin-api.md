@@ -69,13 +69,13 @@ The configuration catalog returns the realm issuer, deployment/storage mode, Red
 |---|---|---|
 | `/realms/{realm}/clients[/{clientId}]` | `GET`, collection `POST`, item `PUT`/`DELETE` | Full OIDC client metadata is validated by the same security policy as startup. Secrets are never returned. Static and reserved clients are immutable. Delete revokes client grants and protocol artifacts. |
 | `/realms/{realm}/roles[/{roleName}]` | `GET`, item `PUT`/`DELETE` | Supports attributes and composite roles; missing references and cycles are rejected. |
-| `/realms/{realm}/groups[/{groupId}]` | `GET`, collection `POST`, item `PATCH`/`DELETE` | Supports parent IDs, stable canonical paths, role assignment, and cycle prevention. A group with children must be reconciled before deletion. |
+| `/realms/{realm}/groups[/{groupId}]` | `GET`, collection `POST`, item `PATCH`/`DELETE` | Supports parent IDs, canonical paths, existing-role assignment, and cycle prevention. Rename/move rewrites affected user paths and revokes stale sessions. A group with children must be reconciled before deletion. |
 | `/realms/{realm}/client-scopes[/{scopeId}]` | `GET`, collection `POST`, item `PATCH`/`DELETE` | Reusable OIDC client scopes. |
-| `/realms/{realm}/clients/{clientId}/client-scopes[/{scopeId}]` | `GET`, item `PUT`/`DELETE` | Assign a scope as `default` or `optional`. |
-| `/realms/{realm}/claim-mappers[/{mapperId}]` | `GET`, collection `POST`, item `PATCH`/`DELETE` | Client- or client-scope-owned hardcoded/user-attribute/role/group/organization mappers. |
-| `/realms/{realm}/authentication-flows[/{flowId}]` | `GET`, collection `POST`, item `PATCH`/`DELETE` | Ordered required/alternative/conditional password, TOTP, passkey, and federation steps with client, `acr`, and maximum-age policy. |
+| `/realms/{realm}/clients/{clientId}/client-scopes[/{scopeId}]` | `GET`, item `PUT`/`DELETE` | Assign an existing scope to an existing client as `default` or `optional`. |
+| `/realms/{realm}/claim-mappers[/{mapperId}]` | `GET`, collection `POST`, item `PATCH`/`DELETE` | Existing-client- or existing-client-scope-owned hardcoded/user-attribute/role/group/organization mappers. |
+| `/realms/{realm}/authentication-flows[/{flowId}]` | `GET`, collection `POST`, item `PATCH`/`DELETE` | Required password/passkey/federation primary method; optional password+TOTP required/conditional composition; or alternative primary methods. Client, `acr`, AMR, and maximum-age policy are enforced on new and existing sessions. Unexecutable mixed definitions are rejected. |
 
-All paths in this table are below `/admin/v1`. Mutations are realm-scoped and audited. A newly stored client is visible to the protocol provider without a restart; deleting it invalidates further client use immediately.
+All paths in this table are below `/admin/v1`. Mutations are realm-scoped and audited. User role/group assignments, mapper owners, scope assignments, and flow client references must resolve within the same realm. A newly stored client is visible to the protocol provider without a restart; deleting it invalidates further client use immediately. Client-scope and authentication-flow mutations update discovery metadata immediately.
 
 ## Organization and signing-key operations
 

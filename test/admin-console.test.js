@@ -394,6 +394,13 @@ test('administrator console uses its real OIDC flow and enforces session boundar
     assert.equal(response.status, 200);
     assert((await response.json()).users.some((user) => user.username === 'admin'));
 
+    await runtime.data.management.putRole('master', {
+      name: 'member', description: 'Member', composites: [], attributes: {},
+    });
+    await runtime.data.management.createGroup('master', {
+      name: 'test', parentId: null, roles: ['member'], attributes: {},
+    });
+
     const newUser = {
       username: 'console-security-test',
       email: 'console-security-test@example.test',

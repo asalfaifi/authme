@@ -48,9 +48,31 @@ test('realm, role, nested group, scope, mapper, flow, and organization APIs are 
   await api('put', '/admin/v1/realms/master/roles/editor', { description: 'Edit', composites: ['reader'], attributes: {} }).expect(201);
   const group = await api('post', '/admin/v1/realms/master/groups', { name: 'engineering', parentId: null, roles: ['editor'], attributes: {} }).expect(201);
   assert.equal(group.body.path, '/engineering');
+  const managedUser = await api('post', '/admin/v1/realms/master/users', {
+    username: 'managed-relations', email: 'managed-relations@example.test', password: 'Correct-Horse-Battery-Staple-2026!',
+    roles: ['editor'], groups: ['/engineering'], clientRoles: {},
+  }).expect(201);
+  await api('post', '/admin/v1/realms/master/users', {
+    username: 'orphan-relations', email: 'orphan-relations@example.test', password: 'Correct-Horse-Battery-Staple-2026!',
+    roles: ['missing-role'], groups: [], clientRoles: {},
+  }).expect(400);
+  const securityVersionBeforeMove = (await runtime.store.findUserById('master', managedUser.body.id)).securityVersion;
+  await api('patch', `/admin/v1/realms/master/groups/${group.body.id}`, { name: 'platform' }).expect(200);
+  const rewrittenUser = await api('get', `/admin/v1/realms/master/users/${managedUser.body.id}`).expect(200);
+  assert.deepEqual(rewrittenUser.body.groups, ['/platform']);
+  assert((await runtime.store.findUserById('master', managedUser.body.id)).securityVersion > securityVersionBeforeMove);
+  await api('patch', `/admin/v1/realms/master/groups/${group.body.id}`, { roles: ['missing-role'] }).expect(400);
+  await api('delete', '/admin/v1/realms/master/roles/editor', {}).expect(204);
+  assert.deepEqual((await api('get', `/admin/v1/realms/master/users/${managedUser.body.id}`).expect(200)).body.roles, []);
   const scope = await api('post', '/admin/v1/realms/master/client-scopes', { name: 'profile-extra', description: '', protocol: 'openid-connect', attributes: {} }).expect(201);
   await api('post', '/admin/v1/realms/master/claim-mappers', { ownerType: 'client-scope', ownerId: scope.body.id, name: 'department', mapperType: 'user-attribute', config: { claim: 'department', source: 'attributes.department' } }).expect(201);
+  await api('post', '/admin/v1/realms/master/claim-mappers', { ownerType: 'client-scope', ownerId: '00000000-0000-4000-8000-000000000000', name: 'orphan', mapperType: 'hardcoded', config: { claim: 'orphan', value: true } }).expect(404);
+  await api('put', `/admin/v1/realms/master/clients/missing-client/client-scopes/${scope.body.id}`, { assignmentType: 'optional' }).expect(404);
   await api('post', '/admin/v1/realms/master/authentication-flows', { alias: 'strong', enabled: true, priority: 10, clientIds: [], acr: 'urn:authme:strong', maxAgeSeconds: 300, steps: [{ type: 'password', requirement: 'required' }] }).expect(201);
+  await api('post', '/admin/v1/realms/master/authentication-flows', { alias: 'impossible', enabled: true, priority: 11, clientIds: [], acr: 'urn:authme:impossible', maxAgeSeconds: 300, steps: [{ type: 'passkey', requirement: 'required' }, { type: 'totp', requirement: 'required' }] }).expect(400);
+  const discovery = await request(runtime.app).get('/realms/master/.well-known/openid-configuration').set('host', host).expect(200);
+  assert(discovery.body.scopes_supported.includes('profile-extra'));
+  assert(discovery.body.acr_values_supported.includes('urn:authme:strong'));
   const organization = await api('post', '/admin/v1/realms/master/organizations', { name: 'Example', alias: 'example', enabled: true, domains: [{ domain: 'example.test', verified: false }], identityProviderIds: [], attributes: {} }).expect(201);
   assert.equal(organization.body.alias, 'example');
   await api('patch', `/admin/v1/realms/master/organizations/${organization.body.id}`, { identityProviderIds: ['unconfigured'] }).expect(400);

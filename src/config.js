@@ -34,6 +34,7 @@ const rawSchema = z.object({
   AUTHME_ADMIN_TOKEN: z.string().optional(),
   AUTHME_JWKS_DIR: z.string().optional(),
   AUTHME_SIGNING_KEY_PROVIDERS_JSON: z.string().optional(),
+  AUTHME_SIGNING_ADAPTER_MODULES_JSON: z.string().optional(),
   AUTHME_CLIENTS_JSON: z.string().optional(),
   AUTHME_RESOURCE_SERVERS_JSON: z.string().optional(),
   AUTHME_LDAP_PROVIDERS_JSON: z.string().optional(),
@@ -234,6 +235,24 @@ function signingKeyProvidersByRealm(value, realms) {
   return deepFreeze(result);
 }
 
+function signingAdapterModules(value) {
+  if (!value) return deepFreeze({});
+  let parsed;
+  try { parsed = JSON.parse(value); } catch (error) { throw new Error('AUTHME_SIGNING_ADAPTER_MODULES_JSON must contain valid JSON', { cause: error }); }
+  if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') throw new Error('AUTHME_SIGNING_ADAPTER_MODULES_JSON must be an object keyed by signing provider');
+  const result = {};
+  for (const [provider, specifier] of Object.entries(parsed)) {
+    if (!['aws-kms', 'gcp-kms', 'azure-key-vault', 'pkcs11'].includes(provider)) {
+      throw new Error(`AUTHME_SIGNING_ADAPTER_MODULES_JSON.${provider} is not a supported external signing provider`);
+    }
+    if (typeof specifier !== 'string' || !specifier.trim() || specifier.length > 2048 || /[\r\n\0]/u.test(specifier)) {
+      throw new Error(`AUTHME_SIGNING_ADAPTER_MODULES_JSON.${provider} must be a module specifier`);
+    }
+    result[provider] = specifier.trim();
+  }
+  return deepFreeze(result);
+}
+
 const oauthScope = /^[\x21\x23-\x5b\x5d-\x7e]+$/;
 
 function stringArray(value, name, { required = false } = {}) {
@@ -376,6 +395,7 @@ export function loadConfig(environment = process.env) {
     adminToken: secret(raw.AUTHME_ADMIN_TOKEN, 'AUTHME_ADMIN_TOKEN', devMode),
     jwksDir: raw.AUTHME_JWKS_DIR,
     signingKeyProvidersByRealm: signingKeyProviders,
+    signingAdapterModules: signingAdapterModules(raw.AUTHME_SIGNING_ADAPTER_MODULES_JSON),
     clientsByRealm: clients,
     resourceServersByRealm: resourceServersByRealm(raw.AUTHME_RESOURCE_SERVERS_JSON, realms, devMode),
     ldapProvidersByRealm: parseLdapProviders(raw.AUTHME_LDAP_PROVIDERS_JSON, { realms, devMode }),

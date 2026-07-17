@@ -4,7 +4,7 @@ _Standards-first, self-hosted identity & access server (a Keycloak alternative).
 
 **Status legend:** ✅ Done & merged · 🔄 In progress · ⏳ Not started · 🔒 External-only (cannot be finished autonomously)
 
-**Current trunk:** branch `codex-build/v0.4` — **v1.0 code-complete release candidate**. All autonomous milestones and hardening follow-ups are implemented. The three external release gates remain explicitly locked.
+**Current trunk:** branch `codex-build/v0.4` — **v1.0 code-complete release candidate**. All autonomous milestones and hardening follow-ups are implemented and mapped to executable evidence in [`docs/release-evidence.md`](docs/release-evidence.md). The three external release gates remain explicitly locked.
 
 ---
 
@@ -74,8 +74,8 @@ _Standards-first, self-hosted identity & access server (a Keycloak alternative).
 
 ## v1.0 exit criteria (gates before declaring 1.0)
 
-- Published compatibility matrix + migration tool with deterministic reconciliation (K1 delivers the tool; matrix to finalize).
-- No critical migration blocker for declared reference deployments.
+- Published compatibility matrix + migration tool with deterministic reconciliation (delivered in `docs/keycloak-compatibility.md` and `scripts/kc-import.mjs`).
+- No critical migration blocker for the three declared reference profiles; each real deployment must still produce its own reconciliation and interoperability evidence.
 - OpenID certification for supported profiles (X1).
 - Independent penetration test + architecture review, critical/high findings resolved (X2).
 - Reproducible builds, signed release artifacts, SBOM, vulnerability-response policy, documented support window.

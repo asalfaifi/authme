@@ -1,5 +1,6 @@
 import { Router, urlencoded } from 'express';
 import { resolveFederatedLogin } from '../authentication/federated-login.js';
+import { authenticationSatisfiesFlow } from '../authentication/flow-policy.js';
 import { createCsrfToken, verifyCsrfToken } from '../crypto/csrf.js';
 import { decryptSecret, safeEqual } from '../crypto/secrets.js';
 import { recoveryCodeDigest, totpStep } from '../crypto/mfa.js';
@@ -22,22 +23,7 @@ function interactionClientName(client) {
   return client.clientName || client.clientId;
 }
 
-function amrSatisfies(type, amr) {
-  if (type === 'password') return amr.includes('pwd') || amr.includes('ldap');
-  if (type === 'totp') return amr.includes('otp') || amr.includes('recovery');
-  if (type === 'passkey') return amr.includes('passkey') || amr.includes('hwk');
-  if (type === 'federated') return amr.includes('federated');
-  return false;
-}
-
-export function authenticationSatisfiesFlow(flow, amr, user = {}) {
-  if (!flow) return true;
-  const required = flow.steps.filter((step) => step.requirement === 'required'
-    || (step.requirement === 'conditional' && step.type === 'totp' && user.totpConfirmed));
-  if (required.some((step) => !amrSatisfies(step.type, amr))) return false;
-  const alternatives = flow.steps.filter((step) => step.requirement === 'alternative');
-  return alternatives.length === 0 || alternatives.some((step) => amrSatisfies(step.type, amr));
-}
+export { authenticationSatisfiesFlow } from '../authentication/flow-policy.js';
 
 function requestedAcrs(details) {
   return String(details.params.acr_values ?? '').split(' ').filter(Boolean);

@@ -64,7 +64,8 @@ The executable recognizes these security-critical inputs:
 | `AUTHME_REALMS` | Comma-separated immutable realm slugs |
 | `DATABASE_URL` | Required PostgreSQL connection |
 | `AUTHME_JWKS_DIR` | Read-only directory containing realm JWK sets for realms using the `file` signing provider |
-| `AUTHME_SIGNING_KEY_PROVIDERS_JSON` | Per-realm provider (`file`, `aws-kms`, `gcp-kms`, `azure-key-vault`, or `pkcs11`), algorithm, non-secret material reference, rotation days, and public-key overlap. External provider deployments must register a compatible signing adapter. |
+| `AUTHME_SIGNING_KEY_PROVIDERS_JSON` | Per-realm provider (`file`, `aws-kms`, `gcp-kms`, `azure-key-vault`, or `pkcs11`), algorithm, non-secret material reference, rotation days, and public-key overlap. |
+| `AUTHME_SIGNING_ADAPTER_MODULES_JSON` | Trusted deployment module specifier for every external provider used by a realm; modules are loaded before the HTTP listener starts. |
 | `AUTHME_COOKIE_KEYS` | At least two independent values, newest first, each at least 32 bytes |
 | `AUTHME_CSRF_SECRET` | Independent random value of at least 32 bytes |
 | `AUTHME_PASSWORD_PEPPER` | Independent random value of at least 32 bytes |
@@ -175,7 +176,7 @@ For multi-replica deployments:
 
 ### Provider configuration and initial provisioning
 
-The default `file` provider loads private JWK material from `AUTHME_JWKS_DIR`. External provider names select a deployment-supplied adapter with `loadJwks()` and `rotate()` operations; AuthMe fails startup if that adapter is absent or returns an invalid private signing set. Keep KMS/HSM credentials in the platform identity/secret boundary and store only provider references and public JWKs in PostgreSQL. Only public members appear in discovery JWKS and administration inventory. Use distinct key material per environment and realm.
+The default `file` provider loads private JWK material from `AUTHME_JWKS_DIR`. External provider names select a trusted deployment module through `AUTHME_SIGNING_ADAPTER_MODULES_JSON`; AuthMe fails before listening if a required module is absent, cannot load, or violates the adapter contract. An external adapter must never return private key material. Keep KMS/HSM credentials in the platform identity/secret boundary and store only provider references and public JWKs in PostgreSQL. Only public members appear in discovery JWKS and administration inventory. Use distinct key material per environment and realm.
 
 Example provider policy:
 
@@ -191,7 +192,23 @@ Example provider policy:
 }
 ```
 
-An external adapter still needs an operator-tested KMS/HSM integration. The repository supplies the validated lifecycle boundary and fails closed; it does not pretend that cloud credentials or physical hardware are present.
+Configure the implementation module independently from the realm policy:
+
+```json
+{
+  "pkcs11": "file:///opt/authme-adapters/pkcs11.mjs"
+}
+```
+
+The module exports `createSigningAdapter({ provider, policies })` (or an equivalent default export) and returns these asynchronous operations:
+
+- `loadJwks({ realm, policy })` returns an ordered, non-empty, public-only JWK Set. The active key is first; every key has a unique `kid`, the configured `alg`, and `use: "sig"`.
+- `sign({ realm, policy, keyId, algorithm, data })` sends the exact JWS signing input to the provider and returns a `Buffer` or `Uint8Array`. ES256 adapters may return ASN.1 DER or 64-byte IEEE P1363 form; AuthMe normalizes DER to JWS form.
+- `rotate({ realm, policy })` creates or activates the next provider key while retaining the old public key for the configured overlap, then returns the same public-only inventory accepted by `loadJwks`.
+
+AuthMe uses `oidc-provider`'s external-signing interface for every JOSE operation. Private parameters returned by `loadJwks` are rejected, no private key is imported into the process, provider/algorithm mismatches fail closed, and adapter signing errors abort token issuance. Module code is part of the trusted computing base: pin it, review it, run it with workload identity or a protected PKCS#11 credential, bound provider timeouts/retries, and monitor signing latency/failure rate.
+
+An external adapter still needs an operator-tested KMS/HSM integration. The repository supplies and tests the public-only remote-signing lifecycle boundary; it does not pretend that cloud credentials or physical hardware are present.
 
 ### Rotation runbook
 
@@ -326,17 +343,29 @@ npm run ha:rehearse -- --base-url https://auth.example.com
 npm run ha:rehearse -- --base-url https://auth.example.com --execute --namespace authme --deployment authme
 ```
 
-This proves the scripted single-region rollout path only. Database standby promotion, dependency outage, physical HSM behavior, disaster recovery, and regional failover must be executed in the operator's real infrastructure and attached as external X3 evidence.
+Execute mode probes public readiness continuously throughout the restart and rollout wait, records sample count, maximum latency, and bounded failure details, and exits nonzero for any failed probe, failed rollout, or failed final health check. A passing report therefore requires zero observed public-readiness errors across the single-region rolling update. This proves the scripted single-region rollout path only. Database standby promotion, dependency outage, physical HSM behavior, disaster recovery, and regional failover must be executed in the operator's real infrastructure and attached as external X3 evidence.
 
 ## Performance target and rehearsal
 
-The default release-candidate service target for the public discovery read path is zero errors and p95 latency at or below 500 ms for 500 requests at concurrency 25 in the target environment. Run:
+The minimum release-candidate service target for the public discovery read path is zero errors and p95 latency at or below 500 ms for 500 requests at concurrency 25 in the target environment. Run:
 
 ```sh
 npm run perf:rehearse -- --base-url https://auth.example.com --requests 500 --concurrency 25 --p95-ms 500
 ```
 
-This is a reproducible minimum gate, not a capacity claim for login or token traffic. Each production deployment must define and validate representative authorization, token, refresh, federation, SCIM, cleanup, and outage workloads, then record throughput, p95/p99, database saturation, error rate, and recovery time.
+The representative built-in scenario performs a fresh Authorization Code + PKCE browser interaction, password/TOTP login, consent, token exchange, and—when `offline_access` returns one—a refresh exchange for every measured operation. Use a dedicated load-test realm, client, and user; never put credentials on the command line:
+
+```sh
+AUTHME_PERF_CLIENT_ID=load-test \
+AUTHME_PERF_REDIRECT_URI=https://load-driver.example/callback \
+AUTHME_PERF_USERNAME=load-user \
+AUTHME_PERF_PASSWORD='from-secret-manager' \
+AUTHME_PERF_OTP='current-test-code' \
+AUTHME_PERF_SCOPE='openid offline_access' \
+npm run perf:rehearse -- --base-url https://auth.example.com --scenario authorization-code --requests 500 --concurrency 25 --p95-ms 2000
+```
+
+The discovery run is a reproducible minimum gate, not a capacity claim for login or token traffic. A release performance record must include the authorization-code scenario and deployment-specific federation, SCIM, cleanup, and dependency-outage workloads, then record throughput, p95/p99, database saturation, error rate, and recovery time. A pass on the local/in-memory development server is functional evidence only, not production capacity evidence.
 
 ## Upgrade procedure
 

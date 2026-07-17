@@ -5,6 +5,7 @@ import { Router, json, urlencoded } from 'express';
 import { createLocalJWKSet, jwtVerify } from 'jose';
 import { z } from 'zod';
 import { createRecoveryCodes, createTotp, totpStep } from '../crypto/mfa.js';
+import { publicSigningJwks } from '../crypto/jwks.js';
 import { hashPassword, verifyPassword } from '../crypto/password.js';
 import { decryptSecret, encryptSecret, keyedDigest, randomToken, safeEqual } from '../crypto/secrets.js';
 import { loggableError } from '../logging.js';
@@ -101,10 +102,6 @@ function consoleHeaders(res) {
   res.set('Cache-Control', 'no-store');
   res.set('Content-Security-Policy', "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'");
   res.set('Permissions-Policy', 'camera=(), geolocation=(), microphone=(), payment=(), usb=(), publickey-credentials-create=(self), publickey-credentials-get=(self)');
-}
-
-function publicJwks(jwks) {
-  return { keys: (jwks?.keys ?? []).map(({ d, p, q, dp, dq, qi, oth, k, ...publicKey }) => publicKey) };
 }
 
 function parse(schema, req, res) {
@@ -382,7 +379,7 @@ export function createAccountConsole({
     if (typeof req.query.code !== 'string' || req.query.code.length > 4096) return fail('The authorization response did not contain a valid code.');
     try {
       const token = await tokenExchange(req.query.code, transaction.verifier);
-      const { payload } = await jwtVerify(token.id_token, createLocalJWKSet(publicJwks(jwks)), {
+      const { payload } = await jwtVerify(token.id_token, createLocalJWKSet(publicSigningJwks(jwks)), {
         issuer: `${config.publicUrl}/realms/${realm}`,
         audience: ACCOUNT_CONSOLE_CLIENT_ID,
         clockTolerance: 5,

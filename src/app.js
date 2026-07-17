@@ -25,6 +25,7 @@ import { renderError } from './ui/render.js';
 const cssPath = fileURLToPath(new URL('./ui/authme.css', import.meta.url));
 const passkeyCssPath = fileURLToPath(new URL('./ui/authme-passkeys.css', import.meta.url));
 const passkeyScriptPath = fileURLToPath(new URL('./ui/authme-passkeys.js', import.meta.url));
+const packageVersion = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')).version;
 
 function securityHeaders(req, res, next) {
   const authUi = req.path.startsWith('/realms/')
@@ -221,7 +222,7 @@ export async function createAuthMeApp(config, overrides = {}) {
     app.get('/', (_req, res) => {
       res.set('Cache-Control', 'no-store').json({
         name: 'AuthMe',
-        version: '0.3.0',
+        version: packageVersion,
         issuers: config.realms.map((realm) => `${config.publicUrl}/realms/${realm}`),
         capabilities: Object.fromEntries(config.realms.map((realm) => [
           realm,

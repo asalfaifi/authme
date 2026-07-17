@@ -12,6 +12,39 @@ jobs:
   release:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: authme_release
+          POSTGRES_USER: authme
+          POSTGRES_PASSWORD: authme-release-ci-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U authme -d authme_release"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      NODE_ENV: test
+      AUTHME_PUBLIC_URL: https://authme.test
+      AUTHME_PORT: "3000"
+      AUTHME_REALMS: master
+      DATABASE_URL: postgresql://authme:authme-release-ci-only@127.0.0.1:5432/authme_release
+      REDIS_URL: redis://127.0.0.1:6379/0
+      AUTHME_DEV_MODE: "false"
+      AUTHME_TRUST_PROXY: "false"
+      AUTHME_LOG_LEVEL: error
     steps:
       - name: Check out exact tag
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -22,8 +55,38 @@ jobs:
           cache: npm
       - name: Install exact dependency tree
         run: npm ci --no-audit --no-fund
+      - name: Generate ephemeral release-validation secrets
+        shell: bash
+        run: |
+          AUTHME_JWKS_DIR="$RUNNER_TEMP/authme-jwks"
+          mkdir -p "$AUTHME_JWKS_DIR"
+          {
+            echo "AUTHME_JWKS_DIR=$AUTHME_JWKS_DIR"
+            echo "AUTHME_COOKIE_KEYS=$(openssl rand -hex 32),$(openssl rand -hex 32)"
+            echo "AUTHME_CSRF_SECRET=$(openssl rand -hex 32)"
+            echo "AUTHME_PASSWORD_PEPPER=$(openssl rand -hex 32)"
+            echo "AUTHME_SUBJECT_SALT=$(openssl rand -hex 32)"
+            echo "AUTHME_FIELD_ENCRYPTION_KEY=$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n')"
+            echo "AUTHME_ADMIN_TOKEN=$(openssl rand -hex 32)"
+          } >> "$GITHUB_ENV"
+      - name: Generate realm signing keys
+        run: npm run keys:generate
+      - name: Apply exact migration set
+        run: npm run db:migrate
       - name: Validate source and tests
         run: npm run check && npm test
+      - name: Run non-skipping PostgreSQL release tests
+        run: npm run test:postgres
+      - name: Run PostgreSQL protocol smoke test
+        env:
+          AUTHME_SMOKE_DATABASE_URL: ${{ env.DATABASE_URL }}
+        run: npm run smoke
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high
+      - name: Validate Helm release and build runtime image
+        run: |
+          ./scripts/check-helm.sh
+          docker build --pull --target runtime --tag authme:${GITHUB_REF_NAME} .
       - name: Load release signing key
         env:
           RELEASE_KEY: ${{ secrets.AUTHME_RELEASE_SIGNING_KEY_B64 }}

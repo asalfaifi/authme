@@ -34,6 +34,8 @@ after(async () => {
 });
 
 test('OIDC and RFC 8414 discovery agree on the issuer-mounted protocol endpoints', async () => {
+  const service = await request(runtime.app).get('/').set('host', '127.0.0.1:34991').expect(200);
+  assert.equal(service.body.version, '1.0.0-rc.1');
   const oidc = await request(runtime.app)
     .get('/realms/master/.well-known/openid-configuration')
     .set('host', '127.0.0.1:34991')

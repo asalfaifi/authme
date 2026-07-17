@@ -57,6 +57,18 @@ Keycloak's current feature inventory includes OIDC/OAuth, SAML, identity brokeri
 | Signing/operations | Implemented code path | Encrypted backup/restore, HA/load rehearsal, and file/KMS/HSM signing-provider rotation; real hardware/DR drills remain external evidence |
 | Kerberos/SPNEGO | Not supported | No implementation |
 
+## Declared reference deployment profiles
+
+The v1 release-candidate compatibility contract is evaluated against three named profiles. These are bounded technical profiles, not claims about an unnamed customer deployment:
+
+| Profile | Required behavior | Critical migration blockers |
+|---|---|---|
+| **OIDC application estate** | Realm-shaped issuer; Authorization Code + PKCE; refresh and client-credentials grants; standard logout; realm/client roles, nested group paths, client scopes, and claim mappers; PostgreSQL-backed sessions | Direct Access Grant, implicit/hybrid-only clients, Keycloak adapter-specific logout, custom protocol mappers/SPIs, UMA policies, or an issuer/redirect change the applications cannot accept |
+| **Enterprise workforce** | OIDC applications plus LDAP/AD import/sync or supported upstream OIDC/SAML federation, SCIM Users/Groups, organizations, MFA/passkeys, native account/admin consoles | Kerberos/SPNEGO, broker-side encrypted SAML assertions, non-portable existing MFA credentials without re-enrollment, arbitrary SCIM extensions, or required Keycloak Admin REST compatibility |
+| **Federation hub** | AuthMe downstream SAML IdP with exact registered SP metadata, signed Response/Assertion, optional assertion encryption, supported IdP initiation and redirect SLO, plus the OIDC application profile | SAML artifact binding, SOAP/POST or multi-party logout, arbitrary Keycloak authentication SPIs/themes, or SP behavior outside the registered algorithm/binding contract |
+
+A deployment matches a profile only when `kc:import` reports no unsupported feature used by a critical workload, every emitted reference reconciles, credentials and secrets have an explicit replacement plan, and its relying-party/federation test suite passes against a production-like AuthMe environment. Any listed blocker makes that source deployment out of profile; it must be redesigned, split into a bounded coexistence migration, or remain on Keycloak. This prevents “no critical blocker” from being inferred merely from a successful JSON parse.
+
 ## URL mapping
 
 The following public paths intentionally match Keycloak's OIDC layout, documented by Keycloak in [OIDC layers](https://www.keycloak.org/securing-apps/oidc-layers):

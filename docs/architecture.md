@@ -438,7 +438,7 @@ Each realm has its own logical signing keyring. Production private keys must be 
 2. **Retiring**: remains in JWKS for verification but does not sign new tokens.
 3. **Removed**: deleted only after every token it could have signed has expired, including clock skew and caches.
 
-The signing-key manager supports file, AWS KMS, GCP KMS, Azure Key Vault, and PKCS#11 provider identifiers. External providers require deployment adapters that load an oidc-provider-compatible private key set and perform rotation; startup fails closed when an adapter or private material is absent. PostgreSQL inventory contains only public JWKs and material references. Rotation activates one new key, marks the prior key retiring, and preserves the configured verification overlap. Real hardware behavior remains an operator/external validation gate.
+The signing-key manager supports file, AWS KMS, GCP KMS, Azure Key Vault, and PKCS#11 provider identifiers. External providers require trusted deployment adapters that return a public-only key inventory, sign exact JWS inputs remotely, and perform rotation. AuthMe wraps those public keys with `oidc-provider`'s external-signing interface; private key parameters are rejected and never imported. Startup fails closed when an adapter, public key, algorithm, or required operation is absent. PostgreSQL inventory contains only public JWKs and material references. Rotation activates one new key, marks the prior key retiring, and preserves the configured verification overlap. Real hardware behavior remains an operator/external validation gate.
 
 ## Internal boundaries
 

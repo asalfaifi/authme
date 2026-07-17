@@ -6,6 +6,7 @@ import {
   MemoryManagementStore,
 } from '../src/repositories/management-store.js';
 import { authenticationSatisfiesFlow } from '../src/routes/interactions.js';
+import { authenticationFlowConfigurationError } from '../src/authentication/flow-policy.js';
 
 test('realm roles compose without cycles and nested groups retain stable paths', async () => {
   const store = new MemoryManagementStore(['master', 'staff']);
@@ -60,6 +61,21 @@ test('client scopes aggregate safe claim mappers and authentication flows resolv
   assert.equal(flow.alias, 'portal-step-up');
   assert.equal(authenticationSatisfiesFlow(flow, ['pwd', 'otp'], { totpConfirmed: true }), true);
   assert.equal(authenticationSatisfiesFlow(flow, ['pwd'], { totpConfirmed: true }), false);
+});
+
+test('authentication flows reject configurations the interaction engine cannot execute', async () => {
+  assert.match(authenticationFlowConfigurationError([
+    { type: 'passkey', requirement: 'required' },
+    { type: 'totp', requirement: 'required' },
+  ]), /TOTP can only be combined with password/iu);
+  assert.match(authenticationFlowConfigurationError([
+    { type: 'password', requirement: 'required' },
+    { type: 'federated', requirement: 'alternative' },
+  ]), /cannot be combined/iu);
+  assert.equal(authenticationFlowConfigurationError([
+    { type: 'password', requirement: 'required' },
+    { type: 'totp', requirement: 'conditional' },
+  ]), undefined);
 });
 
 test('organizations isolate domains, memberships, invitations, and signing-key lifecycle by realm', async () => {

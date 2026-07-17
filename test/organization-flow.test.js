@@ -21,7 +21,7 @@ function csrf(html) {
   return match[1];
 }
 
-async function authorize({ agent = request.agent(runtime.app), organization, scope = 'openid organization', expectFailure = false } = {}) {
+async function authorize({ agent = request.agent(runtime.app), organization, scope = 'openid organization', acrValues, expectFailure = false } = {}) {
   const verifier = randomBytes(32).toString('base64url');
   const state = randomBytes(16).toString('base64url');
   let response = await agent.get('/realms/master/protocol/openid-connect/auth').set('host', host).query({
@@ -33,6 +33,7 @@ async function authorize({ agent = request.agent(runtime.app), organization, sco
     resource,
     code_challenge: createHash('sha256').update(verifier).digest('base64url'),
     code_challenge_method: 'S256',
+    acr_values: acrValues,
     state,
   });
   for (let step = 0; step < 8; step += 1) {
@@ -67,7 +68,7 @@ async function exchange({ callback, verifier }) {
       redirect_uri: client.redirectUri, code: callback.searchParams.get('code'), code_verifier: verifier,
       resource,
     }).expect(200);
-  return jwtVerify(response.body.access_token, keySet, { issuer, audience: resource });
+  return { ...await jwtVerify(response.body.access_token, keySet, { issuer, audience: resource }), accessToken: response.body.access_token };
 }
 
 before(async () => {
@@ -110,17 +111,28 @@ test('organization context, optional client scopes, and configured step-up flows
   const optional = await exchange(await authorize({ organization: organization.id, scope: 'openid organization optional-context' }));
   assert.equal(optional.payload.optional_context, 'granted');
 
+  await runtime.data.management.deleteOrganizationMembership('master', organization.id, admin.id);
+  const revoked = await request(runtime.app).get('/realms/master/protocol/openid-connect/userinfo')
+    .set('host', host).set('authorization', `Bearer ${ordinary.accessToken}`);
+  assert.equal([401, 403].includes(revoked.status), true, `expected revoked organization context to fail, received ${revoked.status}`);
+  await runtime.data.management.upsertOrganizationMembership('master', organization.id, admin.id, ['owner']);
+
   const unauthorized = await runtime.data.management.createOrganization('master', {
     name: 'Other', alias: 'other', enabled: true, domains: [], identityProviderIds: [], attributes: {},
   });
   const failure = await authorize({ organization: unauthorized.alias, expectFailure: true });
   assert.equal(failure.response.status, 401);
 
-  await runtime.data.management.createAuthenticationFlow('master', {
-    alias: 'passkey-required', description: '', enabled: true, priority: 1, clientIds: [client.id],
-    acr: 'urn:authme:passkey', maxAgeSeconds: 300, steps: [{ type: 'passkey', requirement: 'required' }],
+  const flow = await runtime.data.management.createAuthenticationFlow('master', {
+    alias: 'dynamic-assurance', description: '', enabled: true, priority: 1, clientIds: [client.id],
+    acr: 'urn:authme:dynamic', maxAgeSeconds: 300, steps: [{ type: 'password', requirement: 'required' }],
   });
-  const stepUp = await authorize({ organization: organization.alias, expectFailure: true });
+  const sessionAgent = request.agent(runtime.app);
+  await exchange(await authorize({ agent: sessionAgent, organization: organization.alias, acrValues: flow.acr }));
+  await runtime.data.management.updateAuthenticationFlow('master', flow.id, {
+    steps: [{ type: 'passkey', requirement: 'required' }],
+  });
+  const stepUp = await authorize({ agent: sessionAgent, organization: organization.alias, acrValues: flow.acr, expectFailure: true });
   assert.equal(stepUp.response.status, 401);
   assert.match(stepUp.response.text, /stronger authentication method/iu);
 });

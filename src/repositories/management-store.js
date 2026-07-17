@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { assertAuthenticationFlowConfiguration } from '../authentication/flow-policy.js';
 
 function clone(value) {
   return value === undefined ? undefined : structuredClone(value);
@@ -395,6 +396,7 @@ export class MemoryManagementStore {
 
   async listAuthenticationFlows(realm) { return [...this.flows.entries()].filter(([entry]) => entry.startsWith(`${realm}\u0000`)).map(([, flow]) => publicFlow(flow)).sort((a, b) => a.priority - b.priority || a.alias.localeCompare(b.alias)); }
   async createAuthenticationFlow(realm, input) {
+    assertAuthenticationFlowConfiguration(input.steps);
     if ((await this.listAuthenticationFlows(realm)).some((flow) => flow.alias.toLowerCase() === input.alias.toLowerCase())) throw Object.assign(new Error('Authentication flow already exists'), { code: 'AUTH_FLOW_EXISTS' });
     const timestamp = nowIso();
     const flow = { ...clone(input), id: input.id ?? randomUUID(), createdAt: timestamp, updatedAt: timestamp };
@@ -405,6 +407,7 @@ export class MemoryManagementStore {
     const current = this.flows.get(key(realm, id));
     if (!current) return undefined;
     const next = { ...current, ...clone(patch), id, updatedAt: nowIso() };
+    assertAuthenticationFlowConfiguration(next.steps);
     if ((await this.listAuthenticationFlows(realm)).some((flow) => (
       flow.id !== id && flow.alias.toLowerCase() === next.alias.toLowerCase()
     ))) throw Object.assign(new Error('Authentication flow already exists'), { code: 'AUTH_FLOW_EXISTS' });
@@ -611,8 +614,8 @@ export class PostgresManagementStore {
   }
   async effectiveClaimMappers(realm, clientId, grantedScopes = []) { return (await this.pool.query(`SELECT DISTINCT m.* FROM claim_mappers m LEFT JOIN client_scope_assignments a ON a.realm_name=m.realm_name AND m.owner_type='client-scope' AND m.owner_id=a.scope_id::text LEFT JOIN client_scopes s ON s.realm_name=a.realm_name AND s.id=a.scope_id WHERE m.realm_name=$1 AND ((m.owner_type='client' AND m.owner_id=$2) OR (a.client_id=$2 AND (a.assignment_type='default' OR s.name=ANY($3::text[])))) ORDER BY m.name`, [realm, clientId, [...grantedScopes]])).rows.map(publicMapper); }
   async listAuthenticationFlows(realm) { return (await this.pool.query('SELECT * FROM authentication_flows WHERE realm_name=$1 ORDER BY priority,alias', [realm])).rows.map(publicFlow); }
-  async createAuthenticationFlow(realm, input) { return publicFlow((await this.pool.query('INSERT INTO authentication_flows (realm_name,id,alias,description,enabled,priority,client_ids,acr,max_age_seconds,steps) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb) RETURNING *', [realm, input.id ?? randomUUID(), input.alias, input.description, input.enabled, input.priority, input.clientIds, input.acr, input.maxAgeSeconds, JSON.stringify(input.steps)])).rows[0]); }
-  async updateAuthenticationFlow(realm, id, patch) { return publicFlow((await this.pool.query(`UPDATE authentication_flows SET alias=COALESCE($3,alias),description=COALESCE($4,description),enabled=COALESCE($5,enabled),priority=COALESCE($6,priority),client_ids=COALESCE($7::text[],client_ids),acr=COALESCE($8,acr),max_age_seconds=CASE WHEN $9 THEN $10::integer ELSE max_age_seconds END,steps=COALESCE($11::jsonb,steps) WHERE realm_name=$1 AND id=$2 RETURNING *`, [realm, id, patch.alias ?? null, patch.description ?? null, patch.enabled ?? null, patch.priority ?? null, patch.clientIds ?? null, patch.acr ?? null, Object.hasOwn(patch, 'maxAgeSeconds'), patch.maxAgeSeconds ?? null, patch.steps ? JSON.stringify(patch.steps) : null])).rows[0]); }
+  async createAuthenticationFlow(realm, input) { assertAuthenticationFlowConfiguration(input.steps); return publicFlow((await this.pool.query('INSERT INTO authentication_flows (realm_name,id,alias,description,enabled,priority,client_ids,acr,max_age_seconds,steps) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb) RETURNING *', [realm, input.id ?? randomUUID(), input.alias, input.description, input.enabled, input.priority, input.clientIds, input.acr, input.maxAgeSeconds, JSON.stringify(input.steps)])).rows[0]); }
+  async updateAuthenticationFlow(realm, id, patch) { const current = (await this.pool.query('SELECT * FROM authentication_flows WHERE realm_name=$1 AND id=$2', [realm, id])).rows[0]; if (!current) return undefined; assertAuthenticationFlowConfiguration(patch.steps ?? current.steps); return publicFlow((await this.pool.query(`UPDATE authentication_flows SET alias=COALESCE($3,alias),description=COALESCE($4,description),enabled=COALESCE($5,enabled),priority=COALESCE($6,priority),client_ids=COALESCE($7::text[],client_ids),acr=COALESCE($8,acr),max_age_seconds=CASE WHEN $9 THEN $10::integer ELSE max_age_seconds END,steps=COALESCE($11::jsonb,steps) WHERE realm_name=$1 AND id=$2 RETURNING *`, [realm, id, patch.alias ?? null, patch.description ?? null, patch.enabled ?? null, patch.priority ?? null, patch.clientIds ?? null, patch.acr ?? null, Object.hasOwn(patch, 'maxAgeSeconds'), patch.maxAgeSeconds ?? null, patch.steps ? JSON.stringify(patch.steps) : null])).rows[0]); }
   async deleteAuthenticationFlow(realm, id) { return (await this.pool.query('DELETE FROM authentication_flows WHERE realm_name=$1 AND id=$2', [realm, id])).rowCount === 1; }
   async resolveAuthenticationFlow(realm, { clientId, requestedAcrs = [] } = {}) { const flows = (await this.listAuthenticationFlows(realm)).filter((flow) => flow.enabled && (!flow.clientIds.length || flow.clientIds.includes(clientId))); return clone(flows.find((flow) => requestedAcrs.includes(flow.acr)) ?? flows[0]); }
   async listOrganizations(realm) { const organizations = (await this.pool.query('SELECT * FROM organizations WHERE realm_name=$1 ORDER BY name', [realm])).rows; const domains = (await this.pool.query('SELECT * FROM organization_domains WHERE realm_name=$1 ORDER BY domain', [realm])).rows; return organizations.map((organization) => publicOrganization(organization, domains.filter((domain) => String(domain.organization_id) === String(organization.id)))); }

@@ -1,5 +1,6 @@
 import { Router, json } from 'express';
 import { z } from 'zod';
+import { authenticationFlowConfigurationError } from '../authentication/flow-policy.js';
 import { createRecoveryCodes, createTotp, totpStep } from '../crypto/mfa.js';
 import { hashPassword } from '../crypto/password.js';
 import { decryptSecret, encryptSecret, keyedDigest, randomToken, safeEqual } from '../crypto/secrets.js';
@@ -96,6 +97,10 @@ const flowStep = z.object({
   type: z.enum(['password', 'totp', 'passkey', 'federated']),
   requirement: z.enum(['required', 'alternative', 'conditional']),
 }).strict();
+const flowSteps = z.array(flowStep).min(1).max(16).superRefine((value, context) => {
+  const message = authenticationFlowConfigurationError(value);
+  if (message) context.addIssue({ code: z.ZodIssueCode.custom, message });
+});
 const authenticationFlowCreateSchema = z.object({
   alias: policyName,
   description: z.string().max(4096).optional().default(''),
@@ -104,7 +109,7 @@ const authenticationFlowCreateSchema = z.object({
   clientIds: z.array(identifier).max(200).optional().default([]),
   acr: z.string().trim().min(1).max(255),
   maxAgeSeconds: z.number().int().min(1).max(2_592_000).nullable().optional().default(null),
-  steps: z.array(flowStep).min(1).max(16),
+  steps: flowSteps,
 }).strict();
 const authenticationFlowUpdateSchema = authenticationFlowCreateSchema.partial().refine((value) => Object.keys(value).length > 0, 'at least one field is required');
 const domainSchema = z.object({
@@ -288,6 +293,54 @@ export function createAdminRouter({
   const passkeys = webauthn ?? createWebAuthn(config);
   const router = Router();
   const adminConsole = createAdminConsole({ config, store, rateLimits, jwksByRealm, fetch });
+
+  async function clientExists(realm, clientId) {
+    return Boolean(await providers.get(realm)?.Client.find(clientId));
+  }
+
+  async function synchronizeProviderMetadata(realm) {
+    await providers.get(realm)?.authmeManagementMetadata?.synchronize();
+  }
+
+  async function validateUserRelationships(realm, input) {
+    if (input.roles) {
+      const roles = new Set((await management.listRoles(realm)).map((item) => item.name));
+      const unknown = input.roles.find((name) => !roles.has(name));
+      if (unknown) return `Role ${unknown} is not defined in this realm.`;
+    }
+    if (input.groups) {
+      const groups = new Set((await management.listGroups(realm)).map((item) => item.path));
+      const unknown = input.groups.find((path) => !groups.has(path));
+      if (unknown) return `Group ${unknown} is not defined in this realm.`;
+    }
+    return undefined;
+  }
+
+  async function mutateRealmUsers(realm, mutation) {
+    for (let offset = 0; ; offset += 200) {
+      const users = await store.listUsers(realm, { limit: 200, offset });
+      for (const user of users) {
+        const patch = mutation(user);
+        if (!patch) continue;
+        await data.mutateAccountSecurity(realm, user.id, (transactionalStore) => (
+          transactionalStore.updateUser(realm, user.id, patch)
+        ));
+      }
+      if (users.length < 200) break;
+    }
+  }
+
+  async function rewriteUserGroupPaths(realm, mappings, revokePaths = new Set()) {
+    await mutateRealmUsers(realm, (user) => {
+      const groups = user.groups.flatMap((path) => {
+        if (!mappings.has(path)) return [path];
+        const replacement = mappings.get(path);
+        return replacement ? [replacement] : [];
+      });
+      const changed = groups.length !== user.groups.length || groups.some((path, index) => path !== user.groups[index]);
+      return changed || user.groups.some((path) => revokePaths.has(path)) ? { groups } : undefined;
+    });
+  }
   router.use(adminConsole.router);
   router.use((_req, res, next) => {
     res.set('Cache-Control', 'no-store');
@@ -555,7 +608,11 @@ export function createAdminRouter({
       if (!policyName.safeParse(req.params.roleName).success) return problem(res, 400, 'Invalid role name', 'The role name is invalid.');
       const input = parse(roleSchema, req, res);
       if (!input) return undefined;
+      const previous = (await management.listRoles(req.params.realm)).find((item) => item.name === req.params.roleName);
       const result = await management.putRole(req.params.realm, { name: req.params.roleName, ...input });
+      if (previous && JSON.stringify(previous.composites) !== JSON.stringify(result.composites)) {
+        await mutateRealmUsers(req.params.realm, (user) => ({ roles: user.roles }));
+      }
       await audit(store, req, 'admin.role.upserted', undefined, { role: req.params.roleName });
       return res.status(201).json(result);
     } catch (error) { return managementFailure(error, res, next); }
@@ -563,6 +620,9 @@ export function createAdminRouter({
   router.delete('/v1/realms/:realm/roles/:roleName', async (req, res, next) => {
     try {
       if (!await management.deleteRole(req.params.realm, req.params.roleName)) return problem(res, 404, 'Role not found', 'The requested role does not exist.');
+      await mutateRealmUsers(req.params.realm, (user) => (
+        user.roles.includes(req.params.roleName) ? { roles: user.roles.filter((name) => name !== req.params.roleName) } : { roles: user.roles }
+      ));
       await audit(store, req, 'admin.role.deleted', undefined, { role: req.params.roleName });
       return res.status(204).end();
     } catch (error) { return managementFailure(error, res, next); }
@@ -588,15 +648,33 @@ export function createAdminRouter({
       if (!managementId.safeParse(req.params.groupId).success) return problem(res, 400, 'Invalid group identifier', 'Group identifiers must be UUIDs.');
       const input = parse(groupUpdateSchema, req, res);
       if (!input) return undefined;
+      if (input.roles) {
+        const definedRoles = new Set((await management.listRoles(req.params.realm)).map((item) => item.name));
+        const unknown = input.roles.find((name) => !definedRoles.has(name));
+        if (unknown) return problem(res, 400, 'Unknown role', `Group role ${unknown} is not defined in this realm.`);
+      }
+      const before = await management.listGroups(req.params.realm);
       const result = await management.updateGroup(req.params.realm, req.params.groupId, input);
       if (!result) return problem(res, 404, 'Group not found', 'The requested group does not exist.');
+      const after = await management.listGroups(req.params.realm);
+      const afterById = new Map(after.map((item) => [item.id, item]));
+      const pathChanges = new Map(before.flatMap((item) => {
+        const nextGroup = afterById.get(item.id);
+        return nextGroup && nextGroup.path !== item.path ? [[item.path, nextGroup.path]] : [];
+      }));
+      if (pathChanges.size || input.roles) {
+        const changedRolePaths = input.roles ? new Set([before.find((item) => item.id === result.id)?.path].filter(Boolean)) : new Set();
+        await rewriteUserGroupPaths(req.params.realm, pathChanges, changedRolePaths);
+      }
       await audit(store, req, 'admin.group.updated', undefined, { groupId: result.id, fields: Object.keys(input) });
       return res.json(result);
     } catch (error) { return managementFailure(error, res, next); }
   });
   router.delete('/v1/realms/:realm/groups/:groupId', async (req, res, next) => {
     try {
+      const existing = (await management.listGroups(req.params.realm)).find((item) => item.id === req.params.groupId);
       if (!await management.deleteGroup(req.params.realm, req.params.groupId)) return problem(res, 404, 'Group not found', 'The requested group does not exist.');
+      if (existing) await rewriteUserGroupPaths(req.params.realm, new Map([[existing.path, null]]));
       await audit(store, req, 'admin.group.deleted', undefined, { groupId: req.params.groupId });
       return res.status(204).end();
     } catch (error) { return managementFailure(error, res, next); }
@@ -606,19 +684,19 @@ export function createAdminRouter({
     try { return res.json({ clientScopes: await management.listClientScopes(req.params.realm) }); } catch (error) { return next(error); }
   });
   router.post('/v1/realms/:realm/client-scopes', async (req, res, next) => {
-    try { const input = parse(clientScopeCreateSchema, req, res); if (!input) return undefined; const scope = await management.createClientScope(req.params.realm, input); await audit(store, req, 'admin.client_scope.created', undefined, { scopeId: scope.id }); return res.status(201).json(scope); } catch (error) { return managementFailure(error, res, next); }
+    try { const input = parse(clientScopeCreateSchema, req, res); if (!input) return undefined; const scope = await management.createClientScope(req.params.realm, input); await synchronizeProviderMetadata(req.params.realm); await audit(store, req, 'admin.client_scope.created', undefined, { scopeId: scope.id }); return res.status(201).json(scope); } catch (error) { return managementFailure(error, res, next); }
   });
   router.patch('/v1/realms/:realm/client-scopes/:scopeId', async (req, res, next) => {
-    try { const input = parse(clientScopeUpdateSchema, req, res); if (!input) return undefined; const scope = await management.updateClientScope(req.params.realm, req.params.scopeId, input); if (!scope) return problem(res, 404, 'Client scope not found', 'The requested client scope does not exist.'); await audit(store, req, 'admin.client_scope.updated', undefined, { scopeId: scope.id }); return res.json(scope); } catch (error) { return managementFailure(error, res, next); }
+    try { const input = parse(clientScopeUpdateSchema, req, res); if (!input) return undefined; const scope = await management.updateClientScope(req.params.realm, req.params.scopeId, input); if (!scope) return problem(res, 404, 'Client scope not found', 'The requested client scope does not exist.'); await synchronizeProviderMetadata(req.params.realm); await audit(store, req, 'admin.client_scope.updated', undefined, { scopeId: scope.id }); return res.json(scope); } catch (error) { return managementFailure(error, res, next); }
   });
   router.delete('/v1/realms/:realm/client-scopes/:scopeId', async (req, res, next) => {
-    try { if (!await management.deleteClientScope(req.params.realm, req.params.scopeId)) return problem(res, 404, 'Client scope not found', 'The requested client scope does not exist.'); await audit(store, req, 'admin.client_scope.deleted', undefined, { scopeId: req.params.scopeId }); return res.status(204).end(); } catch (error) { return next(error); }
+    try { if (!await management.deleteClientScope(req.params.realm, req.params.scopeId)) return problem(res, 404, 'Client scope not found', 'The requested client scope does not exist.'); await synchronizeProviderMetadata(req.params.realm); await audit(store, req, 'admin.client_scope.deleted', undefined, { scopeId: req.params.scopeId }); return res.status(204).end(); } catch (error) { return next(error); }
   });
   router.get('/v1/realms/:realm/clients/:clientId/client-scopes', async (req, res, next) => {
     try { return res.json({ assignments: await management.listClientScopeAssignments(req.params.realm, req.params.clientId) }); } catch (error) { return next(error); }
   });
   router.put('/v1/realms/:realm/clients/:clientId/client-scopes/:scopeId', async (req, res, next) => {
-    try { const input = parse(z.object({ assignmentType: z.enum(['default', 'optional']) }).strict(), req, res); if (!input) return undefined; if (!await management.setClientScopeAssignment(req.params.realm, req.params.clientId, req.params.scopeId, input.assignmentType)) return problem(res, 404, 'Client scope not found', 'The requested client scope does not exist.'); await audit(store, req, 'admin.client_scope.assigned', undefined, { clientId: req.params.clientId, scopeId: req.params.scopeId, assignmentType: input.assignmentType }); return res.status(204).end(); } catch (error) { return managementFailure(error, res, next); }
+    try { const input = parse(z.object({ assignmentType: z.enum(['default', 'optional']) }).strict(), req, res); if (!input) return undefined; if (!await clientExists(req.params.realm, req.params.clientId)) return problem(res, 404, 'Client not found', 'The requested client does not exist.'); if (!await management.setClientScopeAssignment(req.params.realm, req.params.clientId, req.params.scopeId, input.assignmentType)) return problem(res, 404, 'Client scope not found', 'The requested client scope does not exist.'); await audit(store, req, 'admin.client_scope.assigned', undefined, { clientId: req.params.clientId, scopeId: req.params.scopeId, assignmentType: input.assignmentType }); return res.status(204).end(); } catch (error) { return managementFailure(error, res, next); }
   });
   router.delete('/v1/realms/:realm/clients/:clientId/client-scopes/:scopeId', async (req, res, next) => {
     try { if (!await management.deleteClientScopeAssignment(req.params.realm, req.params.clientId, req.params.scopeId)) return problem(res, 404, 'Client-scope assignment not found', 'The requested assignment does not exist.'); await audit(store, req, 'admin.client_scope.unassigned', undefined, { clientId: req.params.clientId, scopeId: req.params.scopeId }); return res.status(204).end(); } catch (error) { return next(error); }
@@ -627,7 +705,7 @@ export function createAdminRouter({
     try { const ownerType = req.query.ownerType; const ownerId = req.query.ownerId; if ((ownerType || ownerId) && (!['client', 'client-scope'].includes(ownerType) || typeof ownerId !== 'string')) return problem(res, 400, 'Invalid mapper filter', 'ownerType and ownerId must be provided together.'); return res.json({ claimMappers: await management.listClaimMappers(req.params.realm, ownerType, ownerId) }); } catch (error) { return next(error); }
   });
   router.post('/v1/realms/:realm/claim-mappers', async (req, res, next) => {
-    try { const input = parse(claimMapperCreateSchema, req, res); if (!input) return undefined; const mapper = await management.createClaimMapper(req.params.realm, input); await audit(store, req, 'admin.claim_mapper.created', undefined, { mapperId: mapper.id, ownerType: mapper.ownerType, ownerId: mapper.ownerId }); return res.status(201).json(mapper); } catch (error) { return managementFailure(error, res, next); }
+    try { const input = parse(claimMapperCreateSchema, req, res); if (!input) return undefined; const ownerExists = input.ownerType === 'client' ? await clientExists(req.params.realm, input.ownerId) : (await management.listClientScopes(req.params.realm)).some((scope) => scope.id === input.ownerId); if (!ownerExists) return problem(res, 404, 'Mapper owner not found', 'The requested client or client scope does not exist.'); const mapper = await management.createClaimMapper(req.params.realm, input); await audit(store, req, 'admin.claim_mapper.created', undefined, { mapperId: mapper.id, ownerType: mapper.ownerType, ownerId: mapper.ownerId }); return res.status(201).json(mapper); } catch (error) { return managementFailure(error, res, next); }
   });
   router.patch('/v1/realms/:realm/claim-mappers/:mapperId', async (req, res, next) => {
     try { const input = parse(claimMapperUpdateSchema, req, res); if (!input) return undefined; const mapper = await management.updateClaimMapper(req.params.realm, req.params.mapperId, input); if (!mapper) return problem(res, 404, 'Claim mapper not found', 'The requested claim mapper does not exist.'); await audit(store, req, 'admin.claim_mapper.updated', undefined, { mapperId: mapper.id }); return res.json(mapper); } catch (error) { return managementFailure(error, res, next); }
@@ -640,13 +718,13 @@ export function createAdminRouter({
     try { return res.json({ authenticationFlows: await management.listAuthenticationFlows(req.params.realm) }); } catch (error) { return next(error); }
   });
   router.post('/v1/realms/:realm/authentication-flows', async (req, res, next) => {
-    try { const input = parse(authenticationFlowCreateSchema, req, res); if (!input) return undefined; const flow = await management.createAuthenticationFlow(req.params.realm, input); await audit(store, req, 'admin.authentication_flow.created', undefined, { flowId: flow.id, alias: flow.alias }); return res.status(201).json(flow); } catch (error) { return managementFailure(error, res, next); }
+    try { const input = parse(authenticationFlowCreateSchema, req, res); if (!input) return undefined; for (const clientId of input.clientIds) if (!await clientExists(req.params.realm, clientId)) return problem(res, 404, 'Flow client not found', `Client ${clientId} does not exist.`); const flow = await management.createAuthenticationFlow(req.params.realm, input); await synchronizeProviderMetadata(req.params.realm); await audit(store, req, 'admin.authentication_flow.created', undefined, { flowId: flow.id, alias: flow.alias }); return res.status(201).json(flow); } catch (error) { return managementFailure(error, res, next); }
   });
   router.patch('/v1/realms/:realm/authentication-flows/:flowId', async (req, res, next) => {
-    try { const input = parse(authenticationFlowUpdateSchema, req, res); if (!input) return undefined; const flow = await management.updateAuthenticationFlow(req.params.realm, req.params.flowId, input); if (!flow) return problem(res, 404, 'Authentication flow not found', 'The requested authentication flow does not exist.'); await audit(store, req, 'admin.authentication_flow.updated', undefined, { flowId: flow.id }); return res.json(flow); } catch (error) { return managementFailure(error, res, next); }
+    try { const input = parse(authenticationFlowUpdateSchema, req, res); if (!input) return undefined; for (const clientId of input.clientIds ?? []) if (!await clientExists(req.params.realm, clientId)) return problem(res, 404, 'Flow client not found', `Client ${clientId} does not exist.`); const flow = await management.updateAuthenticationFlow(req.params.realm, req.params.flowId, input); if (!flow) return problem(res, 404, 'Authentication flow not found', 'The requested authentication flow does not exist.'); await synchronizeProviderMetadata(req.params.realm); await audit(store, req, 'admin.authentication_flow.updated', undefined, { flowId: flow.id }); return res.json(flow); } catch (error) { return managementFailure(error, res, next); }
   });
   router.delete('/v1/realms/:realm/authentication-flows/:flowId', async (req, res, next) => {
-    try { if (!await management.deleteAuthenticationFlow(req.params.realm, req.params.flowId)) return problem(res, 404, 'Authentication flow not found', 'The requested authentication flow does not exist.'); await audit(store, req, 'admin.authentication_flow.deleted', undefined, { flowId: req.params.flowId }); return res.status(204).end(); } catch (error) { return next(error); }
+    try { if (!await management.deleteAuthenticationFlow(req.params.realm, req.params.flowId)) return problem(res, 404, 'Authentication flow not found', 'The requested authentication flow does not exist.'); await synchronizeProviderMetadata(req.params.realm); await audit(store, req, 'admin.authentication_flow.deleted', undefined, { flowId: req.params.flowId }); return res.status(204).end(); } catch (error) { return next(error); }
   });
 
   router.get('/v1/realms/:realm/organizations', async (req, res, next) => {
@@ -763,6 +841,8 @@ export function createAdminRouter({
     try {
       const input = parse(createUserSchema, req, res);
       if (!input) return;
+      const invalidRelationship = await validateUserRelationships(req.params.realm, input);
+      if (invalidRelationship) return problem(res, 400, 'Unknown user relationship', invalidRelationship);
       const user = await store.createUser({
         ...input,
         realm: req.params.realm,
@@ -954,6 +1034,8 @@ export function createAdminRouter({
     try {
       const input = parse(updateUserSchema, req, res);
       if (!input) return;
+      const invalidRelationship = await validateUserRelationships(req.params.realm, input);
+      if (invalidRelationship) return problem(res, 400, 'Unknown user relationship', invalidRelationship);
       const mutation = await data.mutateAccountSecurity(req.params.realm, req.params.id, async (transactionalStore) => {
         const updated = await transactionalStore.updateUser(req.params.realm, req.params.id, input);
         if (updated) await transactionalStore.writeAudit(

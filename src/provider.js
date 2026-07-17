@@ -1,12 +1,14 @@
 import { createHmac } from 'node:crypto';
 import { isIP } from 'node:net';
-import Provider, { errors, interactionPolicy } from 'oidc-provider';
+import Provider, { errors, ExternalSigningKey, interactionPolicy } from 'oidc-provider';
 import {
   grantType as cibaGrantType,
   handler as cibaGrantHandler,
   parameters as cibaGrantParameters,
 } from 'oidc-provider/lib/actions/grants/ciba.js';
 import { DEFAULTS as oidcClientMetadataDefaults } from 'oidc-provider/lib/consts/client_attributes.js';
+import oidcInstance from 'oidc-provider/lib/helpers/weak_cache.js';
+import { authenticationSatisfiesFlow } from './authentication/flow-policy.js';
 import { issuerFor } from './config.js';
 import { createMtlsFeatureConfiguration } from './security/mtls.js';
 import {
@@ -475,9 +477,12 @@ export async function createRealmProvider({ realm, config, store, data, manageme
   const enabledClientAuthMethods = config.mtls.enabled ? clientAuthMethods : baseClientAuthMethods;
   const configuredFlows = management ? await management.listAuthenticationFlows(realm) : [];
   const configuredClientScopes = management ? await management.listClientScopes(realm) : [];
+  const baseAcrValues = ['urn:authme:loa:1', 'urn:authme:loa:2'];
+  const baseScopes = [
+    'openid', 'offline_access', 'profile', 'email', 'phone', 'address', 'roles', 'groups', 'organization',
+  ];
   const supportedAcrValues = [...new Set([
-    'urn:authme:loa:1',
-    'urn:authme:loa:2',
+    ...baseAcrValues,
     ...configuredFlows.filter((flow) => flow.enabled).map((flow) => flow.acr),
   ])];
   const policy = interactionPolicy.base();
@@ -502,6 +507,10 @@ export async function createRealmProvider({ realm, config, store, data, manageme
         });
         if (!flow || !accountId) return interactionPolicy.Check.NO_NEED_TO_PROMPT;
         if (ctx.oidc.session.acr !== flow.acr) return interactionPolicy.Check.REQUEST_PROMPT;
+        const user = await store.findUserById(realm, accountId);
+        if (!user?.enabled || !authenticationSatisfiesFlow(flow, ctx.oidc.session.amr, user)) {
+          return interactionPolicy.Check.REQUEST_PROMPT;
+        }
         if (flow.maxAgeSeconds && ctx.oidc.session.past(flow.maxAgeSeconds)) {
           return interactionPolicy.Check.REQUEST_PROMPT;
         }
@@ -536,6 +545,9 @@ export async function createRealmProvider({ realm, config, store, data, manageme
     const contextualOrganizations = organizationContext
       ? organizations.filter((organization) => organization.id === organizationContext || organization.alias === organizationContext)
       : organizations;
+    if (organizationContext && contextualOrganizations.length === 0) {
+      throw new errors.AccessDenied('The account is no longer a member of the requested organization');
+    }
     const expandedRoles = expandCompositeRoles([...(user.roles ?? []), ...groupRoles], roles);
     const enriched = { ...user, roles: expandedRoles };
     return {
@@ -586,7 +598,7 @@ export async function createRealmProvider({ realm, config, store, data, manageme
     extraParams: ['organization'],
     acrValues: supportedAcrValues,
     scopes: [...new Set([
-      'openid', 'offline_access', 'profile', 'email', 'phone', 'address', 'roles', 'groups', 'organization',
+      ...baseScopes,
       ...configuredClientScopes.map((scope) => scope.name),
     ])],
     responseTypes: ['code'],
@@ -767,6 +779,10 @@ export async function createRealmProvider({ realm, config, store, data, manageme
         },
       },
       dPoP: { enabled: true },
+      externalSigningSupport: {
+        enabled: jwks.keys.some((key) => key instanceof ExternalSigningKey),
+        ack: jwks.keys.some((key) => key instanceof ExternalSigningKey) ? 'experimental-01' : undefined,
+      },
       fapi: {
         enabled: true,
         profile(_ctx, client) {
@@ -1050,6 +1066,25 @@ export async function createRealmProvider({ realm, config, store, data, manageme
       },
       async find(grantId) {
         return organizationContextAdapter.find(grantId);
+      },
+    }),
+  });
+  Object.defineProperty(provider, 'authmeManagementMetadata', {
+    value: Object.freeze({
+      async synchronize() {
+        const [flows, clientScopes] = await Promise.all([
+          management?.listAuthenticationFlows(realm) ?? [],
+          management?.listClientScopes(realm) ?? [],
+        ]);
+        const configuration = oidcInstance(provider).configuration;
+        configuration.acrValues = new Set([
+          ...baseAcrValues,
+          ...flows.filter((flow) => flow.enabled).map((flow) => flow.acr),
+        ]);
+        configuration.scopes = new Set([
+          ...baseScopes,
+          ...clientScopes.map((scope) => scope.name),
+        ]);
       },
     }),
   });
