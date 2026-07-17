@@ -11,6 +11,11 @@ RUN npm ci --omit=dev --no-audit --no-fund \
 
 FROM node:${NODE_VERSION} AS runtime
 
+# Package managers are build-time tooling. Removing them from the runtime image
+# reduces both image size and the vulnerability surface exposed in production.
+RUN rm -rf /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/corepack /opt/yarn-v1.22.22 \
+    && rm -f /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack /usr/local/bin/pnpm /usr/local/bin/pnpx /usr/local/bin/yarn /usr/local/bin/yarnpkg
+
 ENV NODE_ENV=production \
     AUTHME_PORT=3000 \
     HOME=/tmp \
