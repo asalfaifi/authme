@@ -1,9 +1,10 @@
-name: Signed release
+name: Signed release and certification candidate
 
 on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -11,9 +12,14 @@ permissions:
   attestations: write
   packages: write
 
+concurrency:
+  group: authme-release
+  cancel-in-progress: false
+
 jobs:
   release:
     runs-on: ubuntu-24.04
+    environment: release
     timeout-minutes: 20
     services:
       postgres:
@@ -66,21 +72,63 @@ jobs:
       - name: Validate immutable release coordinates
         shell: bash
         run: |
-          release_version="${GITHUB_REF_NAME#v}"
           package_version="$(node --input-type=commonjs -p "require('./package.json').version")"
           source_date_epoch="$(git show -s --format=%ct "$GITHUB_SHA")"
-          test "$GITHUB_REF_NAME" = "v$package_version"
-          test "$release_version" = "$package_version"
           [[ "$source_date_epoch" =~ ^[0-9]+$ ]]
           image_repository="ghcr.io/${GITHUB_REPOSITORY,,}"
+          if test "$GITHUB_EVENT_NAME" = push; then
+            release_version="${GITHUB_REF_NAME#v}"
+            test "$GITHUB_REF_NAME" = "v$package_version"
+            test "$release_version" = "$package_version"
+            release_channel=tag
+            image_tag="$release_version"
+          else
+            test "$GITHUB_EVENT_NAME" = workflow_dispatch
+            release_version="$package_version"
+            release_channel=candidate
+            image_tag="candidate-$GITHUB_SHA"
+          fi
           {
             echo "AUTHME_RELEASE_VERSION=$release_version"
+            echo "AUTHME_RELEASE_CHANNEL=$release_channel"
             echo "AUTHME_RELEASE_IMAGE_REPOSITORY=$image_repository"
-            echo "AUTHME_RELEASE_IMAGE=$image_repository:$release_version"
+            echo "AUTHME_RELEASE_IMAGE=$image_repository:$image_tag"
             echo "SOURCE_DATE_EPOCH=$source_date_epoch"
           } >> "$GITHUB_ENV"
       - name: Install exact dependency tree
         run: npm ci --no-audit --no-fund
+      - name: Verify version tag signature
+        if: github.event_name == 'push'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag_ref="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME")"
+          test "$(jq -r '.object.type' <<< "$tag_ref")" = tag
+          tag_object_sha="$(jq -r '.object.sha' <<< "$tag_ref")"
+          tag_object="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_object_sha")"
+          test "$(jq -r '.object.type' <<< "$tag_object")" = commit
+          test "$(jq -r '.object.sha' <<< "$tag_object")" = "$GITHUB_SHA"
+          test "$(jq -r '.verification.verified' <<< "$tag_object")" = true
+          test "$(jq -r '.verification.reason' <<< "$tag_object")" = valid
+      - name: Require external evidence for a stable release
+        shell: bash
+        env:
+          EXTERNAL_RELEASE_EVIDENCE_B64: ${{ secrets.AUTHME_EXTERNAL_RELEASE_EVIDENCE_B64 }}
+        run: |
+          if test "$AUTHME_RELEASE_CHANNEL" != tag || [[ "$AUTHME_RELEASE_VERSION" == *-* ]]; then
+            exit 0
+          fi
+          test -n "$EXTERNAL_RELEASE_EVIDENCE_B64"
+          external_evidence="$RUNNER_TEMP/authme-external-release-evidence.json"
+          printf '%s' "$EXTERNAL_RELEASE_EVIDENCE_B64" | base64 --decode > "$external_evidence"
+          chmod 600 "$external_evidence"
+          node scripts/verify-external-release-evidence.mjs \
+            --manifest "$external_evidence" \
+            --version "$AUTHME_RELEASE_VERSION" \
+            --source-commit "$GITHUB_SHA" \
+            --image-repository "$AUTHME_RELEASE_IMAGE_REPOSITORY"
+          echo "AUTHME_EXTERNAL_RELEASE_EVIDENCE=$external_evidence" >> "$GITHUB_ENV"
       - name: Generate ephemeral release-validation secrets
         shell: bash
         run: |
@@ -202,6 +250,17 @@ jobs:
           image_reference="$AUTHME_RELEASE_IMAGE_REPOSITORY@$digest"
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
           echo "AUTHME_RELEASE_IMAGE_REFERENCE=$image_reference" >> "$GITHUB_ENV"
+      - name: Bind stable evidence to the published image
+        run: |
+          if test "$AUTHME_RELEASE_CHANNEL" != tag || [[ "$AUTHME_RELEASE_VERSION" == *-* ]]; then
+            exit 0
+          fi
+          node scripts/verify-external-release-evidence.mjs \
+            --manifest "$AUTHME_EXTERNAL_RELEASE_EVIDENCE" \
+            --version "$AUTHME_RELEASE_VERSION" \
+            --source-commit "$GITHUB_SHA" \
+            --image-repository "$AUTHME_RELEASE_IMAGE_REPOSITORY" \
+            --image-reference "$AUTHME_RELEASE_IMAGE_REFERENCE"
       - name: Build signed archive, package/image SBOMs, and checksums
         run: npm run release:artifacts -- --require-image
       - name: Attest signed release files
@@ -234,6 +293,7 @@ jobs:
         if: always()
         run: docker logout ghcr.io
       - name: Publish immutable tag artifacts
+        if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes

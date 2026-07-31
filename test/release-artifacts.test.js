@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
 import { generateKeyPairSync, verify } from 'node:crypto';
-import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
 import { test } from 'node:test';
+import { fileURLToPath } from 'node:url';
+import { validExternalReleaseEvidence } from '../test-support/external-release-evidence.js';
 
 function run(command, args, options) {
   return new Promise((resolve, reject) => {
@@ -87,6 +89,65 @@ test('release artifacts normalize, checksum, and sign the runtime-image SBOM', {
       'authme-release-public-key.pem', 'authme-release-public-key.pem.sig',
       'authme-sbom.cdx.json', 'authme-sbom.cdx.json.sig',
     ]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('stable release artifacts validate, checksum, and sign the external evidence manifest', { timeout: 120_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'authme-stable-artifacts-'));
+  try {
+    const project = join(directory, 'project');
+    await mkdir(project);
+    const packageDocument = {
+      name: 'authme',
+      version: '1.0.0',
+      description: 'Stable artifact evidence test package',
+      license: 'MIT',
+    };
+    const lockDocument = {
+      name: 'authme',
+      version: '1.0.0',
+      lockfileVersion: 3,
+      requires: true,
+      packages: {
+        '': {
+          name: 'authme',
+          version: '1.0.0',
+          license: 'MIT',
+        },
+      },
+    };
+    await writeFile(join(project, 'package.json'), `${JSON.stringify(packageDocument, null, 2)}\n`);
+    await writeFile(join(project, 'package-lock.json'), `${JSON.stringify(lockDocument, null, 2)}\n`);
+    const evidenceInput = join(directory, 'external-evidence.json');
+    const evidenceDocument = validExternalReleaseEvidence();
+    await writeFile(evidenceInput, `${JSON.stringify(evidenceDocument)}\n`);
+
+    const { privateKey, publicKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
+    const signingKey = join(directory, 'release-key.pem');
+    await writeFile(signingKey, privateKey.export({ type: 'pkcs8', format: 'pem' }), { mode: 0o600 });
+    const output = join(directory, 'dist');
+    const releaseScript = fileURLToPath(new URL('../scripts/release-artifacts.mjs', import.meta.url));
+    await run(process.execPath, [releaseScript, '--output', output], {
+      cwd: project,
+      env: {
+        ...process.env,
+        AUTHME_EXTERNAL_RELEASE_EVIDENCE: evidenceInput,
+        AUTHME_RELEASE_SIGNING_KEY: signingKey,
+      },
+    });
+
+    assert.deepEqual(
+      JSON.parse(await readFile(join(output, 'authme-external-release-evidence.json'), 'utf8')),
+      evidenceDocument,
+    );
+    const checksums = await readFile(join(output, 'SHA256SUMS'), 'utf8');
+    assert.match(checksums, /^[a-f0-9]{64}  authme-external-release-evidence\.json$/mu);
+    const manifest = await readFile(join(output, 'authme-external-release-evidence.json'));
+    const signature = await readFile(join(output, 'authme-external-release-evidence.json.sig'));
+    assert.equal(verify('sha256', manifest, publicKey, signature), true);
+    assert.ok((await readdir(output)).includes('authme-1.0.0.tgz'));
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

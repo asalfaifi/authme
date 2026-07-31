@@ -66,6 +66,14 @@ uncompressed layer digests match. Dependabot monitors the npm, Docker, Helm, and
 GitHub Actions inputs; digest/version updates remain reviewed changes rather
 than release-time drift.
 
+Manual workflow dispatches publish immutable `candidate-<commit>` images for
+X1–X3 testing without creating a final release. A stable tag requires the
+machine-validated external manifest described in
+`docs/external-release-gates.md`, binds it to the exact source commit and
+candidate digest, includes it in the signed artifacts, and fails if the rebuilt
+stable image is not byte-identical to the candidate. Prerelease tags do not
+claim or require those independent records.
+
 Every release publishes `authme-release-public-key.pem`. Verify checksums and detached signatures, then authenticate that key's SHA-256 fingerprint through an independent release-owner channel; co-location is not a trust root. GitHub-hosted provenance is independently verifiable:
 
 ```sh
@@ -91,8 +99,8 @@ Until all three records are attached, the accurate product label is **v1.0 relea
 The repository was re-audited on 2026-07-31 after the v1 lifecycle corrections
 were integrated with the current trunk supply-chain and CI hardening:
 
-- Node.js 22.23.1 source validation checked 153 JavaScript files; the complete
-  suite ran against migrated PostgreSQL 17 and Redis with 353/353 tests passing
+- Node.js 22.23.1 source validation checked 158 JavaScript files; the complete
+  suite ran against migrated PostgreSQL 17 and Redis with 358/358 tests passing
   and zero skips, followed by the dedicated 44/44 PostgreSQL release suite;
 - the PostgreSQL protocol smoke passed, including OIDC/RFC 8414, PKCE, token
   audience/claims, refresh replay, device flow, MFA/recovery, SCIM, and audit;
@@ -116,7 +124,7 @@ were integrated with the current trunk supply-chain and CI hardening:
   High/Critical findings across the exact Debian image and every runtime Node
   package, zero High/Critical deployment misconfigurations under the single
   scoped TTL-name exception, and zero repository secrets. Gitleaks found no
-  history leak across 54 commits;
+  history leak across 55 commits;
 - Helm strict lint and deterministic Kubernetes/OpenShift-restricted renders
   passed. Kubeconform strictly validated all 8 default resources and all known
   optional/OpenShift resources; actionlint and ShellCheck also passed;
@@ -130,7 +138,11 @@ were integrated with the current trunk supply-chain and CI hardening:
   identical output. All published checksums and every detached signature
   verified. The tag workflow is action-pinned and linted to publish/attest those
   files and the exact GHCR image; actual registry/OIDC attestations require the
-  trusted tag event and are not represented as locally executed evidence.
+  trusted tag event and are not represented as locally executed evidence. A
+  every version tag requires a GitHub-verified signature, while a stable tag
+  additionally requires cryptographic assessor/operator evidence, exact
+  candidate source/image binding, and explicit release-owner production
+  approval;
 
 These are reproducible autonomous checks, not substitutes for X1 certification,
 X2 independent review, or X3 target-infrastructure/hardware drill records.

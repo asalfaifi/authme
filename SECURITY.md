@@ -38,6 +38,7 @@ The implemented and staged boundaries are documented in:
 - [Keycloak compatibility](docs/keycloak-compatibility.md)
 - [Federation and provisioning](docs/federation-and-provisioning.md)
 - [Roadmap and release gates](docs/roadmap.md)
+- [External evidence and stable-promotion procedure](docs/external-release-gates.md)
 
 Do not use AuthMe as a replacement where Kerberos/SPNEGO, RADIUS, X.509 end-user login, SAML artifact binding, broker-side assertion decryption, imported WebAuthn credentials, UMA/Authorization Services, Keycloak Admin REST/SPI/theme compatibility, or multi-site active/active writes are required. Treat the exact baseline documented for each implemented mechanism as the supported boundary.
 
@@ -58,6 +59,7 @@ A secure production deployment requires operators to:
 - patch Node.js, the base image, PostgreSQL, Redis, and npm dependencies promptly;
 - run unit, smoke, migration, container, dependency-audit, and protocol-conformance gates on the exact release artifact;
 - verify the release checksums, authenticated signing-key fingerprint, GitHub attestations, and deployed image digest before rollout;
+- protect candidate/release Actions behind an independently reviewed `release` environment and signed stable tags;
 - review log and proxy configuration so authorization headers, cookies, codes, tokens, passwords, MFA material, and client secrets are never recorded.
 
 `AUTHME_ADMIN_TOKEN` is a bootstrap-grade global administration credential. Store it in a secret manager, restrict access to the administration routes at the network layer, rotate it on suspected exposure, and do not treat it as delegated RBAC.

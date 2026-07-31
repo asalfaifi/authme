@@ -5,6 +5,7 @@ import { mkdir, open, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { spawn } from 'node:child_process';
+import { validateExternalReleaseEvidence } from './verify-external-release-evidence.mjs';
 
 async function capture(command, args) {
   return new Promise((resolvePromise, reject) => {
@@ -47,6 +48,7 @@ if (outputIndex !== -1 && !process.argv[outputIndex + 1]) {
 const output = resolve(outputIndex === -1 ? 'dist' : process.argv[outputIndex + 1]);
 const signingKey = process.env.AUTHME_RELEASE_SIGNING_KEY;
 if (!signingKey && !process.argv.includes('--unsigned')) throw new Error('AUTHME_RELEASE_SIGNING_KEY is required (use --unsigned only for non-release rehearsal)');
+const packageDocument = JSON.parse(await readFile('package.json', 'utf8'));
 await rm(output, { recursive: true, force: true });
 await mkdir(output, { mode: 0o755 });
 const packed = JSON.parse(await capture('npm', ['pack', '--json', '--pack-destination', output]));
@@ -85,6 +87,14 @@ if (imageReferenceInput) {
   const imageReferencePath = join(output, 'authme-image-reference.txt');
   await writeFile(imageReferencePath, `${imageReference}\n`, { flag: 'wx', mode: 0o644 });
   artifacts.push(imageReferencePath);
+}
+const externalEvidenceInput = process.env.AUTHME_EXTERNAL_RELEASE_EVIDENCE;
+if (externalEvidenceInput) {
+  const evidenceDocument = JSON.parse(await readFile(resolve(externalEvidenceInput), 'utf8'));
+  validateExternalReleaseEvidence(evidenceDocument, { expectedVersion: packageDocument.version });
+  const evidencePath = join(output, 'authme-external-release-evidence.json');
+  await writeFile(evidencePath, `${JSON.stringify(evidenceDocument, null, 2)}\n`, { flag: 'wx', mode: 0o644 });
+  artifacts.push(evidencePath);
 }
 if (signingKey) {
   const publicKeyPath = join(output, 'authme-release-public-key.pem');

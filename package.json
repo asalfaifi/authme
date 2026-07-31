@@ -33,6 +33,8 @@
     "ha:rehearse": "node scripts/ha-rehearsal.mjs",
     "perf:rehearse": "node scripts/load-rehearsal.mjs",
     "release:artifacts": "node scripts/release-artifacts.mjs",
+    "release:key:generate": "node scripts/generate-release-signing-key.mjs",
+    "release:verify-external-evidence": "node scripts/verify-external-release-evidence.mjs",
     "bootstrap:user": "node scripts/bootstrap-user.mjs",
     "smoke": "node scripts/smoke.mjs"
   },

@@ -33,6 +33,8 @@ AuthMe must:
 - LDAP bind credentials, OIDC client secrets, SAML private keys/certificates, SCIM bearer tokens, and external subject links.
 - Audit records and operational configuration.
 - PostgreSQL and optional Redis credentials.
+- Release-signing private key, external-gate evidence manifest, candidate image,
+  and signed release/attestation records.
 
 ## Trust boundaries
 
@@ -56,6 +58,18 @@ external IdP / LDAP / SCIM client boundaries connect to AuthMe over separately a
 ```
 
 The browser, OAuth client input, proxy headers, database contents, imported migration data, and administrator-supplied configuration are all treated as untrusted until validated for their use. A private network is not itself a trust control.
+
+The release owner, independent assessors/operators, GitHub Actions secret store,
+CI runner, GHCR registry, and public attestation/release records form a separate
+supply-chain trust boundary. A certification candidate is immutable and bound
+to one source commit and image digest. Stable promotion accepts the external
+manifest only through the trusted tag workflow, validates every gate and exact
+coordinate twice, signs the manifest with the release artifacts, and publishes
+GitHub provenance. Candidate/release jobs cross a protected `release`
+environment requiring independent approval and restricted deployment refs.
+Repository, environment-reviewer, or release-owner compromise remains capable
+of authorizing a malicious release and therefore requires organizational
+access, custody, and independent fingerprint controls.
 
 The administrator browser and root automation client cross different credential boundaries. The browser authenticates through AuthMe OIDC and receives only a realm-bound opaque console cookie. Root automation presents `AUTHME_ADMIN_TOKEN` directly to the API. Neither credential is accepted as a substitute for the other's login flow, and the root bearer must never be delivered to browser code.
 
@@ -119,6 +133,7 @@ The administrator browser and root automation client cross different credential 
 | Redis compromise | Redis holds only bounded, opaque throttling counters; never canonical tokens/sessions | A compromised limiter can affect availability; isolate credentials/network |
 | Denial of service | Body/URL/header limits, request timeouts, throttling, bounded DB pool, readiness and load shedding | Multi-region resilience is staged |
 | Supply-chain compromise | Exact dependency pin/lockfile; fail-closed dependency, image, configuration, and secret scans; minimal Node 22 image; signed archive/SBOM/digest artifacts; registry provenance and SBOM attestations | Independent dependency monitoring, release-key custody, and admission-time attestation enforcement |
+| Forged external evidence or candidate substitution | Manual candidates use immutable commit-derived tags; stable manifests require official OpenID URLs, independent-review closure, signed operator drill records, exact source commit/repository/image digest, and owner approval; stable rebuild digest must equal the tested candidate; manifest is release-signed and attested | GitHub/release-owner compromise or dishonest external evidence issuers remain organizational trust risks; consumers must authenticate report and signing-key fingerprints independently |
 | Administration-console login or session theft | OIDC Authorization Code with PKCE/state/nonce; production recent LoA2 requirement; opaque `HttpOnly`/`SameSite=Strict` cookie that is `Secure` in production; digest-only durable storage; idle/absolute expiry; account/grant version binding; server-side logout | An active administrator browser and same-origin XSS retain the granted authority; phishing-resistant passkeys are preferred over TOTP |
 | Administration cross-realm or permission confusion | Session is pinned to one realm; switching reauthorizes; every console API route fails closed on an explicit realm permission; unsafe calls require exact Origin, JSON, session-bound CSRF, and authentication no more than 15 minutes old; administrator-account mutations additionally require `administrators.manage` | Grant lifecycle has no approval workflow; wildcard bootstrap grants remain broad privilege |
 | Account-console session theft or CSRF | Reserved OIDC client with PKCE/state/nonce/recent authentication; realm-path-scoped opaque `HttpOnly`/`SameSite=Strict` cookie; digest-only storage; idle/absolute expiry and account-version binding; exact Origin, JSON, session-derived CSRF, and recent-authentication checks | A same-origin script compromise acts with the user session; password/TOTP authentication remains phishable |

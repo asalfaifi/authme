@@ -1,0 +1,111 @@
+{
+  "schema_version": 1,
+  "release": {
+    "version": "1.0.0",
+    "source_commit": "REPLACE_WITH_40_LOWERCASE_HEX_COMMIT",
+    "candidate_image": "ghcr.io/asalfaifi/authme@sha256:REPLACE_WITH_64_LOWERCASE_HEX_DIGEST",
+    "public_origin": "https://auth.example.com",
+    "created_at": "2026-07-31T00:00:00.000Z"
+  },
+  "x1": {
+    "status": "passed",
+    "authority": "OpenID Foundation",
+    "deployment_name_version": "AuthMe 1.0.0",
+    "certification_url": "https://openid.net/certification/REPLACE_WITH_PUBLIC_RECORD",
+    "certified_at": "2026-07-31T00:00:00.000Z",
+    "profiles": [
+      {
+        "name": "REPLACE_WITH_CERTIFIED_PROFILE_NAME",
+        "test_plan_url": "https://www.certification.openid.net/REPLACE_WITH_PLAN",
+        "results_url": "https://www.certification.openid.net/REPLACE_WITH_PUBLISHED_RESULTS",
+        "results_sha256": "REPLACE_WITH_64_LOWERCASE_HEX_DIGEST"
+      }
+    ]
+  },
+  "x2": {
+    "status": "passed",
+    "assessor": "REPLACE_WITH_INDEPENDENT_ASSESSOR",
+    "independent": true,
+    "completed_at": "2026-07-31T00:00:00.000Z",
+    "methodology": "REPLACE_WITH_REVIEW_AND_TEST_METHODOLOGY",
+    "report_url": "https://evidence.example.com/REPLACE_WITH_REPORT",
+    "report_sha256": "REPLACE_WITH_64_LOWERCASE_HEX_DIGEST",
+    "attestation": {
+      "signer": "REPLACE_WITH_ASSESSOR_SIGNER",
+      "signed_at": "2026-07-31T00:00:00.000Z",
+      "algorithm": "sha256",
+      "public_key_pem": "-----BEGIN PUBLIC KEY-----\nREPLACE_WITH_ASSESSOR_PUBLIC_KEY\n-----END PUBLIC KEY-----\n",
+      "public_key_sha256": "REPLACE_WITH_64_LOWERCASE_HEX_DIGEST",
+      "signature_base64": "REPLACE_WITH_CANONICAL_BASE64_SIGNATURE"
+    },
+    "critical_open": 0,
+    "high_open": 0
+  },
+  "x3": {
+    "status": "passed",
+    "operator": "REPLACE_WITH_ACCOUNTABLE_OPERATOR",
+    "environment": "REPLACE_WITH_PRODUCTION_EQUIVALENT_ENVIRONMENT",
+    "completed_at": "2026-07-31T00:00:00.000Z",
+    "report_url": "https://evidence.example.com/REPLACE_WITH_OPERATIONS_REPORT",
+    "report_sha256": "REPLACE_WITH_64_LOWERCASE_HEX_DIGEST",
+    "attestation": {
+      "signer": "REPLACE_WITH_ATTESTING_OPERATOR",
+      "signed_at": "2026-07-31T00:00:00.000Z",
+      "algorithm": "sha256",
+      "public_key_pem": "-----BEGIN PUBLIC KEY-----\nREPLACE_WITH_OPERATOR_PUBLIC_KEY\n-----END PUBLIC KEY-----\n",
+      "public_key_sha256": "REPLACE_WITH_64_LOWERCASE_HEX_DIGEST",
+      "signature_base64": "REPLACE_WITH_CANONICAL_BASE64_SIGNATURE"
+    },
+    "kms_hsm": {
+      "provider": "REPLACE_WITH_KMS_OR_HSM",
+      "key_reference_fingerprint": "REPLACE_WITH_NON_SECRET_REFERENCE_FINGERPRINT",
+      "rotation_under_traffic": true,
+      "dependency_outage_recovery": true
+    },
+    "recovery": {
+      "rto_target_seconds": 1800,
+      "rto_observed_seconds": 900,
+      "rpo_target_seconds": 300,
+      "rpo_observed_seconds": 60
+    },
+    "drills": [
+      {
+        "name": "database-restore",
+        "status": "passed",
+        "completed_at": "2026-07-31T00:00:00.000Z",
+        "observed_protocol_errors": 0,
+        "evidence_url": "https://evidence.example.com/REPLACE_WITH_RESTORE_EVIDENCE",
+        "evidence_sha256": "REPLACE_WITH_64_LOWERCASE_HEX_DIGEST"
+      },
+      {
+        "name": "dependency-outage",
+        "status": "passed",
+        "completed_at": "2026-07-31T00:00:00.000Z",
+        "observed_protocol_errors": 0,
+        "evidence_url": "https://evidence.example.com/REPLACE_WITH_OUTAGE_EVIDENCE",
+        "evidence_sha256": "REPLACE_WITH_64_LOWERCASE_HEX_DIGEST"
+      },
+      {
+        "name": "regional-failover",
+        "status": "passed",
+        "completed_at": "2026-07-31T00:00:00.000Z",
+        "observed_protocol_errors": 0,
+        "evidence_url": "https://evidence.example.com/REPLACE_WITH_FAILOVER_EVIDENCE",
+        "evidence_sha256": "REPLACE_WITH_64_LOWERCASE_HEX_DIGEST"
+      },
+      {
+        "name": "rolling-upgrade",
+        "status": "passed",
+        "completed_at": "2026-07-31T00:00:00.000Z",
+        "observed_protocol_errors": 0,
+        "evidence_url": "https://evidence.example.com/REPLACE_WITH_UPGRADE_EVIDENCE",
+        "evidence_sha256": "REPLACE_WITH_64_LOWERCASE_HEX_DIGEST"
+      }
+    ]
+  },
+  "release_approval": {
+    "owner": "REPLACE_WITH_RELEASE_OWNER",
+    "approved_at": "2026-07-31T00:00:00.000Z",
+    "statement": "approved-for-production"
+  }
+}

@@ -421,6 +421,11 @@ Preserve relevant audit data, rotate affected secrets, revoke sessions/grants wh
 
 The release owner must record evidence for all of the following:
 
+Stable-tag promotion is mechanically guarded by the candidate and external
+evidence process in [`external-release-gates.md`](external-release-gates.md).
+The final tag must point to the exact tested candidate commit and reproduce its
+immutable image digest.
+
 - clean reproducible build from the lockfile;
 - supported patched Node.js 22 and reviewed dependency audit;
 - database migration and clean-install tests;

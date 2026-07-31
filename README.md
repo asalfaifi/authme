@@ -174,6 +174,12 @@ be checked offline. Authenticate that key's SHA-256 fingerprint through the
 release owner's independent trust channel before relying on it; a key bundled
 beside its own signature is not an independent trust root.
 
+Final stable promotion uses a separately tested immutable candidate and a
+machine-checked X1–X3 evidence manifest. Release owners and assessors should
+follow [the external release-gate procedure](docs/external-release-gates.md);
+stable tags fail closed when the evidence, exact source commit, or candidate
+image digest is absent or mismatched.
+
 ## Essential configuration
 
 | Variable | Purpose |
