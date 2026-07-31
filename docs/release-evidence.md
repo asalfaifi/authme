@@ -124,7 +124,7 @@ were integrated with the current trunk supply-chain and CI hardening:
   High/Critical findings across the exact Debian image and every runtime Node
   package, zero High/Critical deployment misconfigurations under the single
   scoped TTL-name exception, and zero repository secrets. Gitleaks found no
-  history leak across 55 commits;
+  leak in the entire reachable Git history;
 - Helm strict lint and deterministic Kubernetes/OpenShift-restricted renders
   passed. Kubeconform strictly validated all 8 default resources and all known
   optional/OpenShift resources; actionlint and ShellCheck also passed;
