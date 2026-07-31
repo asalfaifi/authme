@@ -69,6 +69,11 @@ assert_contains '^kind: Deployment$' "${default_render}" "default render is miss
 assert_contains '^kind: Job$' "${default_render}" "default render is missing the migration Job"
 assert_contains '^kind: PodDisruptionBudget$' "${default_render}" "default render is missing the PDB"
 assert_contains '^kind: NetworkPolicy$' "${default_render}" "default render is missing the NetworkPolicy"
+assert_contains '^[[:space:]]+command: \["node"\]$' "${default_render}" "migration Job must use the runtime node binary"
+assert_contains '^[[:space:]]+args: \["scripts/migrate\.mjs"\]$' "${default_render}" "migration Job must invoke the packaged migration entrypoint"
+if grep -Eq -- '^[[:space:]]+(command|args):.*npm' "${default_render}"; then
+  fail "runtime workload depends on npm even though the production image removes package-manager tooling"
+fi
 
 for kind in HorizontalPodAutoscaler Ingress Route ServiceMonitor; do
   assert_contains "^kind: ${kind}$" "${all_render}" "all-values render is missing ${kind}"

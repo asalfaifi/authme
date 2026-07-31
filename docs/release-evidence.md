@@ -50,29 +50,35 @@ Until all three records are attached, the accurate product label is **v1.0 relea
 
 ## Latest autonomous verification
 
-The repository was re-audited on 2026-07-17 after the client-role, migration,
-flow/federation/CIBA, account-delivery, policy-lifecycle, organization,
-federated-link, backup-manifest, dynamic-registration deletion, and admin
-client-scope lifecycle corrections:
+The repository was re-audited on 2026-07-31 after the v1 lifecycle corrections
+were integrated with the current trunk supply-chain and CI hardening:
 
-- clean Node.js 22 container: source check passed for 150 JavaScript files;
-  ordinary suite 335 tests, 313 passed, 22 PostgreSQL-only skips, 0 failures;
-- clean Node.js 22 container against migrated PostgreSQL 17: 44/44 release
-  tests passed with 0 skips, including concurrent role/group graphs, managed
-  and registration-managed client policy cleanup, invitation rollback,
-  account-membership cascades, and migration `010_client_roles.sql`;
-- PostgreSQL protocol smoke passed, including OIDC/RFC 8414, PKCE, token
+- Node.js 22.23.1 source validation checked 151 JavaScript files; the complete
+  suite ran against migrated PostgreSQL 17 and Redis with 350/350 tests passing
+  and zero skips, followed by the dedicated 44/44 PostgreSQL release suite;
+- the PostgreSQL protocol smoke passed, including OIDC/RFC 8414, PKCE, token
   audience/claims, refresh replay, device flow, MFA/recovery, SCIM, and audit;
-- real `pg_dump` v2 backup and destructive restore into an isolated database
-  passed; all 10 migration records, the `client_roles` table, and recovered
-  signing keys were checked;
-- production dependency audit reported zero vulnerabilities, Helm strict lint
-  and deterministic OpenShift-restricted renders passed, and the Node.js 22
-  runtime image started with exact issuer discovery;
-- signed archive, CycloneDX SBOM, and checksum signatures verified; a second
-  artifact run was byte-for-byte identical;
-- realm HA baseline probe and a 40-request/8-worker discovery rehearsal passed
-  with zero failures and 172.05 ms p95 on the rebuilt local audit image.
+- the production dependency audit reported zero vulnerabilities, Helm strict
+  lint and deterministic OpenShift-restricted renders passed, and the hardened
+  Node.js 22 runtime image built successfully as the unprivileged `node` user;
+- the runtime image was verified to contain neither npm nor alternate package
+  managers, while its direct `node scripts/migrate.mjs` entrypoint applied and
+  verified all ten migrations against a fresh PostgreSQL database; the image
+  then reached readiness behind the trusted-proxy boundary, served the exact
+  configured issuer metadata, and rejected a mismatched request origin with
+  HTTP 421;
+- the repository-specific universal-CI integration hook ran its 44-test
+  PostgreSQL suite and protocol smoke successfully with pinned disposable
+  PostgreSQL/Redis images; its executable mode is enforced in this revision;
+- an ephemeral release-key rehearsal produced the archive, CycloneDX SBOM,
+  checksums, and signatures twice with byte-for-byte identical output, and all
+  three signatures plus both published checksums verified.
+
+The prior 2026-07-17 operational rehearsal additionally exercised a real
+`pg_dump` v2 backup and destructive restore into an isolated database, checking
+all ten migration records, the `client_roles` table, and recovered signing keys.
+It also ran the realm HA baseline and a 40-request/8-worker discovery rehearsal
+with zero failures and 172.05 ms p95 on the rebuilt local audit image.
 
 These are reproducible autonomous checks, not substitutes for X1 certification,
 X2 independent review, or X3 target-infrastructure/hardware drill records.

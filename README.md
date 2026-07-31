@@ -123,17 +123,17 @@ set -a; . ./.env; set +a
 npm ci
 make keys
 docker compose --env-file .env up -d postgres
-docker compose --env-file .env run --rm authme npm run db:migrate
+docker compose --env-file .env run --rm authme node scripts/migrate.mjs
 read -rsp 'Initial AuthMe password: ' AUTHME_BOOTSTRAP_PASSWORD; echo
 export AUTHME_BOOTSTRAP_PASSWORD
-docker compose --env-file .env run --rm -e AUTHME_BOOTSTRAP_PASSWORD authme npm run bootstrap:user
+docker compose --env-file .env run --rm -e AUTHME_BOOTSTRAP_PASSWORD authme node scripts/bootstrap-user.mjs
 unset AUTHME_BOOTSTRAP_PASSWORD
 docker compose --env-file .env up --build -d authme
 ```
 
 Passing a bootstrap password through an environment variable may still expose it to privileged host operators. Prefer your orchestrator's secret injection, rotate the password after first login, and remove the bootstrap value immediately.
 
-The image runs as an unprivileged user with dropped capabilities and a read-only filesystem. PostgreSQL is mandatory outside development mode. Redis is optional and carries shared rate-limit state only:
+The image runs as an unprivileged user with dropped capabilities and a read-only filesystem. Package-manager tooling is intentionally absent from the runtime image; invoke packaged operational scripts with `node scripts/<command>.mjs` as shown above. PostgreSQL is mandatory outside development mode. Redis is optional and carries shared rate-limit state only:
 
 ```bash
 docker compose --env-file .env --profile cache up --build -d

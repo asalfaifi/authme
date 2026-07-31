@@ -22,7 +22,7 @@ migrate: ## Apply pending database migrations.
 	npm run db:migrate
 
 migrate-container: ## Apply migrations using the production container configuration.
-	docker compose --env-file .env run --rm authme npm run db:migrate
+	docker compose --env-file .env run --rm authme node scripts/migrate.mjs
 
 keys: ## Generate a local development signing-key set under .local/jwks.
 	mkdir -p .local/jwks

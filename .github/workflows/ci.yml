@@ -1,119 +1,215 @@
-name: CI
+name: Universal CI
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
   pull_request:
+    branches: [main]
+  merge_group:
+  schedule:
+    - cron: "10 2 * * 6"
   workflow_dispatch:
+    inputs:
+      full_scan:
+        description: Run repository-wide deep checks
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: universal-ci-${{ github.repository }}-${{ github.ref }}-${{ (github.event_name == 'schedule' || github.event.inputs.full_scan == 'true') && 'deep' || 'standard' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
+
+env:
+  CI: "true"
+  FORCE_COLOR: "1"
+  UNIVERSAL_CI_FULL_SCAN: ${{ github.event_name == 'schedule' || github.event.inputs.full_scan == 'true' }}
+  UNIVERSAL_CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before || '' }}
 
 jobs:
-  test:
-    name: Check and test
-    runs-on: ubuntu-24.04
+  policy:
+    name: Policy and repository integrity
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, universal-ci]
     timeout-minutes: 15
-    services:
-      postgres:
-        image: postgres:17-alpine
-        env:
-          POSTGRES_DB: authme_test
-          POSTGRES_USER: authme
-          POSTGRES_PASSWORD: authme-ci-only
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U authme -d authme_test"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
-      redis:
-        image: redis:7.4-alpine
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 10
-    env:
-      NODE_ENV: test
-      AUTHME_PUBLIC_URL: https://authme.test
-      AUTHME_PORT: "3000"
-      AUTHME_REALMS: master
-      DATABASE_URL: postgresql://authme:authme-ci-only@127.0.0.1:5432/authme_test
-      REDIS_URL: redis://127.0.0.1:6379/0
-      AUTHME_DEV_MODE: "false"
-      AUTHME_TRUST_PROXY: "false"
-      AUTHME_LOG_LEVEL: error
     steps:
-      - name: Check out source
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6
-
-      - name: Set up Node.js
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6
+      - name: Check out application
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
-          node-version: 22
-          cache: npm
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate repository policy
+        uses: asalfaifi/devnoops/.github/actions/universal-phase@65c69d1043b6254e31de00f64ae45d6e0ce88d33
+        with:
+          phase: policy
+      - name: Upload policy evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: policy-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .ci-artifacts/policy
+          if-no-files-found: warn
+          retention-days: 14
 
-      - name: Install dependencies
-        run: npm ci --no-audit --no-fund
-
-      - name: Generate ephemeral test secrets
-        shell: bash
-        run: |
-          AUTHME_JWKS_DIR="$RUNNER_TEMP/authme-jwks"
-          mkdir -p "$AUTHME_JWKS_DIR"
-          {
-            echo "AUTHME_JWKS_DIR=$AUTHME_JWKS_DIR"
-            echo "AUTHME_COOKIE_KEYS=$(openssl rand -hex 32),$(openssl rand -hex 32)"
-            echo "AUTHME_CSRF_SECRET=$(openssl rand -hex 32)"
-            echo "AUTHME_PASSWORD_PEPPER=$(openssl rand -hex 32)"
-            echo "AUTHME_SUBJECT_SALT=$(openssl rand -hex 32)"
-            echo "AUTHME_FIELD_ENCRYPTION_KEY=$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n')"
-            echo "AUTHME_ADMIN_TOKEN=$(openssl rand -hex 32)"
-          } >> "$GITHUB_ENV"
-
-      - name: Generate signing keys
-        run: npm run keys:generate
-
-      - name: Apply database migrations
-        run: npm run db:migrate
-
-      - name: Check
-        run: npm run check
-
-      - name: Test
-        run: npm test
-
-      - name: PostgreSQL release tests
-        run: npm run test:postgres
-
-      - name: PostgreSQL protocol smoke test
-        env:
-          AUTHME_SMOKE_DATABASE_URL: ${{ env.DATABASE_URL }}
-        run: npm run smoke
-
-      - name: Audit production dependencies
-        run: npm audit --omit=dev --audit-level=high
-
-  container:
-    name: Build production container
-    needs: test
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
+  shift-left:
+    name: Shift-left change security
+    needs: policy
+    runs-on: [self-hosted, universal-ci]
+    timeout-minutes: 30
     steps:
-      - name: Check out source
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6
+      - name: Check out application
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Gate changed code and infrastructure early
+        uses: asalfaifi/devnoops/.github/actions/universal-phase@65c69d1043b6254e31de00f64ae45d6e0ce88d33
+        with:
+          phase: shift-left
+      - name: Upload shift-left evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: shift-left-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .ci-artifacts/shift-left
+          if-no-files-found: warn
+          retention-days: 30
 
-      - name: Helm chart release gate
-        run: ./scripts/check-helm.sh
+  lint:
+    name: Developer experience and lint
+    needs: shift-left
+    runs-on: [self-hosted, universal-ci]
+    timeout-minutes: 30
+    steps:
+      - name: Check out application
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Run adaptive linters
+        uses: asalfaifi/devnoops/.github/actions/universal-phase@65c69d1043b6254e31de00f64ae45d6e0ce88d33
+        with:
+          phase: lint
+      - name: Upload lint evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: lint-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .ci-artifacts/lint
+          if-no-files-found: ignore
+          retention-days: 14
 
-      - name: Build runtime image
-        run: docker build --pull --target runtime --tag authme:ci .
+  test:
+    name: Unit and integration tests
+    needs: shift-left
+    runs-on: [self-hosted, universal-ci]
+    timeout-minutes: 180
+    steps:
+      - name: Check out application
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          lfs: true
+          persist-credentials: false
+      - name: Run adaptive test suites
+        uses: asalfaifi/devnoops/.github/actions/universal-phase@65c69d1043b6254e31de00f64ae45d6e0ce88d33
+        with:
+          phase: test
+      - name: Upload test evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .ci-artifacts/test
+          if-no-files-found: ignore
+          retention-days: 14
+
+  security:
+    name: Security, dependencies, and SBOM
+    needs: shift-left
+    runs-on: [self-hosted, universal-ci]
+    timeout-minutes: 180
+    steps:
+      - name: Check out application
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Run security gates and generate SBOM
+        uses: asalfaifi/devnoops/.github/actions/universal-phase@65c69d1043b6254e31de00f64ae45d6e0ce88d33
+        with:
+          phase: security
+      - name: Upload security evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: security-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .ci-artifacts/security
+          if-no-files-found: warn
+          retention-days: 30
+
+  build:
+    name: Reproducible application and container build
+    needs: [lint, test, security]
+    runs-on: [self-hosted, universal-ci]
+    timeout-minutes: 240
+    steps:
+      - name: Check out application
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          lfs: true
+          persist-credentials: false
+      - name: Build detected applications and images
+        uses: asalfaifi/devnoops/.github/actions/universal-phase@65c69d1043b6254e31de00f64ae45d6e0ce88d33
+        with:
+          phase: build
+      - name: Upload build evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: build-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .ci-artifacts/build
+          if-no-files-found: ignore
+          retention-days: 14
+
+  readiness:
+    name: Production readiness and smoke checks
+    needs: build
+    runs-on: [self-hosted, universal-ci]
+    timeout-minutes: 240
+    steps:
+      - name: Check out application
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          lfs: true
+          persist-credentials: false
+      - name: Verify deployment assets and runtime images
+        uses: asalfaifi/devnoops/.github/actions/universal-phase@65c69d1043b6254e31de00f64ae45d6e0ce88d33
+        with:
+          phase: readiness
+      - name: Upload readiness evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: readiness-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .ci-artifacts/readiness
+          if-no-files-found: ignore
+          retention-days: 14
+
+  gate:
+    name: Required CI gate
+    if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    needs: [policy, shift-left, lint, test, security, build, readiness]
+    runs-on: [self-hosted, universal-ci]
+    timeout-minutes: 5
+    steps:
+      - name: Require every pipeline stage
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          printf '%s\n' "$NEEDS_JSON" | jq -e 'all(.[]; .result == "success")'

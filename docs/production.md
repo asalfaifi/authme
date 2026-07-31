@@ -147,7 +147,7 @@ PostgreSQL is in the authentication correctness path. Use a dedicated database a
 Operational rules:
 
 - Run migrations as an explicit release step, once, under an advisory lock where supported.
-- The migrator preflights applied names and checksums before applying pending files, then AuthMe verifies the exact release manifest again before production startup. A missing `schema_migrations` table, pending or modified migration, or migration unknown to the running image fails startup before realm state is touched. Run `npm run db:migrate` with the target image first; do not hand-edit migration history.
+- The migrator preflights applied names and checksums before applying pending files, then AuthMe verifies the exact release manifest again before production startup. A missing `schema_migrations` table, pending or modified migration, or migration unknown to the running image fails startup before realm state is touched. Run `node scripts/migrate.mjs` with the target image first; do not hand-edit migration history. Source checkouts may use the equivalent `npm run db:migrate` convenience script.
 - Migration `006_ciba.sql` adds durable CIBA polling deadline columns to `oidc_records`; apply it before enabling a release that accepts CIBA requests on any replica.
 - Migration `007_ldap_sync.sql` adds per-run reconciliation markers to immutable external-identity links; apply it before running `ldap:sync`.
 - Migration `009_v1_management.sql` adds realm/client authorization policy, organizations, authentication flows, claim mappers, signing-key inventory, and unbounded CIBA poll backoff; apply it before starting this release candidate.

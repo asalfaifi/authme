@@ -51,8 +51,8 @@ spec:
         - name: migrate
           image: {{ include "authme.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          command: ["npm"]
-          args: ["run", "db:migrate"]
+          command: ["node"]
+          args: ["scripts/migrate.mjs"]
           securityContext:
             {{- toYaml .Values.containerSecurityContext | nindent 12 }}
           env:

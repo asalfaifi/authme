@@ -86,7 +86,22 @@ jobs:
       - name: Validate Helm release and build runtime image
         run: |
           ./scripts/check-helm.sh
-          docker build --pull --target runtime --tag authme:${GITHUB_REF_NAME} .
+          docker build --pull --target runtime --tag "authme:${GITHUB_REF_NAME}" .
+      - name: Validate hardened runtime migration entrypoint
+        run: |
+          docker run --rm --entrypoint sh "authme:${GITHUB_REF_NAME}" -c '
+            test "$(id -u)" = 1000
+            command -v node >/dev/null
+            for tool in npm npx corepack pnpm pnpx yarn yarnpkg; do
+              ! command -v "$tool" >/dev/null
+            done
+            test -f scripts/migrate.mjs
+            test -f scripts/bootstrap-user.mjs
+          '
+          docker run --rm --network host \
+            --env DATABASE_URL \
+            --entrypoint node \
+            "authme:${GITHUB_REF_NAME}" scripts/migrate.mjs
       - name: Load release signing key
         env:
           RELEASE_KEY: ${{ secrets.AUTHME_RELEASE_SIGNING_KEY_B64 }}
