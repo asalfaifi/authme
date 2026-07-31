@@ -34,7 +34,8 @@ The v1.0 boundary still excludes Kerberos/SPNEGO, RADIUS, X.509 end-user login, 
 
 ## Run locally
 
-Requirements: Node.js 22.12 or newer.
+Requirements: Node.js 22.12 or newer. Release and container builds pin Node.js
+22.23.1 with npm 10.9.8; use `.nvmrc` when reproducing release evidence.
 
 ```bash
 npm ci

@@ -34,7 +34,17 @@ npm run test:postgres
 AUTHME_SMOKE_DATABASE_URL="$DATABASE_URL" npm run smoke
 npm audit --omit=dev --audit-level=high
 ./scripts/check-helm.sh
-docker build --pull --target runtime --tag authme:release-candidate .
+docker buildx create --name authme-release-rehearsal --driver docker-container \
+  --driver-opt image=moby/buildkit:v0.29.0@sha256:0039c1d47e8748b5afea56f4e85f14febaf34452bd99d9552d2daa82262b5cc5
+docker buildx inspect --bootstrap authme-release-rehearsal
+export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+docker buildx build --builder authme-release-rehearsal \
+  --pull --no-cache --target runtime --platform linux/amd64 \
+  --build-arg "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH" \
+  --tag authme:release-candidate \
+  --output type=docker,dest=/tmp/authme.tar,rewrite-timestamp=true .
+docker load --input /tmp/authme.tar
+docker buildx rm authme-release-rehearsal
 trivy image --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 authme:release-candidate
 trivy config --severity HIGH,CRITICAL --exit-code 1 --ignorefile .trivyignore.yaml .
 trivy fs --scanners secret --exit-code 1 .
@@ -45,6 +55,16 @@ npm run release:artifacts -- --require-image
 ```
 
 `DATABASE_URL` must identify a migrated disposable PostgreSQL 17 database. `test:postgres` intentionally fails instead of skipping when that boundary is absent. Release artifact generation requires `AUTHME_RELEASE_SIGNING_KEY` to name an OpenSSL PEM private key compatible with `openssl dgst -sha256` signing (for example RSA or ECDSA); Ed25519 does not accept an explicit digest in this format. `--unsigned` is rehearsal-only. The tag workflow derives the image digest only after pushing the exact gated image, refuses to overwrite an existing version tag, and fails if the image SBOM or digest reference is absent. GitHub OIDC and registry attestation steps can run only in that trusted tag workflow.
+
+The Dockerfile pins both its frontend and the complete Node 22.23.1
+multi-platform manifest digest, and release PostgreSQL/Redis services use the
+same pinned digests as local CI. The tag workflow pins Buildx and BuildKit, sets
+`SOURCE_DATE_EPOCH` to the tagged commit time, targets `linux/amd64`, uses
+BuildKit's timestamp-rewriting Docker exporter for two independent no-cache
+runtime builds, and refuses publication unless both their image IDs and
+uncompressed layer digests match. Dependabot monitors the npm, Docker, Helm, and
+GitHub Actions inputs; digest/version updates remain reviewed changes rather
+than release-time drift.
 
 Every release publishes `authme-release-public-key.pem`. Verify checksums and detached signatures, then authenticate that key's SHA-256 fingerprint through an independent release-owner channel; co-location is not a trust root. GitHub-hosted provenance is independently verifiable:
 
@@ -71,8 +91,8 @@ Until all three records are attached, the accurate product label is **v1.0 relea
 The repository was re-audited on 2026-07-31 after the v1 lifecycle corrections
 were integrated with the current trunk supply-chain and CI hardening:
 
-- Node.js 22.23.1 source validation checked 152 JavaScript files; the complete
-  suite ran against migrated PostgreSQL 17 and Redis with 352/352 tests passing
+- Node.js 22.23.1 source validation checked 153 JavaScript files; the complete
+  suite ran against migrated PostgreSQL 17 and Redis with 353/353 tests passing
   and zero skips, followed by the dedicated 44/44 PostgreSQL release suite;
 - the PostgreSQL protocol smoke passed, including OIDC/RFC 8414, PKCE, token
   audience/claims, refresh replay, device flow, MFA/recovery, SCIM, and audit;
@@ -88,11 +108,15 @@ were integrated with the current trunk supply-chain and CI hardening:
   The driver now reports bounded failure reasons, counts each failed operation
   once, and the runbook requires distributed sources/accounts instead of
   weakening throttling for capacity tests;
+- two pinned BuildKit v0.29.0 no-cache exports with normalized timestamps
+  produced identical image IDs and all 12 uncompressed layer digests. The exact
+  `linux/amd64` image ran as uid 1000 with Node.js 22.23.1, no package managers,
+  all ten migrations, and a 3,469-component CycloneDX inventory;
 - npm reported zero production vulnerabilities; Trivy reported zero fixed
-  High/Critical findings across Debian and every runtime Node package, zero
-  High/Critical deployment misconfigurations under the single scoped TTL-name
-  exception, and zero repository secrets. Gitleaks found no history leak across
-  53 commits;
+  High/Critical findings across the exact Debian image and every runtime Node
+  package, zero High/Critical deployment misconfigurations under the single
+  scoped TTL-name exception, and zero repository secrets. Gitleaks found no
+  history leak across 54 commits;
 - Helm strict lint and deterministic Kubernetes/OpenShift-restricted renders
   passed. Kubeconform strictly validated all 8 default resources and all known
   optional/OpenShift resources; actionlint and ShellCheck also passed;
@@ -101,7 +125,7 @@ were integrated with the current trunk supply-chain and CI hardening:
   and served the exact configured HTTPS issuer with its container health check
   healthy;
 - an ephemeral release-key rehearsal generated the npm archive, normalized
-  package and 3,468-component image CycloneDX SBOMs, signed image digest,
+  package and image CycloneDX SBOMs, signed image digest,
   published verification key, and SHA-256 manifest twice with byte-for-byte
   identical output. All published checksums and every detached signature
   verified. The tag workflow is action-pinned and linted to publish/attest those
