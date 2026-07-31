@@ -57,6 +57,7 @@ A secure production deployment requires operators to:
 - synchronize system clocks and monitor login failures, token replay, administrative actions, latency, errors, database health, and key expiry;
 - patch Node.js, the base image, PostgreSQL, Redis, and npm dependencies promptly;
 - run unit, smoke, migration, container, dependency-audit, and protocol-conformance gates on the exact release artifact;
+- verify the release checksums, authenticated signing-key fingerprint, GitHub attestations, and deployed image digest before rollout;
 - review log and proxy configuration so authorization headers, cookies, codes, tokens, passwords, MFA material, and client secrets are never recorded.
 
 `AUTHME_ADMIN_TOKEN` is a bootstrap-grade global administration credential. Store it in a secret manager, restrict access to the administration routes at the network layer, rotate it on suspected exposure, and do not treat it as delegated RBAC.

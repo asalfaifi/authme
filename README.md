@@ -25,7 +25,7 @@ AuthMe uses the current OpenID/FAPI-certified [`oidc-provider`](https://github.c
 - Configurable authentication flows with required/alternative/conditional steps and `acr`/`amr`/`max_age` enforcement.
 - Explicit RFC 8707 API audiences with signed JWT access tokens, audience-filtered claims, and optional opaque-token introspection.
 - Secure administration console at `/admin/`, self-service account console, realm-scoped administrator grants, a separately bearer-protected automation API, structured audit events, health endpoints, and Prometheus metrics.
-- Encrypted database/JWKS backup and verified restore, HA/load rehearsal commands, signed release artifacts with SBOM, and file/KMS/HSM signing-provider rotation paths.
+- Encrypted database/JWKS backup and verified restore, HA/load rehearsal commands, signed source/image artifacts with SBOM and provenance attestations, and file/KMS/HSM signing-provider rotation paths.
 - Optional Redis-backed shared rate limiting, non-root container, read-only runtime filesystem, and fail-closed production configuration.
 - Dynamic registration only when explicitly enabled and protected by an independent initial-access token.
 - Per-client, opt-in local account creation with CSRF protection, dedicated rate limits, audit events, and immediate OIDC continuation.
@@ -156,6 +156,22 @@ helm upgrade --install authme ./charts/authme --namespace authme --create-namesp
 ```
 
 Create the runtime and per-realm JWKS Secrets before installation. The migration hook blocks an application rollout when the schema cannot be upgraded, but Helm cannot roll back an already committed database migration; follow the chart's expand/migrate/contract upgrade guidance.
+
+A successful version-tag workflow publishes the matching GHCR image only after
+tests and vulnerability/configuration/secret scans pass. It attaches a signed
+digest reference, package and image CycloneDX SBOMs, SHA-256 manifest, release
+signatures, and GitHub provenance/SBOM attestations. Verify the attestation and
+deploy the digest from `authme-image-reference.txt`, never a mutable tag:
+
+```bash
+gh attestation verify oci://ghcr.io/asalfaifi/authme@sha256:RELEASE_DIGEST \
+  --repo asalfaifi/authme
+```
+
+The release includes `authme-release-public-key.pem` so detached signatures can
+be checked offline. Authenticate that key's SHA-256 fingerprint through the
+release owner's independent trust channel before relying on it; a key bundled
+beside its own signature is not an independent trust root.
 
 ## Essential configuration
 

@@ -66,7 +66,7 @@ Reconciliation fails safe when the scan returns zero entries. It also returns `n
 Run one realm explicitly, optionally narrowing it to one provider:
 
 ```sh
-npm run ldap:sync -- --realm master --provider corporate-directory
+node scripts/ldap-sync.mjs --realm master --provider corporate-directory
 ```
 
 The command requires PostgreSQL and the normal AuthMe production configuration. It emits one credential-free JSON summary per provider and exits nonzero for an outage, local failure, overlapping run, or reconciliation requiring confirmation. See the scheduling and recovery runbook in [production.md](production.md).

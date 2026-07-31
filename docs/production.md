@@ -105,7 +105,7 @@ Apply migration `007_ldap_sync.sql` before enabling sync. Select and test a trul
 Run a baseline manually and inspect the credential-free counters:
 
 ```sh
-npm run ldap:sync -- --realm master --provider corporate-directory
+node scripts/ldap-sync.mjs --realm master --provider corporate-directory
 ```
 
 Investigate every nonzero `conflicts` count through explicit account linking or source-data correction; rerunning will not auto-link it. Verify a sample of created, renamed, group-mapped, disabled, and re-enabled users before scheduling. The command requires `--realm`, considers only providers with `sync_enabled: true`, and exits nonzero unless every selected provider succeeds.
@@ -218,7 +218,7 @@ An external adapter still needs an operator-tested KMS/HSM integration. The repo
 
 ### Rotation runbook
 
-For file keys, run `npm run keys:rotate -- --realm master --jwks-dir /protected/jwks [--algorithm RS256]`; the command atomically installs a new active key, retains the prior key, and reports that a rolling restart is required. For external providers, use `POST /admin/v1/realms/{realm}/signing-keys/rotate` through a reviewed administration channel.
+For file keys, run `node scripts/rotate-jwks.mjs --realm master --jwks-dir /protected/jwks [--algorithm RS256]`; the command atomically installs a new active key, retains the prior key, and reports that a rolling restart is required. For external providers, use `POST /admin/v1/realms/{realm}/signing-keys/rotate` through a reviewed administration channel.
 
 1. Generate/import the new key and unique `kid` without removing the old public key.
 2. Publish both keys and verify JWKS from every replica/public ingress.
@@ -334,9 +334,15 @@ Back up:
 AuthMe's backup command uses `pg_dump` custom format and encrypts the database dump and every file-provider JWK independently with AES-256-GCM. The v2 manifest binds unique logical names, file sizes, SHA-256 checksums, package version, and the exact migration manifest, and authenticates the complete manifest with a domain-separated HMAC-SHA-256 under the backup key. Supply a base64url-encoded 32-byte `AUTHME_BACKUP_ENCRYPTION_KEY` from a backup-specific secret boundary:
 
 ```sh
-npm run backup -- --output /protected/backups/authme-2026-07-17 --jwks-dir /protected/jwks
-npm run restore -- --input /protected/backups/authme-2026-07-17 --jwks-dir /restore/jwks --confirm-destructive-restore
+node scripts/backup.mjs --output /protected/backups/authme-2026-07-31 --jwks-dir /protected/jwks
+node scripts/restore.mjs --input /protected/backups/authme-2026-07-31 --jwks-dir /restore/jwks --confirm-destructive-restore
 ```
+
+Run these commands from a controlled operations host or job that has the exact
+AuthMe release dependencies plus PostgreSQL 17 `pg_dump` and `pg_restore` on
+`PATH`. The hardened serving image deliberately omits package managers and
+database client tooling; do not install ad hoc utilities into a live serving
+container. Keep operations tooling patched and isolated from public ingress.
 
 Restore verifies every checksum, validates the migration manifest, authenticates/decrypts every payload before invoking `pg_restore`, and refuses to overwrite an existing signing-key file. Run it only against an isolated/empty recovery target first. Encrypt backups, isolate backup credentials, define retention/deletion, and test restoration. A database backup without the corresponding signing keys or KMS references cannot resume the same issuer cleanly; signing keys without the database are insufficient to restore grants and sessions.
 
@@ -352,8 +358,8 @@ Recovery objectives must state whether active sessions must survive. If not, del
 For a single-region rolling-availability rehearsal, first run plan mode and inspect the public health result, then allow the command to perform and observe a Kubernetes rollout:
 
 ```sh
-npm run ha:rehearse -- --base-url https://auth.example.com --realm master
-npm run ha:rehearse -- --base-url https://auth.example.com --realm master --execute --namespace authme --deployment authme
+node scripts/ha-rehearsal.mjs --base-url https://auth.example.com --realm master
+node scripts/ha-rehearsal.mjs --base-url https://auth.example.com --realm master --execute --namespace authme --deployment authme
 ```
 
 Execute mode continuously probes public readiness and the realm's exact issuer/authorization/token/JWKS discovery contract throughout the restart and rollout wait. It records sample count, maximum latency, and bounded failure details, and exits nonzero for any failed probe, malformed discovery response, failed rollout, or failed final check. A passing report therefore requires zero observed public protocol errors across the single-region rolling update. This proves the scripted single-region rollout path only. Database standby promotion, dependency outage, physical HSM behavior, disaster recovery, and regional failover must be executed in the operator's real infrastructure and attached as external X3 evidence.
@@ -363,10 +369,10 @@ Execute mode continuously probes public readiness and the realm's exact issuer/a
 The minimum release-candidate service target for the public discovery read path is zero errors and p95 latency at or below 500 ms for 500 requests at concurrency 25 in the target environment. Run:
 
 ```sh
-npm run perf:rehearse -- --base-url https://auth.example.com --requests 500 --concurrency 25 --p95-ms 500
+node scripts/load-rehearsal.mjs --base-url https://auth.example.com --requests 500 --concurrency 25 --p95-ms 500
 ```
 
-The representative built-in scenario performs a fresh Authorization Code + PKCE browser interaction, password/TOTP login, consent, token exchange, and—when `offline_access` returns one—a refresh exchange for every measured operation. Use a dedicated load-test realm, client, and user; never put credentials on the command line:
+The representative built-in scenario performs a fresh Authorization Code + PKCE browser interaction, password/TOTP login, consent, token exchange, and—when `offline_access` returns one—a refresh exchange for every measured operation. Use dedicated load-test realms, clients, and users; never put credentials on the command line:
 
 ```sh
 AUTHME_PERF_CLIENT_ID=load-test \
@@ -375,10 +381,12 @@ AUTHME_PERF_USERNAME=load-user \
 AUTHME_PERF_PASSWORD='from-secret-manager' \
 AUTHME_PERF_OTP='current-test-code' \
 AUTHME_PERF_SCOPE='openid offline_access' \
-npm run perf:rehearse -- --base-url https://auth.example.com --scenario authorization-code --requests 500 --concurrency 25 --p95-ms 2000
+node scripts/load-rehearsal.mjs --base-url https://auth.example.com --scenario authorization-code --requests 500 --concurrency 25 --p95-ms 2000
 ```
 
-The discovery run is a reproducible minimum gate, not a capacity claim for login or token traffic. A release performance record must include the authorization-code scenario and deployment-specific federation, SCIM, cleanup, and dependency-outage workloads, then record throughput, p95/p99, database saturation, error rate, and recovery time. A pass on the local/in-memory development server is functional evidence only, not production capacity evidence.
+Production throttling remains active during this scenario: one source address is limited to 20 login submissions per minute and one account to 10 per 15 minutes. A single invocation that exceeds either quota is a protection-control test, not a capacity test, and must fail with bounded failure reasons. For a larger capacity run, distribute operations across controlled load-driver addresses and dedicated accounts so each source and account stays within its documented quota; aggregate the resulting reports. Do not weaken or bypass the production limiter to obtain a passing number.
+
+The discovery run is a reproducible minimum gate, not a capacity claim for login or token traffic. A release performance record must include a quota-valid authorization-code scenario and deployment-specific federation, SCIM, cleanup, and dependency-outage workloads, then record throughput, p95/p99, database saturation, error rate, and recovery time. A pass on the local/in-memory development server is functional evidence only, not production capacity evidence.
 
 ## Upgrade procedure
 
@@ -424,5 +432,6 @@ The release owner must record evidence for all of the following:
 - key rotation and database restore drills;
 - load/soak and dependency-failure tests;
 - secret/container/SBOM scans;
+- signed image digest plus independently verifiable release and registry provenance/SBOM attestations;
 - updated threat model and compatibility documentation;
 - independent security review before a broad production claim.

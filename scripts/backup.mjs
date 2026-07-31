@@ -6,7 +6,7 @@ import { loadMigrationManifest } from '../src/migrations.js';
 function option(name) { const index = process.argv.indexOf(name); return index === -1 ? undefined : process.argv[index + 1]; }
 
 const outputDirectory = option('--output');
-if (!outputDirectory) throw new Error('Usage: npm run backup -- --output /protected/path');
+if (!outputDirectory) throw new Error('Usage: node scripts/backup.mjs --output /protected/path [--jwks-dir /protected/jwks]');
 const packageJson = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
 const manifest = await createEncryptedBackup({
   databaseUrl: process.env.DATABASE_URL,

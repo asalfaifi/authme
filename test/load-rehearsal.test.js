@@ -1,9 +1,52 @@
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
 import { test } from 'node:test';
+import { fileURLToPath } from 'node:url';
 import { createAuthMeApp } from '../src/app.js';
 import { loadConfig } from '../src/config.js';
 import { authorizationCodeRoundTrip } from '../src/operations/authorization-code-rehearsal.js';
+
+async function closeServer(server) {
+  server.closeIdleConnections();
+  await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+}
+
+test('load rehearsal counts each failed operation once and reports bounded reasons', async () => {
+  let responses = 0;
+  const server = createServer((_request, response) => {
+    response.statusCode = 500 + responses;
+    responses += 1;
+    response.end('{"error":"unavailable"}');
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  const child = spawn(process.execPath, [
+    fileURLToPath(new URL('../scripts/load-rehearsal.mjs', import.meta.url)),
+    '--base-url', `http://127.0.0.1:${address.port}`,
+    '--requests', '12', '--concurrency', '2', '--p95-ms', '500',
+  ], { stdio: ['ignore', 'pipe', 'pipe'] });
+  let stdout = '';
+  let stderr = '';
+  child.stdout.setEncoding('utf8').on('data', (chunk) => { stdout += chunk; });
+  child.stderr.setEncoding('utf8').on('data', (chunk) => { stderr += chunk; });
+  const exitCode = await new Promise((resolve, reject) => {
+    child.once('error', reject);
+    child.once('close', resolve);
+  });
+  await closeServer(server);
+  assert.equal(exitCode, 1, stderr);
+  assert.notEqual(stdout, '', stderr);
+  const report = JSON.parse(stdout);
+  assert.equal(report.failures, 12);
+  assert.equal(Object.keys(report.failureReasons).length, 10);
+  assert.equal(Object.values(report.failureReasons).reduce((sum, count) => sum + count, 0), 12);
+  assert.equal(report.failureReasons['Discovery returned HTTP 500'], 1);
+  assert.equal(report.failureReasons['Other failures'], 3);
+});
 
 test('representative load operation completes authorization, token, and refresh exchanges', { timeout: 30_000 }, async () => {
   const server = createServer();
@@ -32,7 +75,6 @@ test('representative load operation completes authorization, token, and refresh 
     assert.equal(result.refreshed, true);
   } finally {
     await runtime.close();
-    server.closeIdleConnections();
-    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    await closeServer(server);
   }
 });

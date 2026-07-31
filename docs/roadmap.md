@@ -196,7 +196,7 @@ v1.0 means an organization can replace Keycloak for a documented set of OIDC, SA
 - Configurable authentication flows with client/ACR selection, required/alternative/conditional steps, AMR verification, and maximum-age step-up.
 - AES-256-GCM encrypted database/JWKS backup, authenticated-manifest destructive restore, single-region HA and load rehearsal commands.
 - File and external KMS/HSM signing-provider lifecycle, public-only inventory, scheduled/forced rotation, and public-key overlap.
-- Reproducible npm archives, CycloneDX SBOM, SHA-256 manifests, mandatory release signing, and tag release workflow.
+- Reproducible npm archives, package/image CycloneDX SBOMs, signed SHA-256 image-digest manifests, published verification key, fail-closed vulnerability/configuration/secret scans, no-overwrite GHCR tag publication, and release/registry provenance plus SBOM attestations.
 - H1–H4 security follow-ups: redirect-location redaction, audience non-widening regression coverage, unbounded CIBA slow-down, and retained `expired_token` semantics.
 
 The code is complete for K1–K11. Final `1.0.0` release declaration remains blocked by external OpenID certification, independent penetration/architecture review, and hardware/DR/regional drills.

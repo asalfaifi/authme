@@ -1,6 +1,6 @@
 # v1 release-candidate evidence map
 
-This document maps every autonomous milestone to executable evidence. A green unit suite alone is not sufficient: the signed-tag workflow also runs the PostgreSQL-only suite without skips, the PostgreSQL protocol smoke test, production dependency audit, Helm validation, and runtime-image build before producing signed artifacts and an SBOM.
+This document maps every autonomous milestone to executable evidence. A green unit suite alone is not sufficient: the signed-tag workflow also runs the PostgreSQL-only suite without skips, the PostgreSQL protocol smoke test, production dependency audit, Helm validation, image/configuration/secret scans, and exact runtime-image checks. It then publishes a no-overwrite GHCR tag, signs the archive, package/image SBOMs, image digest, verification key, and checksum manifest, and creates release provenance plus registry provenance/SBOM attestations.
 
 | Milestone | Implementation boundary | Primary executable evidence |
 |---|---|---|
@@ -35,10 +35,28 @@ AUTHME_SMOKE_DATABASE_URL="$DATABASE_URL" npm run smoke
 npm audit --omit=dev --audit-level=high
 ./scripts/check-helm.sh
 docker build --pull --target runtime --tag authme:release-candidate .
-npm run release:artifacts
+trivy image --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 authme:release-candidate
+trivy config --severity HIGH,CRITICAL --exit-code 1 --ignorefile .trivyignore.yaml .
+trivy fs --scanners secret --exit-code 1 .
+syft authme:release-candidate --output cyclonedx-json=/tmp/authme-image.cdx.json
+AUTHME_RELEASE_IMAGE_SBOM=/tmp/authme-image.cdx.json \
+AUTHME_RELEASE_IMAGE_REFERENCE=ghcr.io/owner/authme@sha256:RELEASE_DIGEST \
+npm run release:artifacts -- --require-image
 ```
 
-`DATABASE_URL` must identify a migrated disposable PostgreSQL 17 database. `test:postgres` intentionally fails instead of skipping when that boundary is absent. Release artifact generation requires `AUTHME_RELEASE_SIGNING_KEY` to name an OpenSSL PEM private key compatible with `openssl dgst -sha256` signing (for example RSA or ECDSA); Ed25519 does not accept an explicit digest in this format. `--unsigned` is rehearsal-only.
+`DATABASE_URL` must identify a migrated disposable PostgreSQL 17 database. `test:postgres` intentionally fails instead of skipping when that boundary is absent. Release artifact generation requires `AUTHME_RELEASE_SIGNING_KEY` to name an OpenSSL PEM private key compatible with `openssl dgst -sha256` signing (for example RSA or ECDSA); Ed25519 does not accept an explicit digest in this format. `--unsigned` is rehearsal-only. The tag workflow derives the image digest only after pushing the exact gated image, refuses to overwrite an existing version tag, and fails if the image SBOM or digest reference is absent. GitHub OIDC and registry attestation steps can run only in that trusted tag workflow.
+
+Every release publishes `authme-release-public-key.pem`. Verify checksums and detached signatures, then authenticate that key's SHA-256 fingerprint through an independent release-owner channel; co-location is not a trust root. GitHub-hosted provenance is independently verifiable:
+
+```sh
+(cd dist && shasum -a 256 --check SHA256SUMS)
+openssl dgst -sha256 -verify dist/authme-release-public-key.pem \
+  -signature dist/SHA256SUMS.sig dist/SHA256SUMS
+openssl pkey -pubin -in dist/authme-release-public-key.pem -outform DER | \
+  openssl dgst -sha256
+gh attestation verify oci://ghcr.io/asalfaifi/authme@sha256:RELEASE_DIGEST \
+  --repo asalfaifi/authme
+```
 
 ## Evidence that cannot be synthesized in this repository
 
@@ -53,32 +71,42 @@ Until all three records are attached, the accurate product label is **v1.0 relea
 The repository was re-audited on 2026-07-31 after the v1 lifecycle corrections
 were integrated with the current trunk supply-chain and CI hardening:
 
-- Node.js 22.23.1 source validation checked 151 JavaScript files; the complete
-  suite ran against migrated PostgreSQL 17 and Redis with 350/350 tests passing
+- Node.js 22.23.1 source validation checked 152 JavaScript files; the complete
+  suite ran against migrated PostgreSQL 17 and Redis with 352/352 tests passing
   and zero skips, followed by the dedicated 44/44 PostgreSQL release suite;
 - the PostgreSQL protocol smoke passed, including OIDC/RFC 8414, PKCE, token
   audience/claims, refresh replay, device flow, MFA/recovery, SCIM, and audit;
-- the production dependency audit reported zero vulnerabilities, Helm strict
-  lint and deterministic OpenShift-restricted renders passed, and the hardened
-  Node.js 22 runtime image built successfully as the unprivileged `node` user;
-- the runtime image was verified to contain neither npm nor alternate package
-  managers, while its direct `node scripts/migrate.mjs` entrypoint applied and
-  verified all ten migrations against a fresh PostgreSQL database; the image
-  then reached readiness behind the trusted-proxy boundary, served the exact
-  configured issuer metadata, and rejected a mismatched request origin with
-  HTTP 421;
-- the repository-specific universal-CI integration hook ran its 44-test
-  PostgreSQL suite and protocol smoke successfully with pinned disposable
-  PostgreSQL/Redis images; its executable mode is enforced in this revision;
-- an ephemeral release-key rehearsal produced the archive, CycloneDX SBOM,
-  checksums, and signatures twice with byte-for-byte identical output, and all
-  three signatures plus both published checksums verified.
-
-The prior 2026-07-17 operational rehearsal additionally exercised a real
-`pg_dump` v2 backup and destructive restore into an isolated database, checking
-all ten migration records, the `client_roles` table, and recovered signing keys.
-It also ran the realm HA baseline and a 40-request/8-worker discovery rehearsal
-with zero failures and 172.05 ms p95 on the rebuilt local audit image.
+- a real PostgreSQL 17 `pg_dump` v2 backup encrypted both the database and JWKS,
+  restored destructively into a separate database, verified all ten migrations
+  and a sentinel realm, and preserved `0600` manifest/key permissions;
+- the exact production-mode image reached healthy readiness through a trusted
+  TLS proxy with PostgreSQL and Redis. Its HA baseline returned the exact issuer;
+  500/500 discovery requests passed at concurrency 25 and 480.93 ms p95, while a
+  quota-valid 10/10 Authorization Code + PKCE + password + consent + token +
+  refresh run passed at concurrency 4 and 4,006.52 ms p95;
+- a deliberately over-quota login run confirmed the production account limiter.
+  The driver now reports bounded failure reasons, counts each failed operation
+  once, and the runbook requires distributed sources/accounts instead of
+  weakening throttling for capacity tests;
+- npm reported zero production vulnerabilities; Trivy reported zero fixed
+  High/Critical findings across Debian and every runtime Node package, zero
+  High/Critical deployment misconfigurations under the single scoped TTL-name
+  exception, and zero repository secrets. Gitleaks found no history leak across
+  53 commits;
+- Helm strict lint and deterministic Kubernetes/OpenShift-restricted renders
+  passed. Kubeconform strictly validated all 8 default resources and all known
+  optional/OpenShift resources; actionlint and ShellCheck also passed;
+- the hardened runtime ran as the unprivileged `node` user, contained neither
+  npm nor alternate package managers, retained direct operational entrypoints,
+  and served the exact configured HTTPS issuer with its container health check
+  healthy;
+- an ephemeral release-key rehearsal generated the npm archive, normalized
+  package and 3,468-component image CycloneDX SBOMs, signed image digest,
+  published verification key, and SHA-256 manifest twice with byte-for-byte
+  identical output. All published checksums and every detached signature
+  verified. The tag workflow is action-pinned and linted to publish/attest those
+  files and the exact GHCR image; actual registry/OIDC attestations require the
+  trusted tag event and are not represented as locally executed evidence.
 
 These are reproducible autonomous checks, not substitutes for X1 certification,
 X2 independent review, or X3 target-infrastructure/hardware drill records.

@@ -11,13 +11,22 @@ const scenario = option('--scenario', 'discovery');
 const realm = process.env.AUTHME_PERF_REALM ?? 'master';
 if (!baseUrl || !Number.isSafeInteger(requests) || requests < 1 || !Number.isSafeInteger(concurrency) || concurrency < 1
   || !Number.isFinite(p95TargetMs) || p95TargetMs <= 0 || !/^[a-z][a-z0-9-]{0,62}$/u.test(realm)) {
-  throw new Error('Usage: npm run perf:rehearse -- --base-url https://auth.example.com [--scenario discovery|authorization-code --requests 500 --concurrency 25 --p95-ms 500]');
+  throw new Error('Usage: node scripts/load-rehearsal.mjs --base-url https://auth.example.com [--scenario discovery|authorization-code --requests 500 --concurrency 25 --p95-ms 500]');
 }
 if (!['discovery', 'authorization-code'].includes(scenario)) throw new Error('--scenario must be discovery or authorization-code');
 const endpoint = new URL(`/realms/${encodeURIComponent(realm)}/.well-known/openid-configuration`, baseUrl);
 const durations = [];
+const failureReasons = new Map();
 let failures = 0;
 let next = 0;
+function recordFailure(error) {
+  failures += 1;
+  const rawReason = error instanceof Error ? error.message : 'Unknown load operation failure';
+  const reason = rawReason.replace(/[\r\n\t]+/gu, ' ').slice(0, 240) || 'Unknown load operation failure';
+  if (failureReasons.has(reason)) failureReasons.set(reason, failureReasons.get(reason) + 1);
+  else if (failureReasons.size < 9) failureReasons.set(reason, 1);
+  else failureReasons.set('Other failures', (failureReasons.get('Other failures') ?? 0) + 1);
+}
 async function worker() {
   while (next < requests) {
     next += 1;
@@ -38,11 +47,13 @@ async function worker() {
         });
       } else {
         const response = await fetch(endpoint, { cache: 'no-store', signal: AbortSignal.timeout(10_000) });
-        if (!response.ok) failures += 1;
+        if (!response.ok) throw new Error(`Discovery returned HTTP ${response.status}`);
         const discovery = await response.json();
-        if (discovery.issuer !== new URL(`/realms/${encodeURIComponent(realm)}`, baseUrl).href.replace(/\/$/u, '')) failures += 1;
+        if (discovery.issuer !== new URL(`/realms/${encodeURIComponent(realm)}`, baseUrl).href.replace(/\/$/u, '')) {
+          throw new Error('Discovery returned an unexpected issuer');
+        }
       }
-    } catch { failures += 1; }
+    } catch (error) { recordFailure(error); }
     durations.push(performance.now() - started);
   }
 }
@@ -53,6 +64,7 @@ const elapsed = performance.now() - started;
 const percentile = (value) => durations[Math.min(durations.length - 1, Math.ceil(durations.length * value) - 1)];
 const report = {
   scenario, endpoint: scenario === 'discovery' ? endpoint.href : 'authorization-code + token + optional refresh', requests, concurrency, failures,
+  ...(failures ? { failureReasons: Object.fromEntries(failureReasons) } : {}),
   throughputPerSecond: Number((requests / (elapsed / 1000)).toFixed(2)),
   latencyMs: { p50: Number(percentile(0.5).toFixed(2)), p95: Number(percentile(0.95).toFixed(2)), p99: Number(percentile(0.99).toFixed(2)) },
   target: { failures: 0, p95Ms: p95TargetMs },

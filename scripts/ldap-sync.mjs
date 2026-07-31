@@ -12,7 +12,7 @@ function argumentsFor(argv) {
     const argument = argv[index];
     if (argument === '--help') return { help: true };
     if (!['--realm', '--provider'].includes(argument) || !argv[index + 1] || argv[index + 1].startsWith('--')) {
-      throw new Error('Usage: npm run ldap:sync -- --realm <realm> [--provider <provider-id>]');
+      throw new Error('Usage: node scripts/ldap-sync.mjs --realm <realm> [--provider <provider-id>]');
     }
     const field = argument === '--realm' ? 'realm' : 'providerId';
     if (result[field]) throw new Error(`${argument} may be specified only once`);
@@ -48,7 +48,7 @@ function logger(level) {
 async function main() {
   const options = argumentsFor(process.argv.slice(2));
   if (options.help) {
-    process.stdout.write('Usage: npm run ldap:sync -- --realm <realm> [--provider <provider-id>]\n');
+    process.stdout.write('Usage: node scripts/ldap-sync.mjs --realm <realm> [--provider <provider-id>]\n');
     return;
   }
   const config = loadConfig();

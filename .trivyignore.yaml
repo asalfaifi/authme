@@ -1,0 +1,6 @@
+misconfigurations:
+  - id: KSV-0109
+    paths:
+      - charts/authme/templates/configmap.yaml
+    expired_at: 2027-07-31
+    statement: AUTHME_ACCESS_TOKEN_TTL_SECONDS is a public numeric lifetime, not token material.

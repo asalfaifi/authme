@@ -7,6 +7,9 @@ on:
 
 permissions:
   contents: write
+  id-token: write
+  attestations: write
+  packages: write
 
 jobs:
   release:
@@ -53,6 +56,19 @@ jobs:
         with:
           node-version: 22
           cache: npm
+      - name: Validate immutable release coordinates
+        shell: bash
+        run: |
+          release_version="${GITHUB_REF_NAME#v}"
+          package_version="$(node --input-type=commonjs -p "require('./package.json').version")"
+          test "$GITHUB_REF_NAME" = "v$package_version"
+          test "$release_version" = "$package_version"
+          image_repository="ghcr.io/${GITHUB_REPOSITORY,,}"
+          {
+            echo "AUTHME_RELEASE_VERSION=$release_version"
+            echo "AUTHME_RELEASE_IMAGE_REPOSITORY=$image_repository"
+            echo "AUTHME_RELEASE_IMAGE=$image_repository:$release_version"
+          } >> "$GITHUB_ENV"
       - name: Install exact dependency tree
         run: npm ci --no-audit --no-fund
       - name: Generate ephemeral release-validation secrets
@@ -86,10 +102,14 @@ jobs:
       - name: Validate Helm release and build runtime image
         run: |
           ./scripts/check-helm.sh
-          docker build --pull --target runtime --tag "authme:${GITHUB_REF_NAME}" .
+          docker build --pull --target runtime \
+            --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --label "org.opencontainers.image.version=${AUTHME_RELEASE_VERSION}" \
+            --tag "$AUTHME_RELEASE_IMAGE" .
       - name: Validate hardened runtime migration entrypoint
         run: |
-          docker run --rm --entrypoint sh "authme:${GITHUB_REF_NAME}" -c '
+          docker run --rm --entrypoint sh "$AUTHME_RELEASE_IMAGE" -c '
             test "$(id -u)" = 1000
             command -v node >/dev/null
             for tool in npm npx corepack pnpm pnpx yarn yarnpkg; do
@@ -101,7 +121,32 @@ jobs:
           docker run --rm --network host \
             --env DATABASE_URL \
             --entrypoint node \
-            "authme:${GITHUB_REF_NAME}" scripts/migrate.mjs
+            "$AUTHME_RELEASE_IMAGE" scripts/migrate.mjs
+      - name: Install pinned Trivy scanner
+        uses: aquasecurity/setup-trivy@3fb12ec12f41e471780db15c232d5dd185dcb514 # v0.2.6
+        with:
+          cache: true
+          version: v0.72.0
+      - name: Scan runtime image, deployment configuration, and repository secrets
+        run: |
+          trivy image --scanners vuln --severity HIGH,CRITICAL \
+            --ignore-unfixed --exit-code 1 --quiet "$AUTHME_RELEASE_IMAGE"
+          trivy config --severity HIGH,CRITICAL --exit-code 1 --quiet \
+            --ignorefile .trivyignore.yaml .
+          trivy fs --scanners secret --exit-code 1 --quiet .
+      - name: Install pinned Syft SBOM generator
+        id: syft
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          syft-version: v1.50.0
+      - name: Inventory the exact runtime image
+        env:
+          SYFT_COMMAND: ${{ steps.syft.outputs.cmd }}
+        run: |
+          image_sbom="$RUNNER_TEMP/authme-image-sbom.raw.cdx.json"
+          "$SYFT_COMMAND" "$AUTHME_RELEASE_IMAGE" \
+            --output "cyclonedx-json=$image_sbom" --quiet
+          echo "AUTHME_RELEASE_IMAGE_SBOM=$image_sbom" >> "$GITHUB_ENV"
       - name: Load release signing key
         env:
           RELEASE_KEY: ${{ secrets.AUTHME_RELEASE_SIGNING_KEY_B64 }}
@@ -109,9 +154,56 @@ jobs:
           test -n "$RELEASE_KEY"
           printf '%s' "$RELEASE_KEY" | base64 --decode > "$RUNNER_TEMP/authme-release-key.pem"
           chmod 600 "$RUNNER_TEMP/authme-release-key.pem"
+          openssl pkey -in "$RUNNER_TEMP/authme-release-key.pem" -noout -check
           echo "AUTHME_RELEASE_SIGNING_KEY=$RUNNER_TEMP/authme-release-key.pem" >> "$GITHUB_ENV"
-      - name: Build signed archive, SBOM, and checksums
-        run: npm run release:artifacts
+      - name: Publish the exact gated runtime image
+        id: publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          if docker buildx imagetools inspect "$AUTHME_RELEASE_IMAGE" >/dev/null 2>&1; then
+            echo "Refusing to overwrite existing image tag: $AUTHME_RELEASE_IMAGE" >&2
+            exit 1
+          fi
+          docker push "$AUTHME_RELEASE_IMAGE"
+          digest="$(docker buildx imagetools inspect "$AUTHME_RELEASE_IMAGE" --format '{{.Manifest.Digest}}')"
+          [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+          image_reference="$AUTHME_RELEASE_IMAGE_REPOSITORY@$digest"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "AUTHME_RELEASE_IMAGE_REFERENCE=$image_reference" >> "$GITHUB_ENV"
+      - name: Build signed archive, package/image SBOMs, and checksums
+        run: npm run release:artifacts -- --require-image
+      - name: Attest signed release files
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+        with:
+          subject-path: dist/*
+      - name: Attest runtime image provenance
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+        with:
+          subject-name: ${{ env.AUTHME_RELEASE_IMAGE_REPOSITORY }}
+          subject-digest: ${{ steps.publish.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false
+      - name: Attest runtime image SBOM
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+        with:
+          subject-name: ${{ env.AUTHME_RELEASE_IMAGE_REPOSITORY }}
+          subject-digest: ${{ steps.publish.outputs.digest }}
+          sbom-path: dist/authme-image-sbom.cdx.json
+          push-to-registry: true
+          create-storage-record: false
+      - name: Verify published release provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh attestation verify "dist/authme-${AUTHME_RELEASE_VERSION}.tgz" --repo "$GITHUB_REPOSITORY"
+          gh attestation verify dist/SHA256SUMS --repo "$GITHUB_REPOSITORY"
+          gh attestation verify "oci://$AUTHME_RELEASE_IMAGE" --repo "$GITHUB_REPOSITORY"
+      - name: Log out of the container registry
+        if: always()
+        run: docker logout ghcr.io
       - name: Publish immutable tag artifacts
         env:
           GH_TOKEN: ${{ github.token }}

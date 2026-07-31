@@ -4,7 +4,7 @@ import { monitorAvailability, probeRealmAvailability } from '../src/operations/a
 
 function option(name) { const index = process.argv.indexOf(name); return index === -1 ? undefined : process.argv[index + 1]; }
 const baseUrl = option('--base-url');
-if (!baseUrl) throw new Error('Usage: npm run ha:rehearse -- --base-url https://auth.example.com [--realm master --execute --namespace authme --deployment authme --probe-interval-ms 250]');
+if (!baseUrl) throw new Error('Usage: node scripts/ha-rehearsal.mjs --base-url https://auth.example.com [--realm master --execute --namespace authme --deployment authme --probe-interval-ms 250]');
 const origin = new URL(baseUrl).origin;
 const realm = option('--realm') ?? 'master';
 const probeIntervalMs = Number(option('--probe-interval-ms') ?? '250');
