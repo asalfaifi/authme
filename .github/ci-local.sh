@@ -8,8 +8,8 @@ docker() {
 }
 
 suffix="${GITHUB_RUN_ID:-local}-$$"
-postgres_container="universal-ci-authme-postgres-${suffix}"
-redis_container="universal-ci-authme-redis-${suffix}"
+postgres_container="authme-ci-postgres-${suffix}"
+redis_container="authme-ci-redis-${suffix}"
 postgres_image="postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193"
 redis_image="redis:7.4-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99"
 startup_log="${RUNNER_TEMP:-/tmp}/authme-services-${suffix}.log"
