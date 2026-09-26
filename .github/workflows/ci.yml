@@ -41,12 +41,16 @@ jobs:
 
       - name: Prepare AuthMe integration services
         run: |
+          docker_home="$RUNNER_TEMP/authme-home-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           docker_config="$RUNNER_TEMP/docker-config-authme-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          mkdir -p "$docker_config"
+          mkdir -p "$docker_home" "$docker_config"
           printf '%s\n' '{"auths":{}}' > "$docker_config/config.json"
-          printf 'DOCKER_CONFIG=%s\n' "$docker_config" >> "$GITHUB_ENV"
-          docker --config "$docker_config" pull postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
-          docker --config "$docker_config" pull redis:7.4-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
+          export HOME="$docker_home" DOCKER_CONFIG="$docker_config"
+          unset DOCKER_AUTH_CONFIG REGISTRY_AUTH_FILE
+          printf 'HOME=%s\nDOCKER_CONFIG=%s\nDOCKER_AUTH_CONFIG=\nREGISTRY_AUTH_FILE=\n' \
+            "$docker_home" "$docker_config" >> "$GITHUB_ENV"
+          docker pull postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
+          docker pull redis:7.4-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
 
       - name: Run AuthMe database, cache, and smoke tests
         run: |
